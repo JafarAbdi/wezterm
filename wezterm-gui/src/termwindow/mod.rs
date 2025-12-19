@@ -1335,7 +1335,6 @@ impl TermWindow {
                 func(self);
             }
             TermWindowNotif::SwitchToMuxWindow(mux_window_id) => {
-                log::debug!("SwitchToMuxWindow: switching from {} to {}", self.mux_window_id, mux_window_id);
                 self.mux_window_id = mux_window_id;
                 *self.mux_window_id_for_subscriptions.lock().unwrap() = mux_window_id;
 
@@ -1418,10 +1417,7 @@ impl TermWindow {
         let mux = Mux::get();
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
             Some(tab) => tab,
-            None => {
-                log::debug!("is_pane_visible: no active tab for mux_window_id={}, pane_id={}", self.mux_window_id, pane_id);
-                return false;
-            }
+            None => return false,
         };
 
         let tab_id = tab.tab_id();
@@ -1439,9 +1435,7 @@ impl TermWindow {
 
     fn mux_pane_output_event(&mut self, pane_id: PaneId) {
         metrics::histogram!("mux.pane_output_event.rate").record(1.);
-        let visible = self.is_pane_visible(pane_id);
-        log::trace!("mux_pane_output_event: pane_id={}, visible={}", pane_id, visible);
-        if visible {
+        if self.is_pane_visible(pane_id) {
             if let Some(ref win) = self.window {
                 win.invalidate();
             }
@@ -1475,25 +1469,14 @@ impl TermWindow {
             | MuxNotification::PaneFocused(pane_id)
             | MuxNotification::PaneRemoved(pane_id)
             | MuxNotification::PaneOutput(pane_id) => {
-                // Ideally we'd check to see if pane_id is part of this window,
-                // but overlays may not be 100% associated with the window
-                // in the mux and we don't want to lose the invalidation
-                // signal for that case, so we just check window validity
-                // here and propagate to the window event handler that
-                // will then do the check with full context.
+                // Check window validity and propagate to the window event handler
+                // that will do the full pane visibility check.
+                // If the window is not found, the mux_window_id may be stale during
+                // a workspace switch - skip this notification but keep the subscription.
                 let mux = Mux::get();
                 if mux.get_window(mux_window_id).is_none() {
-                    // Window not found - this can happen during workspace switches
-                    // when the mux_window_id is briefly stale. Don't cancel the
-                    // subscription, just skip this notification.
-                    log::trace!(
-                        "PaneOutput: mux_window_id={} not found, skipping (pane_id={})",
-                        mux_window_id,
-                        pane_id
-                    );
                     return true;
                 }
-                log::trace!("mux_pane_output_event_callback: pane_id={}, mux_window_id={}", pane_id, mux_window_id);
                 let _ = pane_id;
             }
             MuxNotification::PaneAdded(_pane_id) => {
@@ -1515,13 +1498,7 @@ impl TermWindow {
                 }
                 // The removed window matches our current mux_window_id.
                 // During workspace switches, mux_window_id may be stale.
-                // Don't cancel the subscription - just skip this notification.
-                // The subscription should only be cancelled when the TermWindow
-                // itself is closing (via the dead flag set elsewhere).
-                log::trace!(
-                    "WindowRemoved: window_id={} matches mux_window_id, skipping",
-                    window_id
-                );
+                // Skip this notification but keep the subscription alive.
                 return true;
             }
             MuxNotification::TabResized(tab_id)
