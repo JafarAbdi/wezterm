@@ -377,6 +377,7 @@ impl GuiFrontEnd {
         for (window, window_id) in known_windows.into_iter() {
             if let Some(idx) = mux_windows.iter().position(|&id| id == window_id) {
                 // it already points to the desired mux window
+                window.invalidate();
                 windows.insert(window, window_id);
                 mux_windows.remove(idx);
             } else {
@@ -388,6 +389,7 @@ impl GuiFrontEnd {
 
         for (window, old_id) in unused.into_iter() {
             if let Some(mux_window_id) = mux_windows.next() {
+                log::debug!("reconcile: sending SwitchToMuxWindow({}) to window (was {})", mux_window_id, old_id);
                 window.notify(TermWindowNotif::SwitchToMuxWindow(mux_window_id));
                 windows.insert(window, mux_window_id);
             } else {

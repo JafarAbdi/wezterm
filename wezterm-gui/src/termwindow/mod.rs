@@ -380,6 +380,7 @@ pub struct TermWindow {
     terminal_size: TerminalSize,
     pub mux_window_id: MuxWindowId,
     pub mux_window_id_for_subscriptions: Arc<Mutex<MuxWindowId>>,
+    subscription_cancelled: Arc<AtomicBool>,
     pub render_metrics: RenderMetrics,
     render_state: Option<RenderState>,
     input_map: InputMap,
@@ -696,6 +697,7 @@ impl TermWindow {
             focused: None,
             mux_window_id,
             mux_window_id_for_subscriptions: Arc::new(Mutex::new(mux_window_id)),
+            subscription_cancelled: Arc::new(AtomicBool::new(false)),
             fonts: Rc::clone(&fontconfig),
             render_metrics,
             dimensions,
@@ -1333,6 +1335,7 @@ impl TermWindow {
                 func(self);
             }
             TermWindowNotif::SwitchToMuxWindow(mux_window_id) => {
+                log::debug!("SwitchToMuxWindow: switching from {} to {}", self.mux_window_id, mux_window_id);
                 self.mux_window_id = mux_window_id;
                 *self.mux_window_id_for_subscriptions.lock().unwrap() = mux_window_id;
 
@@ -1415,7 +1418,10 @@ impl TermWindow {
         let mux = Mux::get();
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
             Some(tab) => tab,
-            None => return false,
+            None => {
+                log::debug!("is_pane_visible: no active tab for mux_window_id={}, pane_id={}", self.mux_window_id, pane_id);
+                return false;
+            }
         };
 
         let tab_id = tab.tab_id();
@@ -1433,7 +1439,9 @@ impl TermWindow {
 
     fn mux_pane_output_event(&mut self, pane_id: PaneId) {
         metrics::histogram!("mux.pane_output_event.rate").record(1.);
-        if self.is_pane_visible(pane_id) {
+        let visible = self.is_pane_visible(pane_id);
+        log::trace!("mux_pane_output_event: pane_id={}, visible={}", pane_id, visible);
+        if visible {
             if let Some(ref win) = self.window {
                 win.invalidate();
             }
@@ -1475,14 +1483,17 @@ impl TermWindow {
                 // will then do the check with full context.
                 let mux = Mux::get();
                 if mux.get_window(mux_window_id).is_none() {
-                    // Something inconsistent: cancel subscription
-                    log::debug!(
-                        "PaneOutput: wanted mux_window_id={} from mux, but \
-                         was not found, cancel mux subscription",
-                        mux_window_id
+                    // Window not found - this can happen during workspace switches
+                    // when the mux_window_id is briefly stale. Don't cancel the
+                    // subscription, just skip this notification.
+                    log::trace!(
+                        "PaneOutput: mux_window_id={} not found, skipping (pane_id={})",
+                        mux_window_id,
+                        pane_id
                     );
-                    return false;
+                    return true;
                 }
+                log::trace!("mux_pane_output_event_callback: pane_id={}, mux_window_id={}", pane_id, mux_window_id);
                 let _ = pane_id;
             }
             MuxNotification::PaneAdded(_pane_id) => {
@@ -1502,9 +1513,16 @@ impl TermWindow {
                 if window_id != mux_window_id {
                     return true;
                 }
-                // Set the window as dead to unsubscribe from further notifications
-                dead.store(true, Ordering::Relaxed);
-                return false;
+                // The removed window matches our current mux_window_id.
+                // During workspace switches, mux_window_id may be stale.
+                // Don't cancel the subscription - just skip this notification.
+                // The subscription should only be cancelled when the TermWindow
+                // itself is closing (via the dead flag set elsewhere).
+                log::trace!(
+                    "WindowRemoved: window_id={} matches mux_window_id, skipping",
+                    window_id
+                );
+                return true;
             }
             MuxNotification::TabResized(tab_id)
             | MuxNotification::TabTitleChanged { tab_id, .. } => {
@@ -1543,7 +1561,7 @@ impl TermWindow {
         let window = self.window.clone().expect("window to be valid on startup");
         let mux_window_id = Arc::clone(&self.mux_window_id_for_subscriptions);
         let mux = Mux::get();
-        let dead = Arc::new(AtomicBool::new(false));
+        let dead = Arc::clone(&self.subscription_cancelled);
         mux.subscribe(move |n| {
             if dead.load(Ordering::Relaxed) {
                 return false;
@@ -3619,6 +3637,8 @@ impl TermWindow {
 
 impl Drop for TermWindow {
     fn drop(&mut self) {
+        // Cancel the mux subscription
+        self.subscription_cancelled.store(true, Ordering::Relaxed);
         self.clear_all_overlays();
         if let Some(window) = self.window.take() {
             if let Some(fe) = try_front_end() {
