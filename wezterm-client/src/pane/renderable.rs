@@ -68,6 +68,7 @@ pub struct RenderableInner {
     lines: LruCache<StableRowIndex, LineEntry>,
     pub title: String,
     pub working_dir: Option<Url>,
+    pub current_command: Option<String>,
     pub seqno: SequenceNo,
 
     fetch_limiter: RateLimiter,
@@ -110,6 +111,7 @@ impl RenderableInner {
             ),
             title: title.to_string(),
             working_dir: None,
+            current_command: None,
             fetch_limiter,
             last_send_time: now,
             last_recv_time: now,
@@ -352,6 +354,7 @@ impl RenderableInner {
         self.dimensions = delta.dimensions;
         self.title = delta.title;
         self.working_dir = delta.working_dir.map(Into::into);
+        self.current_command = delta.current_command;
         log::trace!(
             "server says: seqno from {} -> {} for local_pane_id={}",
             self.seqno,

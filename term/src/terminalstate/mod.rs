@@ -350,6 +350,10 @@ pub struct TerminalState {
 
     current_dir: Option<Url>,
 
+    /// The command line currently executing, reported via OSC 133 command-start;
+    /// None while at the prompt.
+    current_command: Option<String>,
+
     term_program: String,
     term_version: String,
 
@@ -563,6 +567,7 @@ impl TerminalState {
             alert_handler: None,
             download_handler: None,
             current_dir: None,
+            current_command: None,
             term_program: term_program.to_string(),
             term_version: term_version.to_string(),
             writer,
@@ -651,6 +656,12 @@ impl TerminalState {
     /// the applicaiton using the OSC 7 escape sequence.
     pub fn get_current_dir(&self) -> Option<&Url> {
         self.current_dir.as_ref()
+    }
+
+    /// The command line currently executing in the terminal (OSC 133); None at
+    /// the prompt.
+    pub fn get_current_command(&self) -> Option<&String> {
+        self.current_command.as_ref()
     }
 
     /// Returns a copy of the palette.

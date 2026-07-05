@@ -40,6 +40,7 @@ pub(crate) struct PerPane {
     cursor_position: StableCursorPosition,
     title: String,
     working_dir: Option<Url>,
+    current_command: Option<String>,
     dimensions: RenderableDimensions,
     mouse_grabbed: bool,
     sent_initial_palette: bool,
@@ -77,6 +78,11 @@ impl PerPane {
 
         let working_dir = pane.get_current_working_dir(CachePolicy::AllowStale);
         if working_dir != self.working_dir {
+            changed = true;
+        }
+
+        let current_command = pane.get_current_command();
+        if current_command != self.current_command {
             changed = true;
         }
 
@@ -124,6 +130,7 @@ impl PerPane {
         self.cursor_position = cursor_position;
         self.title = title.clone();
         self.working_dir = working_dir.clone();
+        self.current_command = current_command.clone();
         self.dimensions = dims;
         self.mouse_grabbed = mouse_grabbed;
 
@@ -137,6 +144,7 @@ impl PerPane {
             title,
             bonus_lines,
             working_dir: working_dir.map(Into::into),
+            current_command,
             input_serial: force_with_input_serial,
             seqno: self.seqno,
         })

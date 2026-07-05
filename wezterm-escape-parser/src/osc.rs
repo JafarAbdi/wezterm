@@ -735,6 +735,9 @@ pub enum FinalTermSemanticPrompt {
 
     MarkEndOfInputAndStartOfOutput {
         aid: Option<String>,
+        /// The command line that is about to run, if the shell reported it. fish
+        /// 4.3+ sends it as a percent-encoded `cmdline_url` parameter.
+        command: Option<String>,
     },
 
     /// Indicates the result of the command
@@ -742,6 +745,50 @@ pub enum FinalTermSemanticPrompt {
         status: i32,
         aid: Option<String>,
     },
+}
+
+fn percent_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn percent_encode(s: &str) -> String {
+    const HEX: &[u8] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'-' | b'_' | b'.' | b'/' => {
+                out.push(b as char)
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xf) as usize] as char);
+            }
+        }
+    }
+    out
 }
 
 impl FinalTermSemanticPrompt {
@@ -787,6 +834,7 @@ impl FinalTermSemanticPrompt {
         if param == "C" {
             return Ok(Self::MarkEndOfInputAndStartOfOutput {
                 aid: params.get("aid").map(|&s| s.to_owned()),
+                command: params.get("cmdline_url").map(|&s| percent_decode(s)),
             });
         }
 
@@ -858,10 +906,13 @@ impl Display for FinalTermSemanticPrompt {
             }
             Self::MarkEndOfPromptAndStartOfInputUntilNextMarker => write!(f, "B")?,
             Self::MarkEndOfPromptAndStartOfInputUntilEndOfLine => write!(f, "I")?,
-            Self::MarkEndOfInputAndStartOfOutput { aid } => {
+            Self::MarkEndOfInputAndStartOfOutput { aid, command } => {
                 write!(f, "C")?;
                 if let Some(aid) = aid {
                     write!(f, ";aid={}", aid)?;
+                }
+                if let Some(command) = command {
+                    write!(f, ";cmdline_url={}", percent_encode(command))?;
                 }
             }
             Self::CommandStatus {
@@ -1495,7 +1546,10 @@ mod test {
         assert_eq!(
             parse(&["133", "C"], "\x1b]133;C\x1b\\"),
             OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput { aid: None }
+                FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput {
+                    aid: None,
+                    command: None
+                }
             )
         );
 
@@ -1503,7 +1557,21 @@ mod test {
             parse(&["133", "C", "aid=123"], "\x1b]133;C;aid=123\x1b\\"),
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput {
-                    aid: Some("123".to_string())
+                    aid: Some("123".to_string()),
+                    command: None
+                }
+            )
+        );
+
+        assert_eq!(
+            parse(
+                &["133", "C", "cmdline_url=echo%20hi"],
+                "\x1b]133;C;cmdline_url=echo%20hi\x1b\\"
+            ),
+            OperatingSystemCommand::FinalTermSemanticPrompt(
+                FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput {
+                    aid: None,
+                    command: Some("echo hi".to_string())
                 }
             )
         );

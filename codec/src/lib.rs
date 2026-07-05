@@ -441,7 +441,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 45;
+pub const CODEC_VERSION: usize = 46;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -919,6 +919,7 @@ pub struct GetPaneRenderChangesResponse {
     pub dirty_lines: Vec<Range<StableRowIndex>>,
     pub title: String,
     pub working_dir: Option<SerdeUrl>,
+    pub current_command: Option<String>,
     /// Lines that the server thought we'd almost certainly
     /// want to fetch as soon as we received this response
     pub bonus_lines: SerializedLines,

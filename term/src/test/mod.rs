@@ -412,7 +412,7 @@ fn test_semantic() {
     term.print(format!(
         "{}",
         OperatingSystemCommand::FinalTermSemanticPrompt(
-            FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput { aid: None }
+            FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput { aid: None, command: None }
         )
     ));
     term.print("some file");

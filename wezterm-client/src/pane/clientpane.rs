@@ -554,6 +554,10 @@ impl Pane for ClientPane {
         self.renderable.lock().inner.borrow().working_dir.clone()
     }
 
+    fn get_current_command(&self) -> Option<String> {
+        self.renderable.lock().inner.borrow().current_command.clone()
+    }
+
     fn focus_changed(&self, focused: bool) {
         if focused {
             self.advise_focus();

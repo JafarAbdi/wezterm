@@ -892,14 +892,19 @@ impl<'a> Performer<'a> {
                 self.clear_semantic_attribute_on_newline = true;
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput { .. },
+                FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput { command, .. },
             ) => {
                 self.pen.set_semantic_type(SemanticType::Output);
+                if let Some(command) = command {
+                    self.current_command = Some(command);
+                }
             }
 
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::CommandStatus { .. },
-            ) => {}
+            ) => {
+                self.current_command = None;
+            }
 
             OperatingSystemCommand::SystemNotification(message) => {
                 if let Some(handler) = self.alert_handler.as_mut() {

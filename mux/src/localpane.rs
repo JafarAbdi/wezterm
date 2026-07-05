@@ -517,6 +517,10 @@ impl Pane for LocalPane {
             .or_else(|| self.divine_current_working_dir(policy))
     }
 
+    fn get_current_command(&self) -> Option<String> {
+        self.terminal.lock().get_current_command().cloned()
+    }
+
     fn tty_name(&self) -> Option<String> {
         #[cfg(unix)]
         {

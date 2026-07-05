@@ -161,6 +161,12 @@ impl UserData for MuxPane {
                 .map(|url| Url { url }))
         });
 
+        methods.add_method("get_current_command", |_, this, _: ()| {
+            let mux = get_mux()?;
+            let pane = this.resolve(&mux)?;
+            Ok(pane.get_current_command())
+        });
+
         methods.add_method("get_metadata", |lua, this, _: ()| {
             let mux = get_mux()?;
             let pane = this.resolve(&mux)?;

@@ -319,6 +319,11 @@ pub trait Pane: Downcast + Send + Sync {
     }
 
     fn get_current_working_dir(&self, policy: CachePolicy) -> Option<Url>;
+    /// The command line currently executing in the pane, if the shell reported it
+    /// via OSC 133 command-start. None at the prompt.
+    fn get_current_command(&self) -> Option<String> {
+        None
+    }
     fn get_foreground_process_name(&self, _policy: CachePolicy) -> Option<String> {
         None
     }
