@@ -204,21 +204,21 @@ impl SelectorState {
         term.render(&changes)
     }
 
-    fn trigger_event(&self, entry: Option<InputSelectorEntry>) {
+    fn trigger_event(&self, entry: Option<InputSelectorEntry>, place: bool) {
         let name = self.event_name.clone();
         let window = self.window.clone();
         let pane = self.pane.clone();
 
         promise::spawn::spawn_into_main_thread(async move {
-            trampoline(name, window, pane, entry);
+            trampoline(name, window, pane, entry, place);
             anyhow::Result::<()>::Ok(())
         })
         .detach();
     }
 
-    fn launch(&self, active_idx: usize) -> bool {
+    fn launch(&self, active_idx: usize, place: bool) -> bool {
         if let Some(entry) = self.filtered_entries.get(active_idx).cloned() {
-            self.trigger_event(Some(entry));
+            self.trigger_event(Some(entry), place);
             true
         } else {
             false
@@ -252,7 +252,7 @@ impl SelectorState {
                         // by construction, we have pos as usize <= self.max_items
                         // for free
                         self.active_idx = self.top_row + pos as usize;
-                        if self.launch(self.active_idx) {
+                        if self.launch(self.active_idx, false) {
                             break;
                         }
                     }
@@ -308,7 +308,7 @@ impl SelectorState {
                     key: KeyCode::Escape,
                     ..
                 }) => {
-                    self.trigger_event(None);
+                    self.trigger_event(None, false);
                     break;
                 }
                 InputEvent::Key(KeyEvent {
@@ -355,14 +355,23 @@ impl SelectorState {
                         self.active_idx = self.top_row + y as usize - 1;
 
                         if mouse_buttons == MouseButtons::LEFT {
-                            if self.launch(self.active_idx) {
+                            if self.launch(self.active_idx, false) {
                                 break;
                             }
                         }
                     }
                     if mouse_buttons != MouseButtons::NONE {
                         // Treat any other mouse button as cancel
-                        self.trigger_event(None);
+                        self.trigger_event(None, false);
+                        break;
+                    }
+                }
+                InputEvent::Key(KeyEvent {
+                    key: KeyCode::Tab,
+                    ..
+                }) => {
+                    // tab accepts too, with place=true so callbacks can tell it from enter
+                    if self.launch(self.active_idx, true) {
                         break;
                     }
                 }
@@ -370,7 +379,7 @@ impl SelectorState {
                     key: KeyCode::Enter,
                     ..
                 }) => {
-                    if self.launch(self.active_idx) {
+                    if self.launch(self.active_idx, false) {
                         break;
                     }
                 }
@@ -383,10 +392,18 @@ impl SelectorState {
     }
 }
 
-fn trampoline(name: String, window: GuiWin, pane: MuxPane, entry: Option<InputSelectorEntry>) {
+fn trampoline(
+    name: String,
+    window: GuiWin,
+    pane: MuxPane,
+    entry: Option<InputSelectorEntry>,
+    place: bool,
+) {
     promise::spawn::spawn(async move {
-        config::with_lua_config_on_main_thread(move |lua| do_event(lua, name, window, pane, entry))
-            .await
+        config::with_lua_config_on_main_thread(move |lua| {
+            do_event(lua, name, window, pane, entry, place)
+        })
+        .await
     })
     .detach();
 }
@@ -397,12 +414,13 @@ async fn do_event(
     window: GuiWin,
     pane: MuxPane,
     entry: Option<InputSelectorEntry>,
+    place: bool,
 ) -> anyhow::Result<()> {
     if let Some(lua) = lua {
         let id = entry.as_ref().map(|entry| entry.id.clone());
         let label = entry.as_ref().map(|entry| entry.label.to_string());
 
-        let args = lua.pack_multi((window, pane, id, label))?;
+        let args = lua.pack_multi((window, pane, id, label, place))?;
 
         if let Err(err) = config::lua::emit_event(&lua, (name.clone(), args)).await {
             log::error!("while processing {} event: {:#}", name, err);
