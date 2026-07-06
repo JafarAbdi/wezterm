@@ -312,6 +312,28 @@ impl SelectorState {
                     break;
                 }
                 InputEvent::Key(KeyEvent {
+                    key: KeyCode::Char('W'),
+                    modifiers: Modifiers::CTRL,
+                }) if self.filtering => {
+                    // drop the trailing whitespace-delimited word
+                    let cut = self
+                        .filter_term
+                        .trim_end()
+                        .char_indices()
+                        .rev()
+                        .find(|(_, c)| c.is_whitespace())
+                        .map_or(0, |(i, c)| i + c.len_utf8());
+                    self.filter_term.truncate(cut);
+                    self.update_filter();
+                }
+                InputEvent::Key(KeyEvent {
+                    key: KeyCode::Char('U'),
+                    modifiers: Modifiers::CTRL,
+                }) if self.filtering => {
+                    self.filter_term.clear();
+                    self.update_filter();
+                }
+                InputEvent::Key(KeyEvent {
                     key: KeyCode::Char(c),
                     ..
                 }) if self.filtering => {
