@@ -777,10 +777,21 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
 
     let gui = crate::frontend::try_new()?;
     let activity = Activity::new();
+    // When attaching a domain (`wezterm connect`, `--attach`), a failure is shown
+    // in the "Connecting..." overlay, which lingers on failure just like an in-GUI
+    // attach. Exiting here would tear that window down before it can be read, so
+    // keep the GUI alive when the overlay is present (a live pane). A failure with
+    // no pane -- e.g. an invalid domain name, which fails before the overlay is
+    // created -- still terminates so it does not hang with an empty GUI.
+    let is_connecting = opts.attach;
 
     promise::spawn::spawn(async move {
         if let Err(err) = async_run_terminal_gui(cmd, opts, publish.should_publish()).await {
-            terminate_with_error(err);
+            if is_connecting && !Mux::get().is_empty() {
+                log::error!("domain attach failed: {:#}", err);
+            } else {
+                terminate_with_error(err);
+            }
         }
         drop(activity);
     })
