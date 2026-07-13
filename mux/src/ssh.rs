@@ -776,9 +776,6 @@ impl Domain for RemoteSshDomain {
             self.id,
             "RemoteSshDomain".to_string(),
         ));
-        let mux = Mux::get();
-        mux.add_pane(&pane)?;
-
         Ok(pane)
     }
 

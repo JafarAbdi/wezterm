@@ -98,6 +98,7 @@ pub trait Domain: Downcast + Send + Sync {
             None => anyhow::bail!("invalid pane index {}", pane_index),
         };
 
+        let register_pane = matches!(&source, SplitSource::Spawn { .. });
         let pane = match source {
             SplitSource::Spawn {
                 command,
@@ -138,9 +139,17 @@ pub trait Domain: Downcast + Send + Sync {
         };
 
         tab.split_and_insert(final_pane_index, split_request, Arc::clone(&pane))?;
+        if register_pane {
+            if let Err(err) = mux.add_pane(&pane) {
+                let removed = tab.remove_pane(pane.pane_id());
+                assert!(removed.is_some());
+                return Err(err).context("register split pane");
+            }
+        }
         Ok(pane)
     }
 
+    /// Create a pane without registering it with the global mux.
     async fn spawn_pane(
         &self,
         size: TerminalSize,
@@ -657,9 +666,6 @@ impl Domain for LocalDomain {
                 ))
             }
         };
-
-        let mux = Mux::get();
-        mux.add_pane(&pane)?;
 
         Ok(pane)
     }
