@@ -5,10 +5,16 @@ set -e
 
 mkdir AppDir
 
-install -Dsm755 -t AppDir/usr/bin target/release/wezterm-mux-server
-install -Dsm755 -t AppDir/usr/bin target/release/wezterm
-install -Dsm755 -t AppDir/usr/bin target/release/wezterm-gui
-install -Dsm755 -t AppDir/usr/bin target/release/strip-ansi-escapes
+case "${DEBUG_SYMBOLS:-0}" in
+  0) install_flags=(-Dsm755) ;;
+  1) install_flags=(-Dm755) ;;
+  *) echo "DEBUG_SYMBOLS must be 0 or 1" >&2; exit 2 ;;
+esac
+
+install "${install_flags[@]}" -t AppDir/usr/bin target/release/wezterm-mux-server
+install "${install_flags[@]}" -t AppDir/usr/bin target/release/wezterm
+install "${install_flags[@]}" -t AppDir/usr/bin target/release/wezterm-gui
+install "${install_flags[@]}" -t AppDir/usr/bin target/release/strip-ansi-escapes
 install -Dm644 assets/icon/terminal.png AppDir/usr/share/icons/hicolor/128x128/apps/org.wezfurlong.wezterm.png
 install -Dm644 assets/wezterm.desktop AppDir/usr/share/applications/org.wezfurlong.wezterm.desktop
 install -Dm644 assets/wezterm.appdata.xml AppDir/usr/share/metainfo/org.wezfurlong.wezterm.appdata.xml
