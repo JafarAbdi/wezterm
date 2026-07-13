@@ -72,6 +72,7 @@ COPY --link . .
 # .tag means the build needs no .git, so it is excluded from the context.
 ARG TAG_NAME=dev
 ARG BUILD_REASON
+ARG DEBUG_SYMBOLS=0
 # TARGETARCH (amd64/arm64/arm/...) is auto-populated by the builder; it scopes
 # the caches per-arch so cross-builds on one host don't mix object files.
 ARG TARGETARCH
@@ -84,12 +85,13 @@ RUN echo "$TAG_NAME" > .tag
 RUN --mount=type=cache,id=wezterm-target-${TARGETARCH},target=/build/target \
     --mount=type=cache,id=wezterm-registry-${TARGETARCH},target=/root/.cargo/registry \
     --mount=type=cache,id=wezterm-git-${TARGETARCH},target=/root/.cargo/git \
+    if [ "$DEBUG_SYMBOLS" = 1 ]; then export CARGO_PROFILE_RELEASE_DEBUG=2; fi; \
     cargo build --release \
         -p wezterm \
         -p wezterm-gui \
         -p wezterm-mux-server \
         -p strip-ansi-escapes \
-    && TAG_NAME="$TAG_NAME" BUILD_REASON="$BUILD_REASON" bash ci/appimage.sh \
+    && TAG_NAME="$TAG_NAME" BUILD_REASON="$BUILD_REASON" DEBUG_SYMBOLS="$DEBUG_SYMBOLS" bash ci/appimage.sh \
     && arch="$(uname -m)" \
     && for f in *.AppImage; do mv -- "$f" "${f%.AppImage}-${arch}.AppImage"; done
 
