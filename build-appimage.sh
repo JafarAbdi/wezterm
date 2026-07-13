@@ -2,9 +2,10 @@
 # Build a Linux AppImage of WezTerm in a container and drop it in ./out.
 # The AppImage filename ends in the target arch (…-x86_64.AppImage etc).
 #
-#   ./build-appimage.sh                     # build for the host arch
+#   ./build-appimage.sh                       # build for the host arch
 #   PLATFORM=linux/arm64 ./build-appimage.sh  # cross-build (needs qemu binfmt)
 #   BUILD_REASON=Schedule ./build-appimage.sh # nightly-style naming
+#   DEBUG_SYMBOLS=1 ./build-appimage.sh       # retain release debug information
 #
 # Building natively on the target machine (e.g. run this on the Raspberry Pi) is
 # far faster than cross-building under emulation. Cross-builds need qemu-user
@@ -44,4 +45,5 @@ exec "$engine" build \
     "${platform_args[@]}" \
     --build-arg TAG_NAME="$tag_name" \
     --build-arg BUILD_REASON="${BUILD_REASON:-}" \
+    --build-arg DEBUG_SYMBOLS="${DEBUG_SYMBOLS:-0}" \
     .
