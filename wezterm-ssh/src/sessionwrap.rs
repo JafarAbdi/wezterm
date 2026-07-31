@@ -6,12 +6,14 @@ use filedescriptor::{AsRawSocketDescriptor, SocketDescriptor, POLLIN, POLLOUT};
 pub(crate) struct Ssh2Session {
     pub sess: ssh2::Session,
     pub sftp: Option<SftpWrap>,
+    transport_guard: Option<Box<dyn Send>>,
 }
 
 #[cfg(feature = "libssh-rs")]
 pub(crate) struct LibSshSession {
     pub sess: libssh_rs::Session,
     pub sftp: Option<SftpWrap>,
+    transport_guard: Option<Box<dyn Send>>,
 }
 
 pub(crate) enum SessionWrap {
@@ -25,12 +27,30 @@ pub(crate) enum SessionWrap {
 impl SessionWrap {
     #[cfg(feature = "ssh2")]
     pub fn with_ssh2(sess: ssh2::Session) -> Self {
-        Self::Ssh2(Ssh2Session { sess, sftp: None })
+        Self::Ssh2(Ssh2Session {
+            sess,
+            sftp: None,
+            transport_guard: None,
+        })
     }
 
     #[cfg(feature = "libssh-rs")]
     pub fn with_libssh(sess: libssh_rs::Session) -> Self {
-        Self::LibSsh(LibSshSession { sess, sftp: None })
+        Self::LibSsh(LibSshSession {
+            sess,
+            sftp: None,
+            transport_guard: None,
+        })
+    }
+
+    pub fn retain_transport<T: Send + 'static>(&mut self, guard: T) {
+        match self {
+            #[cfg(feature = "ssh2")]
+            Self::Ssh2(sess) => sess.transport_guard = Some(Box::new(guard)),
+
+            #[cfg(feature = "libssh-rs")]
+            Self::LibSsh(sess) => sess.transport_guard = Some(Box::new(guard)),
+        }
     }
 
     pub fn set_blocking(&mut self, blocking: bool) {
@@ -91,6 +111,33 @@ impl SessionWrap {
                 Ok(ChannelWrap::LibSsh(channel))
             }
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn open_direct_tcpip(
+        &self,
+        remote_host: &str,
+        remote_port: u16,
+        source_host: &str,
+        source_port: u16,
+    ) -> anyhow::Result<ChannelWrap> {
+        let channel = match self {
+            #[cfg(feature = "ssh2")]
+            Self::Ssh2(sess) => ChannelWrap::Ssh2(sess.sess.channel_direct_tcpip(
+                remote_host,
+                remote_port,
+                Some((source_host, source_port)),
+            )?),
+
+            #[cfg(feature = "libssh-rs")]
+            Self::LibSsh(sess) => {
+                let channel = sess.sess.new_channel()?;
+                channel.open_forward(remote_host, remote_port, source_host, source_port)?;
+                ChannelWrap::LibSsh(channel)
+            }
+        };
+
+        Ok(channel)
     }
 
     pub fn accept_agent_forward(&mut self) -> Option<ChannelWrap> {

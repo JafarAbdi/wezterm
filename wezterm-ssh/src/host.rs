@@ -1,3 +1,4 @@
+use crate::config::ConfigMap;
 use crate::session::SessionEvent;
 use anyhow::Context;
 use smol::channel::{bounded, Sender};
@@ -29,6 +30,7 @@ impl crate::sessioninner::SessionInner {
     #[cfg(feature = "libssh-rs")]
     pub fn host_verification_libssh(
         &mut self,
+        config: &ConfigMap,
         sess: &libssh_rs::Session,
         hostname: &str,
         port: u16,
@@ -64,7 +66,7 @@ impl crate::sessioninner::SessionInner {
             }
             libssh_rs::KnownHosts::Changed => {
                 let mut file = None;
-                if let Some(kh) = self.config.get("userknownhostsfile") {
+                if let Some(kh) = config.get("userknownhostsfile") {
                     for candidate in kh.split_whitespace() {
                         file.replace(candidate.into());
                         break;
@@ -95,6 +97,7 @@ impl crate::sessioninner::SessionInner {
     #[cfg(feature = "ssh2")]
     pub fn host_verification(
         &mut self,
+        config: &ConfigMap,
         sess: &ssh2::Session,
         remote_host_name: &str,
         port: u16,
@@ -106,8 +109,7 @@ impl crate::sessioninner::SessionInner {
 
         let mut known_hosts = sess.known_hosts().context("preparing known hosts")?;
 
-        let known_hosts_files = self
-            .config
+        let known_hosts_files = config
             .get("userknownhostsfile")
             .unwrap()
             .split_whitespace()

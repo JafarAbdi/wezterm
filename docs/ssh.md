@@ -37,6 +37,7 @@ and respects the following options:
 * `User`
 * `Port`
 * `ProxyCommand`
+* `ProxyJump`
 * `Host` (including wildcard matching)
 * `UserKnownHostsFile`
 * `IdentitiesOnly`
@@ -58,6 +59,12 @@ All other options are parsed but have no effect.  Notably, neither `Match` or
 {{since('nightly')}}
 
 `ProxyUseFDpass` is now supported. (But not on Microsoft Windows).
+
+`ProxyJump` is handled natively by wezterm for both the `libssh` and `ssh2`
+backends, including comma-separated jump chains.  wezterm does not spawn an
+external `ssh` process for `ProxyJump`; each jump host is resolved from your SSH
+configuration and connected using SSH direct TCP forwarding.  `ProxyCommand`
+continues to use the configured external command.
 
 `ServerAliveInterval` is now supported by the `libssh` backend.  Setting it to
 a non-zero value will cause wezterm to send an `IGNORE` packet on that interval.
