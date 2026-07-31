@@ -23,7 +23,8 @@ use termwiz::render::terminfo::TerminfoRenderer;
 use termwiz::surface::{Change, LineAttribute};
 use termwiz::terminal::{ScreenSize, Terminal, TerminalWaker};
 use wezterm_ssh::{
-    ConfigMap, HostVerificationFailed, Session, SessionEvent, SshChildProcess, SshPty,
+    ConfigMap, HostVerificationFailed, ResolvedSshRoute, Session, SessionEvent, SshChildProcess,
+    SshPty,
 };
 use wezterm_term::TerminalSize;
 
@@ -58,16 +59,17 @@ impl LineEditorHost for PasswordPromptHost {
 }
 
 pub fn ssh_connect_with_ui(
-    ssh_config: wezterm_ssh::ConfigMap,
+    route: wezterm_ssh::ResolvedSshRoute,
     ui: &mut ConnectionUI,
 ) -> anyhow::Result<Session> {
     let cloned_ui = ui.clone();
     cloned_ui.run_and_log_error(move || {
-        let remote_address = ssh_config
+        let remote_address = route
+            .target()
             .get("hostname")
             .expect("ssh config to always set hostname");
         ui.output_str(&format!("Connecting to {} using SSH\n", remote_address));
-        let (session, events) = Session::connect(ssh_config.clone())?;
+        let (session, events) = Session::connect_route(route.clone())?;
 
         while let Ok(event) = smol::block_on(events.recv()) {
             match event {
@@ -184,9 +186,24 @@ pub struct RemoteSshDomain {
     name: String,
 }
 
-pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap> {
+pub fn ssh_domain_to_ssh_route(ssh_dom: &SshDomain) -> anyhow::Result<ResolvedSshRoute> {
     let mut ssh_config = wezterm_ssh::Config::new();
     ssh_config.add_default_config_files();
+
+    let backend = match ssh_dom
+        .ssh_backend
+        .unwrap_or_else(|| config::configuration().ssh_backend)
+    {
+        SshBackend::Ssh2 => "ssh2",
+        SshBackend::LibSsh => "libssh",
+    }
+    .to_string();
+    ssh_config.set_option("wezterm_ssh_backend", &backend);
+    for (k, v) in &ssh_dom.ssh_option {
+        if matches!(k.to_lowercase().as_str(), "proxyjump" | "proxycommand") {
+            ssh_config.set_option(k, v);
+        }
+    }
 
     let (remote_host_name, port) = {
         let parts: Vec<&str> = ssh_dom.remote_address.split(':').collect();
@@ -198,35 +215,36 @@ pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap
         }
     };
 
-    let mut ssh_config = ssh_config.for_host(&remote_host_name);
-    ssh_config.insert(
-        "wezterm_ssh_backend".to_string(),
-        match ssh_dom
-            .ssh_backend
-            .unwrap_or_else(|| config::configuration().ssh_backend)
-        {
-            SshBackend::Ssh2 => "ssh2",
-            SshBackend::LibSsh => "libssh",
-        }
-        .to_string(),
-    );
-    for (k, v) in &ssh_dom.ssh_option {
-        ssh_config.insert(k.to_string(), v.to_string());
-    }
+    let mut target = ssh_config.for_host(&remote_host_name);
 
     if let Some(username) = &ssh_dom.username {
-        ssh_config.insert("user".to_string(), username.to_string());
+        target.insert("user".to_string(), username.to_string());
     }
     if let Some(port) = port {
-        ssh_config.insert("port".to_string(), port.to_string());
+        target.insert("port".to_string(), port.to_string());
     }
     if ssh_dom.no_agent_auth {
-        ssh_config.insert("identitiesonly".to_string(), "yes".to_string());
+        target.insert("identitiesonly".to_string(), "yes".to_string());
     }
-    if let Some("true") = ssh_config.get("wezterm_ssh_verbose").map(|s| s.as_str()) {
-        log::info!("Using ssh config: {ssh_config:#?}");
+
+    let route = ssh_config.resolve_route(target)?;
+    let mut target = route.target().clone();
+    for (k, v) in &ssh_dom.ssh_option {
+        target.insert(k.to_lowercase(), v.to_string());
     }
-    Ok(ssh_config)
+    let route = ResolvedSshRoute::new(route.jumps().to_vec(), target);
+    if let Some("true") = route
+        .target()
+        .get("wezterm_ssh_verbose")
+        .map(|s| s.as_str())
+    {
+        log::info!("Using ssh route: {route:#?}");
+    }
+    Ok(route)
+}
+
+pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap> {
+    Ok(ssh_domain_to_ssh_route(ssh_dom)?.into_target())
 }
 
 impl RemoteSshDomain {
@@ -240,8 +258,8 @@ impl RemoteSshDomain {
         })
     }
 
-    pub fn ssh_config(&self) -> anyhow::Result<ConfigMap> {
-        ssh_domain_to_ssh_config(&self.dom)
+    pub fn ssh_route(&self) -> anyhow::Result<ResolvedSshRoute> {
+        ssh_domain_to_ssh_route(&self.dom)
     }
 
     fn build_command(
@@ -330,8 +348,9 @@ impl RemoteSshDomain {
         env: HashMap<String, String>,
         size: TerminalSize,
     ) -> anyhow::Result<StartNewSessionResult> {
-        let (session, events) = Session::connect(self.ssh_config().context("obtain ssh config")?)
-            .context("connect to ssh server")?;
+        let (session, events) =
+            Session::connect_route(self.ssh_route().context("obtain ssh config")?)
+                .context("connect to ssh server")?;
         self.session.lock().unwrap().replace(session.clone());
 
         // We get to establish the session!
@@ -1141,5 +1160,32 @@ impl std::io::Read for PtyReader {
                 _ => res,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn ssh_domain_target_options_do_not_leak_into_proxy_jump() {
+        let mut ssh_option = HashMap::new();
+        ssh_option.insert("ProxyJump".to_string(), "jump-isolation".to_string());
+        ssh_option.insert("User".to_string(), "target-user".to_string());
+        ssh_option.insert("IdentityFile".to_string(), "/tmp/target-key".to_string());
+
+        let dom = SshDomain {
+            remote_address: "target-isolation".to_string(),
+            ssh_option,
+            ..Default::default()
+        };
+
+        let route = ssh_domain_to_ssh_route(&dom).unwrap();
+        assert_eq!(route.jumps().len(), 1);
+        assert_ne!(route.jumps()[0]["user"], "target-user");
+        assert_ne!(route.jumps()[0]["identityfile"], "/tmp/target-key");
+        assert_eq!(route.target()["user"], "target-user");
+        assert_eq!(route.target()["identityfile"], "/tmp/target-key");
     }
 }

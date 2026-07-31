@@ -680,9 +680,9 @@ impl Reconnectable {
         initial: bool,
         ui: &mut ConnectionUI,
     ) -> anyhow::Result<()> {
-        let ssh_config = mux::ssh::ssh_domain_to_ssh_config(&ssh_dom)?;
+        let ssh_route = mux::ssh::ssh_domain_to_ssh_route(&ssh_dom)?;
 
-        let sess = ssh_connect_with_ui(ssh_config, ui)?;
+        let sess = ssh_connect_with_ui(ssh_route, ui)?;
         let proxy_bin = Self::wezterm_bin_path(&ssh_dom.remote_wezterm_path);
 
         let cmd = if let Some(cmd) = ssh_dom.override_proxy_command.clone() {
@@ -869,15 +869,15 @@ impl Reconnectable {
                     .ok_or_else(|| anyhow::anyhow!("no host component somehow"))?;
                 let port = fields.next();
 
-                let mut ssh_config = ssh_config.for_host(host);
+                let mut target = ssh_config.for_host(host);
                 if let Some(username) = &ssh_params.username {
-                    ssh_config.insert("user".to_string(), username.to_string());
+                    target.insert("user".to_string(), username.to_string());
                 }
                 if let Some(port) = port {
-                    ssh_config.insert("port".to_string(), port.to_string());
+                    target.insert("port".to_string(), port.to_string());
                 }
 
-                let sess = ssh_connect_with_ui(ssh_config, ui)?;
+                let sess = ssh_connect_with_ui(ssh_config.resolve_route(target)?, ui)?;
 
                 let creds = ui.run_and_log_error(|| {
                     // The `tlscreds` command will start the server if needed and then

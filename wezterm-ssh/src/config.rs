@@ -5,6 +5,114 @@ use std::path::{Path, PathBuf};
 
 pub type ConfigMap = BTreeMap<String, String>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSshRoute {
+    jumps: Vec<ConfigMap>,
+    target: ConfigMap,
+}
+
+impl ResolvedSshRoute {
+    pub fn direct(target: ConfigMap) -> Self {
+        Self {
+            jumps: Vec::new(),
+            target,
+        }
+    }
+
+    pub fn new(jumps: Vec<ConfigMap>, target: ConfigMap) -> Self {
+        Self { jumps, target }
+    }
+
+    pub fn jumps(&self) -> &[ConfigMap] {
+        &self.jumps
+    }
+
+    pub fn target(&self) -> &ConfigMap {
+        &self.target
+    }
+
+    pub fn into_target(self) -> ConfigMap {
+        self.target
+    }
+}
+
+fn option_is_set(options: &ConfigMap, key: &str) -> bool {
+    if matches!(key, "proxycommand" | "proxyjump") {
+        options.contains_key("proxycommand") || options.contains_key("proxyjump")
+    } else {
+        options.contains_key(key)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ProxyJumpSpec {
+    user: Option<String>,
+    host: String,
+    port: Option<u16>,
+}
+
+fn parse_proxy_jump(value: &str) -> anyhow::Result<Vec<ProxyJumpSpec>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(vec![]);
+    }
+    if value.is_empty() {
+        anyhow::bail!("ProxyJump cannot be empty");
+    }
+
+    value
+        .split(',')
+        .map(|spec| {
+            let spec = spec.trim();
+            if spec.is_empty() || spec.chars().any(char::is_whitespace) {
+                anyhow::bail!("invalid ProxyJump destination `{spec}`");
+            }
+
+            let (user, destination) = match spec.rsplit_once('@') {
+                Some(("", _)) | Some((_, "")) => {
+                    anyhow::bail!("invalid ProxyJump destination `{spec}`");
+                }
+                Some((user, destination)) => (Some(user.to_string()), destination),
+                None => (None, spec),
+            };
+
+            let (host, port) = if let Some(destination) = destination.strip_prefix('[') {
+                let Some((host, suffix)) = destination.split_once(']') else {
+                    anyhow::bail!("invalid ProxyJump destination `{spec}`");
+                };
+                let port = match suffix.strip_prefix(':') {
+                    Some(port) => Some(parse_proxy_jump_port(port, spec)?),
+                    None if suffix.is_empty() => None,
+                    None => anyhow::bail!("invalid ProxyJump destination `{spec}`"),
+                };
+                (host, port)
+            } else if destination.matches(':').count() == 1 {
+                let (host, port) = destination.split_once(':').unwrap();
+                (host, Some(parse_proxy_jump_port(port, spec)?))
+            } else {
+                (destination, None)
+            };
+
+            if host.is_empty() {
+                anyhow::bail!("invalid ProxyJump destination `{spec}`");
+            }
+
+            Ok(ProxyJumpSpec {
+                user,
+                host: host.to_string(),
+                port,
+            })
+        })
+        .collect()
+}
+
+fn parse_proxy_jump_port(port: &str, spec: &str) -> anyhow::Result<u16> {
+    match port.parse::<u16>() {
+        Ok(port) if port != 0 => Ok(port),
+        _ => anyhow::bail!("invalid port in ProxyJump destination `{spec}`"),
+    }
+}
+
 /// A Pattern in a `Host` list
 #[derive(Debug, PartialEq, Eq, Clone)]
 struct Pattern {
@@ -347,13 +455,14 @@ impl ParsedConfigFile {
                     // first option wins in ssh_config, except for identityfile
                     // which explicitly allows multiple entries to combine together
                     let is_identity_file = k == "identityfile";
+                    if !is_identity_file && option_is_set(options, &k) {
+                        return;
+                    }
                     options
                         .entry(k)
                         .and_modify(|e| {
-                            if is_identity_file {
-                                e.push(' ');
-                                e.push_str(v);
-                            }
+                            e.push(' ');
+                            e.push_str(v);
                         })
                         .or_insert_with(|| v.to_string());
                 }
@@ -381,7 +490,9 @@ impl ParsedConfigFile {
         let mut needs_reparse = false;
 
         for (k, v) in &self.options {
-            target.entry(k.to_string()).or_insert_with(|| v.to_string());
+            if !option_is_set(target, k) {
+                target.insert(k.to_string(), v.to_string());
+            }
         }
         for group in &self.groups {
             if group.context != Context::FirstPass {
@@ -389,7 +500,9 @@ impl ParsedConfigFile {
             }
             if group.is_match(hostname, user, local_user, context) {
                 for (k, v) in &group.options {
-                    target.entry(k.to_string()).or_insert_with(|| v.to_string());
+                    if !option_is_set(target, k) {
+                        target.insert(k.to_string(), v.to_string());
+                    }
                 }
             }
         }
@@ -439,8 +552,14 @@ impl Config {
     /// line options to override config values.
     /// These values take precedence over any values found in config files.
     pub fn set_option<K: AsRef<str>, V: AsRef<str>>(&mut self, key: K, value: V) {
-        self.options
-            .insert(key.as_ref().to_lowercase(), value.as_ref().to_string());
+        let key = key.as_ref().to_lowercase();
+        if matches!(key.as_str(), "proxycommand" | "proxyjump")
+            && !self.options.contains_key(&key)
+            && option_is_set(&self.options, &key)
+        {
+            return;
+        }
+        self.options.insert(key, value.as_ref().to_string());
     }
 
     /// Parse `config_string` as if it were the contents of an `ssh_config` file,
@@ -552,6 +671,14 @@ impl Config {
         token_map.insert("%n".to_string(), host.to_string());
         token_map.insert("%r".to_string(), target_user.to_string());
         token_map.insert(
+            "%j".to_string(),
+            result
+                .get("proxyjump")
+                .filter(|value| !value.eq_ignore_ascii_case("none"))
+                .cloned()
+                .unwrap_or_default(),
+        );
+        token_map.insert(
             "%p".to_string(),
             result
                 .get("port")
@@ -607,6 +734,33 @@ impl Config {
         result
     }
 
+    /// Resolve the effective ProxyJump chain for a host configuration.
+    /// Explicit users and ports in ProxyJump override values from jump aliases.
+    pub fn resolve_proxy_jump(&self, host_config: &ConfigMap) -> anyhow::Result<Vec<ConfigMap>> {
+        let Some(proxy_jump) = host_config.get("proxyjump") else {
+            return Ok(vec![]);
+        };
+
+        parse_proxy_jump(proxy_jump)?
+            .into_iter()
+            .map(|jump| {
+                let mut config = self.for_host(&jump.host);
+                if let Some(user) = jump.user {
+                    config.insert("user".to_string(), user);
+                }
+                if let Some(port) = jump.port {
+                    config.insert("port".to_string(), port.to_string());
+                }
+                Ok(config)
+            })
+            .collect()
+    }
+
+    pub fn resolve_route(&self, target: ConfigMap) -> anyhow::Result<ResolvedSshRoute> {
+        let jumps = self.resolve_proxy_jump(&target)?;
+        Ok(ResolvedSshRoute::new(jumps, target))
+    }
+
     /// Return true if a given option name is subject to environment variable
     /// expansion.
     fn should_expand_environment(&self, key: &str) -> bool {
@@ -621,14 +775,14 @@ impl Config {
     fn should_expand_tokens(&self, key: &str) -> Option<&[&str]> {
         match key {
             "certificatefile" | "controlpath" | "identityagent" | "identityfile"
-            | "localforward" | "remotecommand" | "remoteforward" | "userknownkostsfile" => {
-                Some(&["%C", "%d", "%h", "%i", "%L", "%l", "%n", "%p", "%r", "%u"])
-            }
+            | "localforward" | "remotecommand" | "remoteforward" | "userknownkostsfile" => Some(&[
+                "%C", "%d", "%h", "%i", "%j", "%L", "%l", "%n", "%p", "%r", "%u",
+            ]),
             "hostname" => Some(&["%h"]),
             "localcommand" => Some(&[
-                "%C", "%d", "%h", "%i", "%k", "%L", "%l", "%n", "%p", "%r", "%T", "%u",
+                "%C", "%d", "%h", "%i", "%j", "%k", "%L", "%l", "%n", "%p", "%r", "%T", "%u",
             ]),
-            "proxycommand" => Some(&["%h", "%n", "%p", "%r"]),
+            "proxycommand" | "proxyjump" => Some(&["%h", "%n", "%p", "%r"]),
             _ => None,
         }
     }
@@ -702,15 +856,6 @@ impl Config {
                     }
                     *value = items.join(" ");
                 }
-            } else if t == "%j" {
-                // %j: The contents of the ProxyJump option, or the empty string if this option is unset
-                // We don't directly support ProxyJump, and this %j token referencing
-                // may technically put this into two-phase evaluation territory which
-                // we don't support.
-                // Let's silently gloss over this and treat this token as the empty
-                // string.
-                // Someone in the future will probably curse this.
-                *value = value.replace(t, "");
             } else if t == "%T" {
                 // %T: The local tun(4) or tap(4) network interface assigned if tunnel
                 // forwarding was requested, or "NONE" otherwise.
@@ -913,6 +1058,216 @@ Config {
     }
 
     #[test]
+    fn parse_proxy_jump_specs() {
+        assert_eq!(
+            parse_proxy_jump(
+                "jump,user@jump.example:2200,[2001:db8::1],root@[2001:db8::2]:2222,2001:db8::3"
+            )
+            .unwrap(),
+            vec![
+                ProxyJumpSpec {
+                    user: None,
+                    host: "jump".to_string(),
+                    port: None,
+                },
+                ProxyJumpSpec {
+                    user: Some("user".to_string()),
+                    host: "jump.example".to_string(),
+                    port: Some(2200),
+                },
+                ProxyJumpSpec {
+                    user: None,
+                    host: "2001:db8::1".to_string(),
+                    port: None,
+                },
+                ProxyJumpSpec {
+                    user: Some("root".to_string()),
+                    host: "2001:db8::2".to_string(),
+                    port: Some(2222),
+                },
+                ProxyJumpSpec {
+                    user: None,
+                    host: "2001:db8::3".to_string(),
+                    port: None,
+                },
+            ]
+        );
+        assert_eq!(parse_proxy_jump("none").unwrap(), vec![]);
+        assert_eq!(parse_proxy_jump("NONE").unwrap(), vec![]);
+
+        for invalid in ["", "jump,", "@jump", "jump@", "jump:0", "[::1", "[::1]:x"] {
+            assert!(parse_proxy_jump(invalid).is_err(), "accepted `{}`", invalid);
+        }
+    }
+
+    #[test]
+    fn resolve_proxy_jump_aliases() {
+        let mut config = Config::new();
+        config.add_config_string(
+            r#"
+        Host target
+            ProxyJump jump,user@jump-with-port:2200,[2001:db8::1]:2222
+        Host jump
+            HostName bastion.example
+            User bastion-user
+            Port 2022
+        Host jump-with-port
+            HostName other-bastion.example
+            User ignored-user
+            Port 2023
+        Host 2001:db8::1
+            HostName 2001:db8::2
+            User ipv6-user
+            "#,
+        );
+        let mut fake_env = ConfigMap::new();
+        fake_env.insert("USER".to_string(), "local-user".to_string());
+        config.assign_environment(fake_env);
+
+        let target = config.for_host("target");
+        let jumps = config.resolve_proxy_jump(&target).unwrap();
+        let endpoints: Vec<_> = jumps
+            .iter()
+            .map(|jump| {
+                (
+                    jump["user"].as_str(),
+                    jump["hostname"].as_str(),
+                    jump["port"].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            endpoints,
+            vec![
+                ("bastion-user", "bastion.example", "2022"),
+                ("user", "other-bastion.example", "2200"),
+                ("ipv6-user", "2001:db8::2", "2222"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_route_keeps_jumps_separate_from_target() {
+        let mut config = Config::new();
+        config.add_config_string(
+            r#"
+        Host target
+            HostName final.example
+            ProxyJump jump
+        Host jump
+            HostName bastion.example
+            User jump-user
+            "#,
+        );
+        let target = config.for_host("target");
+        let route = config.resolve_route(target).unwrap();
+
+        assert_eq!(route.jumps().len(), 1);
+        assert_eq!(route.jumps()[0]["hostname"], "bastion.example");
+        assert_eq!(route.jumps()[0]["user"], "jump-user");
+        assert_eq!(route.target()["hostname"], "final.example");
+    }
+
+    #[test]
+    fn proxy_jump_none_resolves_to_no_jumps() {
+        let mut config = Config::new();
+        config.add_config_string("Host target\n    ProxyJump none");
+
+        let target = config.for_host("target");
+        assert!(config.resolve_proxy_jump(&target).unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_connect_rejects_effective_proxy_jump() {
+        let mut config = ConfigMap::new();
+        config.insert("proxyjump".to_string(), "jump".to_string());
+
+        let err = match crate::Session::connect(config) {
+            Ok(_) => panic!("Session::connect accepted ProxyJump"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("Config::resolve_route"));
+        assert!(err.contains("Session::connect_route"));
+    }
+
+    #[test]
+    fn proxy_jump_and_proxy_command_share_first_value_semantics() {
+        for (options, expected, rejected) in [
+            (
+                "ProxyJump jump\n    ProxyCommand command",
+                "proxyjump",
+                "proxycommand",
+            ),
+            (
+                "ProxyCommand command\n    ProxyJump jump",
+                "proxycommand",
+                "proxyjump",
+            ),
+        ] {
+            let mut config = Config::new();
+            config.add_config_string(&format!("Host target\n    {options}"));
+            let target = config.for_host("target");
+            assert!(target.contains_key(expected));
+            assert!(!target.contains_key(rejected));
+        }
+
+        for (first, fallback, expected, rejected) in [
+            (
+                "ProxyJump jump",
+                "ProxyCommand command",
+                "proxyjump",
+                "proxycommand",
+            ),
+            (
+                "ProxyCommand command",
+                "ProxyJump jump",
+                "proxycommand",
+                "proxyjump",
+            ),
+        ] {
+            let mut config = Config::new();
+            config.add_config_string(&format!("Host target\n    {first}\nHost *\n    {fallback}"));
+            let target = config.for_host("target");
+            assert!(target.contains_key(expected));
+            assert!(!target.contains_key(rejected));
+        }
+
+        let mut config = Config::new();
+        config.set_option("ProxyJump", "jump");
+        config.set_option("ProxyJump", "replacement");
+        config.set_option("ProxyCommand", "command");
+        let target = config.for_host("target");
+        assert_eq!(target["proxyjump"], "replacement");
+        assert!(!target.contains_key("proxycommand"));
+    }
+
+    #[test]
+    fn proxy_jump_expands_destination_tokens() {
+        let mut config = Config::new();
+        config.add_config_string(
+            "Host target\n    HostName target.example\n    Port 2200\n    ProxyJump %h-jump:%p",
+        );
+
+        assert_eq!(
+            config.for_host("target")["proxyjump"],
+            "target.example-jump:2200"
+        );
+    }
+
+    #[test]
+    fn proxy_jump_token_uses_effective_value() {
+        let mut config = Config::new();
+        config.add_config_string(
+            "Host target\n    ProxyJump user@jump:2200\n    LocalCommand jump=%j",
+        );
+
+        assert_eq!(
+            config.for_host("target")["localcommand"],
+            "jump=user@jump:2200"
+        );
+    }
+
+    #[test]
     fn misc_tokens() {
         let mut config = Config::new();
 
@@ -936,7 +1291,7 @@ Config {
 {
     "hostname": "target-host",
     "identityfile": "/home/me/.ssh/id_dsa /home/me/.ssh/id_ecdsa /home/me/.ssh/id_ed25519 /home/me/.ssh/id_rsa",
-    "localcommand": "C=8de28522efb92214d9c442ea0402863e34d095a4006467ad9136a48e930870ea d=/home/me h=target-host i=1000 L=localhost l=localhost n=target-host p=22 r=me T=NONE u=me",
+    "localcommand": "C=fabc202dda3f2f6db142a44b6c503c9f68c0067640b8890ba424cdf2dcdb4f35 d=/home/me h=target-host i=1000 L=localhost l=localhost n=target-host p=22 r=me T=NONE u=me",
     "port": "22",
     "user": "me",
     "userknownhostsfile": "/home/me/.ssh/known_hosts /home/me/.ssh/known_hosts2",

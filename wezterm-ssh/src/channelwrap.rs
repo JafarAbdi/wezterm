@@ -1,6 +1,5 @@
 use crate::pty::{NewPty, ResizePty};
 use portable_pty::ExitStatus;
-
 pub(crate) enum ChannelWrap {
     #[cfg(feature = "ssh2")]
     Ssh2(ssh2::Channel),
@@ -76,6 +75,20 @@ impl ChannelWrap {
 
             #[cfg(feature = "libssh-rs")]
             Self::LibSsh(chan) => Box::new(chan.stdin()),
+        }
+    }
+
+    pub fn send_eof(&mut self) {
+        match self {
+            #[cfg(feature = "ssh2")]
+            Self::Ssh2(chan) => {
+                let _ = chan.send_eof();
+            }
+
+            #[cfg(feature = "libssh-rs")]
+            Self::LibSsh(chan) => {
+                let _ = chan.send_eof();
+            }
         }
     }
 

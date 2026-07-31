@@ -22,6 +22,8 @@ usually the best available version.
 As features stabilize some brief notes about them will accumulate here.
 
 #### Changed
+* The built-in SSH client now supports native `ProxyJump` connections and
+  comma-separated jump chains with both SSH backends.
 * DECRQCRA is now disabled by default to prevent silent screen scraping.
   Set `enable_checksum_rectangular_area = true` to re-enable it.
   Thanks to @jquast! #7701

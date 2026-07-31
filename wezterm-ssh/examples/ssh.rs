@@ -54,13 +54,13 @@ fn main() {
     let mut config = Config::new();
     config.add_default_config_files();
 
-    let mut config = config.for_host(&opts.destination);
+    let mut target = config.for_host(&opts.destination);
     if let Some(user) = opts.user.as_ref() {
-        config.insert("user".to_string(), user.to_string());
+        target.insert("user".to_string(), user.to_string());
     }
-
     let res = smol::block_on(async move {
-        let (session, events) = Session::connect(config.clone())?;
+        let route = config.resolve_route(target)?;
+        let (session, events) = Session::connect_route(route)?;
 
         while let Ok(event) = events.recv().await {
             match event {
