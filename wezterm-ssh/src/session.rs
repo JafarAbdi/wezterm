@@ -1,5 +1,5 @@
 use crate::auth::*;
-use crate::config::ConfigMap;
+use crate::config::{ConfigMap, ResolvedSshRoute};
 use crate::host::*;
 use crate::pty::*;
 use crate::sessioninner::*;
@@ -87,6 +87,21 @@ impl Drop for Session {
 
 impl Session {
     pub fn connect(config: ConfigMap) -> anyhow::Result<(Self, Receiver<SessionEvent>)> {
+        if config
+            .get("proxyjump")
+            .is_some_and(|value| !value.eq_ignore_ascii_case("none"))
+        {
+            anyhow::bail!(
+                "Session::connect does not resolve ProxyJump; use Config::resolve_route and Session::connect_route"
+            );
+        }
+        Self::connect_route(ResolvedSshRoute::direct(config))
+    }
+
+    pub fn connect_route(
+        route: ResolvedSshRoute,
+    ) -> anyhow::Result<(Self, Receiver<SessionEvent>)> {
+        let config = route.target().clone();
         let (tx_event, rx_event) = bounded(8);
         let (tx_req, rx_req) = bounded(8);
         let (mut sender_write, mut sender_read) = socketpair()?;
@@ -111,6 +126,7 @@ impl Session {
 
         let mut inner = SessionInner {
             config,
+            route,
             tx_event,
             rx_req,
             channels: HashMap::new(),

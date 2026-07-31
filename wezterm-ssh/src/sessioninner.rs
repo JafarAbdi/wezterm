@@ -1,5 +1,5 @@
 use crate::channelwrap::ChannelWrap;
-use crate::config::ConfigMap;
+use crate::config::{ConfigMap, ResolvedSshRoute};
 use crate::dirwrap::DirWrap;
 use crate::filewrap::FileWrap;
 use crate::pty::*;
@@ -20,6 +20,7 @@ use socket2::{Domain, Socket, Type};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -40,6 +41,7 @@ pub(crate) type ChannelId = usize;
 
 pub(crate) struct SessionInner {
     pub config: ConfigMap,
+    pub route: ResolvedSshRoute,
     pub tx_event: Sender<SessionEvent>,
     pub rx_req: Receiver<SessionRequest>,
     pub channels: HashMap<ChannelId, ChannelInfo>,
@@ -70,8 +72,52 @@ impl SessionInner {
     }
 
     fn run_impl(&mut self) -> anyhow::Result<()> {
-        let backend = self
-            .config
+        let mut next_socket = None;
+        let jumps = self.route.jumps().to_vec();
+        let target = self.config.clone();
+        let mut bridge_threads = Vec::new();
+
+        for (idx, jump) in jumps.iter().enumerate() {
+            let next_config = jumps.get(idx + 1).unwrap_or(&target);
+            let jump_host = config_hostname(jump)?;
+            let jump_session = self
+                .connect_hop(jump, next_socket.take(), false)
+                .with_context(|| format!("connecting ProxyJump host {jump_host}"))?;
+            let next_host = config_hostname(next_config)?;
+            let next_port = config_port(next_config)?;
+            let mut jump_session = jump_session;
+            jump_session.set_blocking(true);
+            let direct = jump_session
+                .open_direct_tcpip(&next_host, next_port, "127.0.0.1", 0)
+                .with_context(|| {
+                    format!("opening ProxyJump direct-tcpip to {next_host}:{next_port}")
+                })?;
+            let (socket, bridge_fd) = socketpair()?;
+            next_socket = Some(socket_from_file_descriptor(socket));
+            bridge_threads.push(spawn_direct_tcpip_bridge(jump_session, direct, bridge_fd));
+        }
+
+        let target_host = config_hostname(&target)?;
+        let mut sess = self
+            .connect_hop(&target, next_socket, true)
+            .with_context(|| format!("connecting final SSH target {target_host}"))?;
+        let result = self.request_loop(&mut sess);
+        drop(sess);
+        for bridge in bridge_threads {
+            if let Err(err) = bridge.join() {
+                log::error!("ProxyJump bridge thread panicked: {err:?}");
+            }
+        }
+        result
+    }
+
+    fn connect_hop(
+        &mut self,
+        config: &ConfigMap,
+        socket: Option<Socket>,
+        emit_authenticated: bool,
+    ) -> anyhow::Result<SessionWrap> {
+        let backend = config
             .get("wezterm_ssh_backend")
             .map(|s| s.as_str())
             .unwrap_or(
@@ -82,7 +128,7 @@ impl SessionInner {
             );
         match backend {
             #[cfg(feature = "ssh2")]
-            "ssh2" => self.run_impl_ssh2(),
+            "ssh2" => self.connect_ssh2(config, socket, emit_authenticated),
 
             #[cfg(not(feature = "ssh2"))]
             "ssh2" => anyhow::bail!(
@@ -91,7 +137,7 @@ impl SessionInner {
             ),
 
             #[cfg(feature = "libssh-rs")]
-            "libssh" => self.run_impl_libssh(),
+            "libssh" => self.connect_libssh(config, socket, emit_authenticated),
 
             #[cfg(not(feature = "libssh-rs"))]
             "libssh" => anyhow::bail!(
@@ -107,22 +153,15 @@ impl SessionInner {
     }
 
     #[cfg(feature = "libssh-rs")]
-    fn run_impl_libssh(&mut self) -> anyhow::Result<()> {
-        let hostname = self
-            .config
-            .get("hostname")
-            .ok_or_else(|| anyhow!("hostname not present in config"))?
-            .to_string();
-        let user = self
-            .config
-            .get("user")
-            .ok_or_else(|| anyhow!("username not present in config"))?
-            .to_string();
-        let port = self
-            .config
-            .get("port")
-            .ok_or_else(|| anyhow!("port is always set in config loader"))?
-            .parse::<u16>()?;
+    fn connect_libssh(
+        &mut self,
+        config: &ConfigMap,
+        socket: Option<Socket>,
+        emit_authenticated: bool,
+    ) -> anyhow::Result<SessionWrap> {
+        let hostname = config_hostname(config)?;
+        let user = config_user(config)?;
+        let port = config_port(config)?;
 
         self.tx_event
             .try_send(SessionEvent::Banner(Some(format!(
@@ -132,8 +171,7 @@ impl SessionInner {
             .context("notifying user of banner")?;
 
         let sess = libssh_rs::Session::new()?;
-        let verbose = self
-            .config
+        let verbose = config
             .get("wezterm_ssh_verbose")
             .map(|s| s.as_str())
             .unwrap_or("false")
@@ -155,10 +193,6 @@ impl SessionInner {
                 let function = CStr::from_ptr(function).to_string_lossy().to_string();
                 let message = CStr::from_ptr(message).to_string_lossy().to_string();
 
-                // The message typically has "function: message" prefixed, which
-                // looks redundant when logged with the function prefix by the
-                // logging crate.
-                // Strip that off!
                 let message = match message.strip_prefix(&format!("{}: ", function)) {
                     Some(m) => m,
                     None => &message,
@@ -181,33 +215,39 @@ impl SessionInner {
         sess.set_option(libssh_rs::SshOption::User(Some(user)))?;
         sess.set_option(libssh_rs::SshOption::Port(port))?;
         sess.options_parse_config(None)?; // FIXME: overridden config path?
-        if let Some(agent) = self.config.get("identityagent") {
+        if let Some(agent) = config.get("identityagent") {
             sess.set_option(libssh_rs::SshOption::IdentityAgent(Some(agent.clone())))?;
         }
-        if let Some(files) = self.config.get("identityfile") {
+        if let Some(files) = config.get("identityfile") {
             for file in files.split_whitespace() {
                 sess.set_option(libssh_rs::SshOption::AddIdentity(file.to_string()))?;
             }
         }
-        if let Some(kh) = self.config.get("userknownhostsfile") {
+        if let Some(kh) = config.get("userknownhostsfile") {
             for file in kh.split_whitespace() {
                 sess.set_option(libssh_rs::SshOption::KnownHosts(Some(file.to_string())))?;
                 break;
             }
         }
-        if let Some(types) = self.config.get("pubkeyacceptedtypes") {
+        if let Some(types) = config.get("pubkeyacceptedtypes") {
             sess.set_option(libssh_rs::SshOption::PublicKeyAcceptedTypes(
                 types.to_string(),
             ))?;
         }
-        if let Some(bind_addr) = self.config.get("bindaddress") {
+        if let Some(bind_addr) = config.get("bindaddress") {
             sess.set_option(libssh_rs::SshOption::BindAddress(bind_addr.to_string()))?;
         }
-        if let Some(host_key) = self.config.get("hostkeyalgorithms") {
+        if let Some(host_key) = config.get("hostkeyalgorithms") {
             sess.set_option(libssh_rs::SshOption::HostKeys(host_key.to_string()))?;
         }
 
-        let (sock, _child) = self.connect_to_host(&hostname, port, verbose)?;
+        let (sock, _child) = match socket {
+            Some(socket) => {
+                socket.set_nonblocking(false)?;
+                (socket, None)
+            }
+            None => self.connect_to_host(config, &hostname, port, verbose)?,
+        };
         let raw = {
             #[cfg(unix)]
             {
@@ -231,8 +271,8 @@ impl SessionInner {
             .try_send(SessionEvent::Banner(Some(banner)))
             .context("notifying user of banner")?;
 
-        self.host_verification_libssh(&sess, &hostname, port)?;
-        self.authenticate_libssh(&sess)?;
+        self.host_verification_libssh(config, &sess, &hostname, port)?;
+        self.authenticate_libssh(config, &sess)?;
 
         if let Ok(banner) = sess.get_issue_banner() {
             self.tx_event
@@ -240,12 +280,14 @@ impl SessionInner {
                 .context("notifying user of banner")?;
         }
 
-        self.tx_event
-            .try_send(SessionEvent::Authenticated)
-            .context("notifying user that session is authenticated")?;
+        if emit_authenticated {
+            self.tx_event
+                .try_send(SessionEvent::Authenticated)
+                .context("notifying user that session is authenticated")?;
+        }
 
-        if let Some("yes") = self.config.get("forwardagent").map(|s| s.as_str()) {
-            if self.identity_agent().is_some() {
+        if let Some("yes") = config.get("forwardagent").map(|s| s.as_str()) {
+            if self.identity_agent_for_config(config).is_some() {
                 sess.enable_accept_agent_forward(true);
             } else {
                 log::error!("ForwardAgent is set to yes, but IdentityAgent is not set");
@@ -253,33 +295,28 @@ impl SessionInner {
         }
         sess.set_blocking(false);
         let mut sess = SessionWrap::with_libssh(sess);
-        self.request_loop(&mut sess)
+        if let Some(child) = _child {
+            sess.retain_transport(child);
+        }
+        Ok(sess)
     }
 
     #[cfg(feature = "ssh2")]
-    fn run_impl_ssh2(&mut self) -> anyhow::Result<()> {
-        let verbose = self
-            .config
+    fn connect_ssh2(
+        &mut self,
+        config: &ConfigMap,
+        socket: Option<Socket>,
+        emit_authenticated: bool,
+    ) -> anyhow::Result<SessionWrap> {
+        let verbose = config
             .get("wezterm_ssh_verbose")
             .map(|s| s.as_str())
             .unwrap_or("false")
             == "true";
 
-        let hostname = self
-            .config
-            .get("hostname")
-            .ok_or_else(|| anyhow!("hostname not present in config"))?
-            .to_string();
-        let user = self
-            .config
-            .get("user")
-            .ok_or_else(|| anyhow!("username not present in config"))?
-            .to_string();
-        let port = self
-            .config
-            .get("port")
-            .ok_or_else(|| anyhow!("port is always set in config loader"))?
-            .parse::<u16>()?;
+        let hostname = config_hostname(config)?;
+        let user = config_user(config)?;
+        let port = config_port(config)?;
         let remote_address = format!("{}:{}", hostname, port);
 
         self.tx_event
@@ -289,7 +326,13 @@ impl SessionInner {
             ))))
             .context("notifying user of banner")?;
 
-        let (sock, _child) = self.connect_to_host(&hostname, port, verbose)?;
+        let (sock, _child) = match socket {
+            Some(socket) => {
+                socket.set_nonblocking(false)?;
+                (socket, None)
+            }
+            None => self.connect_to_host(config, &hostname, port, verbose)?,
+        };
 
         let mut sess = ssh2::Session::new()?;
         if verbose {
@@ -304,20 +347,25 @@ impl SessionInner {
             .try_send(SessionEvent::Banner(sess.banner().map(|s| s.to_string())))
             .context("notifying user of banner")?;
 
-        self.host_verification(&sess, &hostname, port, &remote_address)
+        self.host_verification(config, &sess, &hostname, port, &remote_address)
             .context("host verification")?;
 
-        self.authenticate(&sess, &user, &hostname)
+        self.authenticate(config, &sess, &user, &hostname)
             .context("authentication")?;
 
-        self.tx_event
-            .try_send(SessionEvent::Authenticated)
-            .context("notifying user that session is authenticated")?;
+        if emit_authenticated {
+            self.tx_event
+                .try_send(SessionEvent::Authenticated)
+                .context("notifying user that session is authenticated")?;
+        }
 
         sess.set_blocking(false);
 
         let mut sess = SessionWrap::with_ssh2(sess);
-        self.request_loop(&mut sess)
+        if let Some(child) = _child {
+            sess.retain_transport(child);
+        }
+        Ok(sess)
     }
 
     /// Explicitly and directly connect to the requested host because
@@ -328,11 +376,12 @@ impl SessionInner {
     /// on Windows in libssh.
     fn connect_to_host(
         &self,
+        config: &ConfigMap,
         hostname: &str,
         port: u16,
         verbose: bool,
     ) -> anyhow::Result<(Socket, Option<KillOnDropChild>)> {
-        match self.config.get("proxycommand").map(|s| s.as_str()) {
+        match config.get("proxycommand").map(|s| s.as_str()) {
             Some("none") | None => {}
             Some(proxy_command) => {
                 let mut cmd;
@@ -360,7 +409,7 @@ impl SessionInner {
                     use std::os::unix::io::{FromRawFd, IntoRawFd};
 
                     let raw = a.into_raw_fd();
-                    let dest = match self.config.get("proxyusefdpass").map(|s| s.as_str()) {
+                    let dest = match config.get("proxyusefdpass").map(|s| s.as_str()) {
                         Some("yes") => raw.recv_fd()?,
                         _ => raw,
                     };
@@ -380,16 +429,16 @@ impl SessionInner {
 
         let addr = (hostname, port)
             .to_socket_addrs()?
-            .find(|addr| self.filter_sock_addr(addr))
+            .find(|addr| self.filter_sock_addr(config, addr))
             .with_context(|| format!("resolving address for {}", hostname))?;
         if verbose {
             log::info!("resolved {hostname}:{port} -> {addr:?}");
         }
         let sock = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
-        if let Some(bind_addr) = self.config.get("bindaddress") {
+        if let Some(bind_addr) = config.get("bindaddress") {
             let bind_addr = (bind_addr.as_str(), 0)
                 .to_socket_addrs()?
-                .find(|addr| self.filter_sock_addr(addr))
+                .find(|addr| self.filter_sock_addr(config, addr))
                 .with_context(|| format!("resolving bind address {bind_addr:?}"))?;
             if verbose {
                 log::info!("binding to {bind_addr:?}");
@@ -405,8 +454,8 @@ impl SessionInner {
 
     /// Used to restrict to_socket_addrs results to the address
     /// family specified by the config
-    fn filter_sock_addr(&self, addr: &std::net::SocketAddr) -> bool {
-        match self.config.get("addressfamily").map(|s| s.as_str()) {
+    fn filter_sock_addr(&self, config: &ConfigMap, addr: &std::net::SocketAddr) -> bool {
+        match config.get("addressfamily").map(|s| s.as_str()) {
             Some("inet") => addr.is_ipv4(),
             Some("inet6") => addr.is_ipv6(),
             None | Some("any") | Some(_) => true,
@@ -524,7 +573,9 @@ impl SessionInner {
                         }
                     } else {
                         if info.exited && state.buf.is_empty() {
-                            log::trace!("channel {channel_id} exited and we have no data to send to fd {fd_num}: close it!");
+                            log::trace!(
+                                "channel {channel_id} exited and we have no data to send to fd {fd_num}: close it!"
+                            );
                             state.fd.take();
                         } else {
                             // We can write our buffered output
@@ -1065,11 +1116,183 @@ impl SessionInner {
     }
 
     pub fn identity_agent(&self) -> Option<String> {
-        self.config
+        self.identity_agent_for_config(&self.config)
+    }
+
+    pub fn identity_agent_for_config(&self, config: &ConfigMap) -> Option<String> {
+        config
             .get("identityagent")
             .map(|s| s.to_owned())
             .or_else(|| std::env::var("SSH_AUTH_SOCK").ok())
     }
+}
+
+fn config_hostname(config: &ConfigMap) -> anyhow::Result<String> {
+    config
+        .get("hostname")
+        .cloned()
+        .ok_or_else(|| anyhow!("hostname not present in config"))
+}
+
+fn config_user(config: &ConfigMap) -> anyhow::Result<String> {
+    config
+        .get("user")
+        .cloned()
+        .ok_or_else(|| anyhow!("username not present in config"))
+}
+
+fn config_port(config: &ConfigMap) -> anyhow::Result<u16> {
+    Ok(config
+        .get("port")
+        .ok_or_else(|| anyhow!("port is always set in config loader"))?
+        .parse::<u16>()?)
+}
+
+fn socket_from_file_descriptor(fd: FileDescriptor) -> Socket {
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+        Socket::from_raw_fd(fd.into_raw_fd())
+    }
+    #[cfg(windows)]
+    unsafe {
+        use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+        Socket::from_raw_socket(fd.into_raw_socket())
+    }
+}
+
+fn spawn_direct_tcpip_bridge(
+    mut sess: SessionWrap,
+    direct: ChannelWrap,
+    mut fd: FileDescriptor,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        if let Err(err) = bridge_direct_tcpip(&mut sess, direct, &mut fd) {
+            log::debug!("ProxyJump direct-tcpip bridge finished: {err:#}");
+        }
+    })
+}
+
+fn bridge_direct_tcpip(
+    sess: &mut SessionWrap,
+    mut channel: ChannelWrap,
+    fd: &mut FileDescriptor,
+) -> anyhow::Result<()> {
+    let mut fd_to_channel = VecDeque::with_capacity(8192);
+    let mut channel_to_fd = VecDeque::with_capacity(8192);
+    let mut fd_read_open = true;
+    let mut fd_write_open = true;
+    let mut channel_read_open = true;
+    let mut channel_write_open = true;
+
+    sess.set_blocking(false);
+    fd.set_non_blocking(true)?;
+
+    loop {
+        if !fd_to_channel.is_empty() {
+            if let Err(err) = write_from_buf(&mut channel.writer(), &mut fd_to_channel) {
+                log::trace!("ProxyJump bridge write to channel failed: {err:#}");
+                fd_to_channel.clear();
+                fd_read_open = false;
+                channel_write_open = false;
+            }
+        }
+
+        if channel_read_open && channel_to_fd.len() < channel_to_fd.capacity() {
+            if let Err(err) = read_into_buf(&mut channel.reader(0), &mut channel_to_fd) {
+                log::trace!("ProxyJump bridge read from channel failed: {err:#}");
+                channel_read_open = false;
+            }
+        }
+
+        if !channel_to_fd.is_empty() {
+            if let Err(err) = write_from_buf(fd, &mut channel_to_fd) {
+                log::trace!("ProxyJump bridge write to socket failed: {err:#}");
+                channel_to_fd.clear();
+                fd_write_open = false;
+                channel_read_open = false;
+            }
+        }
+
+        if fd_read_open && fd_to_channel.len() < fd_to_channel.capacity() {
+            if let Err(err) = read_into_buf(fd, &mut fd_to_channel) {
+                log::trace!("ProxyJump bridge read from socket failed: {err:#}");
+                fd_read_open = false;
+            }
+        }
+
+        if !fd_read_open && channel_write_open && fd_to_channel.is_empty() {
+            channel.send_eof();
+            channel_write_open = false;
+        }
+        if !channel_read_open && fd_write_open && channel_to_fd.is_empty() {
+            shutdown_socket_write(fd);
+            fd_write_open = false;
+        }
+
+        if !fd_read_open
+            && !fd_write_open
+            && !channel_read_open
+            && !channel_write_open
+            && fd_to_channel.is_empty()
+            && channel_to_fd.is_empty()
+        {
+            channel.close();
+            return Ok(());
+        }
+
+        let mut poll_array = [
+            pollfd {
+                fd: sess.as_socket_descriptor(),
+                events: sess.get_poll_flags(),
+                revents: 0,
+            },
+            pollfd {
+                fd: fd.as_socket_descriptor(),
+                events: {
+                    let mut events = 0;
+                    if fd_read_open && fd_to_channel.len() < fd_to_channel.capacity() {
+                        events |= POLLIN;
+                    }
+                    if fd_write_open && !channel_to_fd.is_empty() {
+                        events |= POLLOUT;
+                    }
+                    events
+                },
+                revents: 0,
+            },
+        ];
+        poll(&mut poll_array, Some(Duration::from_millis(100)))?;
+    }
+}
+
+fn shutdown_socket_write(fd: &FileDescriptor) {
+    #[cfg(unix)]
+    unsafe {
+        use std::mem::ManuallyDrop;
+        use std::os::fd::FromRawFd;
+
+        let socket = ManuallyDrop::new(Socket::from_raw_fd(fd.as_socket_descriptor()));
+        let _ = socket.shutdown(std::net::Shutdown::Write);
+    }
+
+    #[cfg(windows)]
+    unsafe {
+        use std::mem::ManuallyDrop;
+        use std::os::windows::io::FromRawSocket;
+
+        let socket = ManuallyDrop::new(Socket::from_raw_socket(fd.as_socket_descriptor()));
+        let _ = socket.shutdown(std::net::Shutdown::Write);
+    }
+}
+
+fn is_would_block(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+
+    let err = err.to_string();
+    err.contains("Would block") || err.contains("TryAgain")
 }
 
 fn write_from_buf<W: Write>(w: &mut W, buf: &mut VecDeque<u8>) -> std::io::Result<()> {
@@ -1079,7 +1302,7 @@ fn write_from_buf<W: Write>(w: &mut W, buf: &mut VecDeque<u8>) -> std::io::Resul
             Ok(())
         }
         Err(err) => {
-            if err.kind() == std::io::ErrorKind::WouldBlock {
+            if is_would_block(&err) {
                 return Ok(());
             }
             Err(err)
@@ -1106,7 +1329,7 @@ fn read_into_buf<R: Read>(r: &mut R, buf: &mut VecDeque<u8>) -> std::io::Result<
         Err(err) => {
             buf.resize(current_len, 0);
 
-            if err.kind() == std::io::ErrorKind::WouldBlock {
+            if is_would_block(&err) {
                 return Ok(());
             }
             Err(err)

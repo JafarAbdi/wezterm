@@ -1,3 +1,4 @@
+use crate::config::ConfigMap;
 use crate::session::SessionEvent;
 use anyhow::Context;
 use smol::channel::{bounded, Sender};
@@ -28,8 +29,13 @@ impl AuthenticationEvent {
 
 impl crate::sessioninner::SessionInner {
     #[cfg(feature = "ssh2")]
-    fn agent_auth(&mut self, sess: &ssh2::Session, user: &str) -> anyhow::Result<bool> {
-        if let Some(only) = self.config.get("identitiesonly") {
+    fn agent_auth(
+        &mut self,
+        config: &ConfigMap,
+        sess: &ssh2::Session,
+        user: &str,
+    ) -> anyhow::Result<bool> {
+        if let Some(only) = config.get("identitiesonly") {
             if only == "yes" {
                 log::trace!("Skipping agent auth because identitiesonly=yes");
                 return Ok(false);
@@ -56,13 +62,14 @@ impl crate::sessioninner::SessionInner {
     #[cfg(feature = "ssh2")]
     fn pubkey_auth(
         &mut self,
+        config: &ConfigMap,
         sess: &ssh2::Session,
         user: &str,
         host: &str,
     ) -> anyhow::Result<bool> {
         use std::path::{Path, PathBuf};
 
-        if let Some(files) = self.config.get("identityfile") {
+        if let Some(files) = config.get("identityfile") {
             for file in files.split_whitespace() {
                 let pubkey: PathBuf = format!("{}.pub", file).into();
                 let file = Path::new(file);
@@ -129,7 +136,11 @@ impl crate::sessioninner::SessionInner {
     }
 
     #[cfg(feature = "libssh-rs")]
-    pub fn authenticate_libssh(&mut self, sess: &libssh_rs::Session) -> anyhow::Result<()> {
+    pub fn authenticate_libssh(
+        &mut self,
+        _config: &ConfigMap,
+        sess: &libssh_rs::Session,
+    ) -> anyhow::Result<()> {
         use std::collections::HashMap;
         let tx = self.tx_event.clone();
 
@@ -255,6 +266,7 @@ impl crate::sessioninner::SessionInner {
     #[cfg(feature = "ssh2")]
     pub fn authenticate(
         &mut self,
+        config: &ConfigMap,
         sess: &ssh2::Session,
         user: &str,
         host: &str,
@@ -273,11 +285,11 @@ impl crate::sessioninner::SessionInner {
             log::trace!("ssh auth methods: {:?}", methods);
 
             if !sess.authenticated() && methods.contains("publickey") {
-                if self.agent_auth(sess, user)? {
+                if self.agent_auth(config, sess, user)? {
                     continue;
                 }
 
-                if self.pubkey_auth(sess, user, host)? {
+                if self.pubkey_auth(config, sess, user, host)? {
                     continue;
                 }
             }
