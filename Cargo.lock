@@ -7259,6 +7259,7 @@ dependencies = [
  "rangeset",
  "rcgen",
  "smol",
+ "tempfile",
  "termwiz",
  "url",
  "wezterm-client",
