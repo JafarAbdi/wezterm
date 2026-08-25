@@ -110,7 +110,9 @@ impl LineEditBuffer {
                 let mut char_position = char_indices
                     .iter()
                     .position(|(idx, _)| *idx == self.cursor)
-                    .unwrap_or(char_indices.len() - 1);
+                    // At end-of-line the cursor matches no index; seed past-the-end
+                    // (not the last char) so the scan still sees the separator.
+                    .unwrap_or_else(|| char_indices.len());
 
                 for _ in 0..rep {
                     if char_position == 0 {
@@ -127,7 +129,10 @@ impl LineEditBuffer {
 
                     char_position = found.unwrap_or(0);
                 }
-                char_indices[char_position].0
+                char_indices
+                    .get(char_position)
+                    .map(|(i, _)| *i)
+                    .unwrap_or_else(|| self.line.len())
             }
             Movement::ForwardWord(rep) => {
                 let char_indices: Vec<(usize, char)> = self.line.char_indices().collect();
@@ -185,5 +190,55 @@ impl LineEditBuffer {
             }
             Movement::None => self.cursor,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backward_word_kill(line: &str, cursor: usize, rep: usize) -> (String, usize) {
+        let mut buffer = LineEditBuffer::new(line, cursor);
+        buffer.kill_text(Movement::BackwardWord(rep), Movement::BackwardWord(rep));
+        (buffer.get_line().to_string(), buffer.get_cursor())
+    }
+
+    #[test]
+    fn backward_word_single_char_trailing_at_eol() {
+        // Regression: a single-char trailing word at end-of-line must kill
+        // only that word, not two words.
+        assert_eq!(backward_word_kill("a b", 3, 1), ("a ".to_string(), 2));
+        assert_eq!(backward_word_kill("x y z", 5, 1), ("x y ".to_string(), 4));
+    }
+
+    #[test]
+    fn backward_word_multi_char_trailing_at_eol() {
+        assert_eq!(backward_word_kill("foo bar", 7, 1), ("foo ".to_string(), 4));
+    }
+
+    #[test]
+    fn backward_word_mid_line() {
+        // Cursor at the start of "bar" moves to the start of "foo".
+        assert_eq!(backward_word_kill("foo bar", 4, 1), ("bar".to_string(), 0));
+    }
+
+    #[test]
+    fn backward_word_repeat() {
+        assert_eq!(
+            backward_word_kill("foo bar baz", 11, 2),
+            ("foo ".to_string(), 4)
+        );
+    }
+
+    #[test]
+    fn backward_word_multibyte_trailing_at_eol() {
+        // "é" is two bytes; the kill must land on the char boundary at byte 3.
+        assert_eq!(backward_word_kill("é b", 4, 1), ("é ".to_string(), 3));
+    }
+
+    #[test]
+    fn backward_word_zero_repeat_is_noop() {
+        // BackwardWord(0) must not panic and must leave the line unchanged.
+        assert_eq!(backward_word_kill("a b", 3, 0), ("a b".to_string(), 3));
     }
 }
