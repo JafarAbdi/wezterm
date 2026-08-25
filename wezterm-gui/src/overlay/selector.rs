@@ -493,6 +493,11 @@ mod tests {
             apply_filter_edit('W', Modifiers::CTRL, "foo bar").as_deref(),
             Some("foo ")
         );
+        // A single-char trailing word must kill only it (needs the termwiz fix).
+        assert_eq!(
+            apply_filter_edit('W', Modifiers::CTRL, "a b").as_deref(),
+            Some("a ")
+        );
     }
 
     #[test]
