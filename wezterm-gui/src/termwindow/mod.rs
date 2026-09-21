@@ -383,7 +383,7 @@ impl EventState {
             }
             Self::InProgressWithQueued(pane) => {
                 let pane = *pane;
-                *self = Self::InProgress;
+                *self = Self::None;
                 FinishAction::EmitQueued(pane)
             }
             Self::None => FinishAction::Done,
@@ -1663,7 +1663,7 @@ impl TermWindow {
             .or_insert(EventState::None)
             .finish(again);
         if let FinishAction::EmitQueued(pane) = action {
-            self.schedule_window_event(name, pane);
+            self.emit_window_event(name, pane);
         }
     }
 
