@@ -352,7 +352,7 @@ pub struct TabState {
 /// We don't want to queue more than 1 event at a time,
 /// so we use this enum to allow for at most 1 executing
 /// and 1 pending event.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum EventState {
     /// The event is not running
     None,
@@ -361,6 +361,47 @@ enum EventState {
     /// The event is running, and we have another one ready to
     /// run once it completes
     InProgressWithQueued(Option<PaneId>),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum FinishAction {
+    Done,
+    EmitQueued(Option<PaneId>),
+}
+
+impl EventState {
+    fn finish(&mut self, again: bool) -> FinishAction {
+        if !again {
+            *self = Self::None;
+            return FinishAction::Done;
+        }
+
+        match self {
+            Self::InProgress => {
+                *self = Self::None;
+                FinishAction::Done
+            }
+            Self::InProgressWithQueued(pane) => {
+                let pane = *pane;
+                *self = Self::InProgress;
+                FinishAction::EmitQueued(pane)
+            }
+            Self::None => FinishAction::Done,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EventState, FinishAction};
+
+    #[test]
+    fn queued_event_is_idle_before_redispatch() {
+        let mut state = EventState::InProgressWithQueued(None);
+
+        assert_eq!(state.finish(true), FinishAction::EmitQueued(None));
+        assert_eq!(state, EventState::None);
+    }
 }
 
 pub struct TermWindow {
@@ -1616,24 +1657,13 @@ impl TermWindow {
     /// to execute against, so we should just mark as done.
     /// Otherwise, if there is a queued item, schedule it now.
     fn finish_window_event(&mut self, name: &str, again: bool) {
-        let state = self
+        let action = self
             .event_states
             .entry(name.to_string())
-            .or_insert(EventState::None);
-        if again {
-            match state {
-                EventState::InProgress => {
-                    *state = EventState::None;
-                }
-                EventState::InProgressWithQueued(pane) => {
-                    let pane = *pane;
-                    *state = EventState::InProgress;
-                    self.schedule_window_event(name, pane);
-                }
-                EventState::None => {}
-            }
-        } else {
-            *state = EventState::None;
+            .or_insert(EventState::None)
+            .finish(again);
+        if let FinishAction::EmitQueued(pane) = action {
+            self.schedule_window_event(name, pane);
         }
     }
 
