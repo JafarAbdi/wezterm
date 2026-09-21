@@ -7,7 +7,11 @@ mkdir AppDir
 
 case "${DEBUG_SYMBOLS:-0}" in
   0) install_flags=(-Dsm755) ;;
-  1) install_flags=(-Dm755) ;;
+  1)
+    install_flags=(-Dm755)
+    # linuxdeploy strips independently of install.
+    export NO_STRIP=1
+    ;;
   *) echo "DEBUG_SYMBOLS must be 0 or 1" >&2; exit 2 ;;
 esac
 
