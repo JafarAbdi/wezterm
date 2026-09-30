@@ -12,6 +12,8 @@ use mux::Mux;
 use std::rc::Rc;
 use wezterm_font::FontConfiguration;
 
+#[cfg(target_os = "android")]
+pub mod android;
 mod colorease;
 mod commands;
 mod customglyph;
@@ -23,6 +25,7 @@ pub mod glyphcache;
 mod inputmap;
 mod overlay;
 mod quad;
+pub mod renderfault;
 mod renderstate;
 mod resize_increment_calculator;
 mod scripting;

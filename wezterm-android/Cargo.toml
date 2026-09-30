@@ -29,11 +29,13 @@ wezterm-font.workspace = true
 wezterm-gui = { workspace = true, features = ["vendored-fonts"] }
 wezterm-version.workspace = true
 wgpu.workspace = true
+window.workspace = true
 zstd.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger.workspace = true
 jni.workspace = true
+ndk.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

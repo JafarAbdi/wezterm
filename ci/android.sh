@@ -8,7 +8,7 @@
 #   ci/android.sh inspect               gate the built artifacts (ELF, symbols, alignment, APK, signature); nonzero on any failure
 #   ci/android.sh inspect-selftest      prove the gate rejects missing and malformed artifacts using fixture copies
 #   ci/android.sh install <serial>      install the APK matching the device ABI
-#   ci/android.sh test <serial> <suite> rebuild for the device ABI and run connected instrumentation for <suite>
+#   ci/android.sh test <serial> <suite> check the Rust crates for the device ABI, rebuild, and run connected instrumentation for <suite>
 #
 # Machine-specific SDK/NDK locations come from the environment or from the
 # untracked ci/android.local.env written by `provision`.
@@ -25,8 +25,19 @@ PERMITTED_NEEDED=(libandroid.so libc.so libdl.so liblog.so libm.so)
 REQUIRED_JNI_EXPORTS=(
   Java_org_wezterm_android_NativeApp_nativeInitialize
   Java_org_wezterm_android_NativeApp_nativeDiagnosticFault
+  Java_org_wezterm_android_NativeApp_nativeTerminalStart
+  Java_org_wezterm_android_NativeApp_nativeSurfaceCreated
+  Java_org_wezterm_android_NativeApp_nativeSurfaceChanged
+  Java_org_wezterm_android_NativeApp_nativeSurfaceDestroyed
+  Java_org_wezterm_android_NativeApp_nativeSurfaceStatus
+  Java_org_wezterm_android_NativeApp_nativeAwaitSurfaceFrames
+  Java_org_wezterm_android_NativeApp_nativeAwaitSurfaceState
+  Java_org_wezterm_android_NativeApp_nativeAwaitRenderFailures
 )
-declare -A SUITE_CLASS=([native-load]=org.wezterm.android.NativeLoadTest)
+declare -A SUITE_CLASS=(
+  [native-load]=org.wezterm.android.NativeLoadTest
+  [surface]=org.wezterm.android.SurfaceTest
+)
 
 CARGO_NDK_VERSION=4.1.2
 JDK_VERSION="17.0.20.1+1"
@@ -319,8 +330,14 @@ cmd_test() {
   local class=${SUITE_CLASS[$suite]:-}
   [ -n "$class" ] || die "unknown suite '$suite' (known: ${!SUITE_CLASS[*]})"
   local abi; abi=$(device_abi "$serial"); require_abi "$abi"
+  # The Rust under test must pass its own gate before it is packaged.
+  cmd_check "$abi"
+  # WEZTERM_ANDROID_CONFIG_OVERRIDES: key=value config lines the suite passes
+  # to TerminalActivity (debug builds only), e.g. to pin a wgpu adapter on an
+  # emulator whose default adapter is unusable.
   ANDROID_SERIAL=$serial gradle :app:connectedDebugAndroidTest \
-    -Pandroid.testInstrumentationRunnerArguments.class="$class"
+    -Pandroid.testInstrumentationRunnerArguments.class="$class" \
+    -Pandroid.testInstrumentationRunnerArguments.configOverrides="${WEZTERM_ANDROID_CONFIG_OVERRIDES:-}"
 }
 
 case "${1:-}" in

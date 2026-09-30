@@ -70,6 +70,7 @@ winreg.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 filedescriptor.workspace = true
+ndk.workspace = true
 
 [target.'cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))'.dependencies]
 dirs-next.workspace = true
