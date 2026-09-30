@@ -187,6 +187,7 @@ fn register_panic_hook() {
 
 fn register_lua_modules() {
     for func in [
+        #[cfg(not(target_os = "android"))]
         battery::register,
         color_funcs::register,
         termwiz_funcs::register,

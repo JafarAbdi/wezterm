@@ -2,7 +2,17 @@
 // Copyright © 2015 Sebastian Thiel
 // <https://github.com/Byron/open-rs>
 
-#[cfg(not(windows))]
+#[cfg(target_os = "android")]
+pub fn open_url(url: &str) {
+    log::warn!("open_url({url}) is not routed to an Android intent yet");
+}
+
+#[cfg(target_os = "android")]
+pub fn open_with(url: &str, app: &str) {
+    log::warn!("open_with({url}, {app}) is not routed to an Android intent yet");
+}
+
+#[cfg(all(not(windows), not(target_os = "android")))]
 pub fn open_url(url: &str) {
     let url = url.to_string();
     std::thread::spawn(move || {
@@ -31,7 +41,7 @@ pub fn open_url(url: &str) {
     });
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "android")))]
 pub fn open_with(url: &str, app: &str) {
     let url = url.to_string();
     let app = app.to_string();

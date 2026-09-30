@@ -1,0 +1,39 @@
+[package]
+name = "wezterm-android"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "JNI entry point that loads the WezTerm GUI closure inside the Android app"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+codec.workspace = true
+config.workspace = true
+git2 = { workspace = true, default-features = false }
+libssh-rs = { workspace = true, features = ["vendored"] }
+log.workspace = true
+openssl.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+ssh2.workspace = true
+termwiz.workspace = true
+thiserror.workspace = true
+wezterm-font.workspace = true
+wezterm-gui = { workspace = true, features = ["vendored-fonts"] }
+wezterm-version.workspace = true
+wgpu.workspace = true
+zstd.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger.workspace = true
+jni.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

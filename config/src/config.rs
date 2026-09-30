@@ -1077,8 +1077,11 @@ impl Config {
         // We didn't find (or were asked to skip) a wezterm.lua file, so
         // update the environment to make it simpler to understand this
         // state.
-        std::env::remove_var("WEZTERM_CONFIG_FILE");
-        std::env::remove_var("WEZTERM_CONFIG_DIR");
+        #[cfg(not(target_os = "android"))]
+        {
+            std::env::remove_var("WEZTERM_CONFIG_FILE");
+            std::env::remove_var("WEZTERM_CONFIG_DIR");
+        }
 
         match Self::try_default() {
             Err(err) => LoadedConfig {
@@ -1149,9 +1152,12 @@ impl Config {
                 // problems earlier than we use them.
                 let _ = cfg.key_bindings();
 
-                std::env::set_var("WEZTERM_CONFIG_FILE", p);
-                if let Some(dir) = p.parent() {
-                    std::env::set_var("WEZTERM_CONFIG_DIR", dir);
+                #[cfg(not(target_os = "android"))]
+                {
+                    std::env::set_var("WEZTERM_CONFIG_FILE", p);
+                    if let Some(dir) = p.parent() {
+                        std::env::set_var("WEZTERM_CONFIG_DIR", dir);
+                    }
                 }
                 Ok(cfg)
             });
@@ -1756,6 +1762,22 @@ fn default_font_size() -> f64 {
     12.0
 }
 
+#[cfg(target_os = "android")]
+pub(crate) fn compute_cache_dir() -> anyhow::Result<PathBuf> {
+    Ok(crate::android_paths().cache.clone())
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn compute_data_dir() -> anyhow::Result<PathBuf> {
+    Ok(crate::android_paths().data.clone())
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn compute_runtime_dir() -> anyhow::Result<PathBuf> {
+    Ok(crate::android_paths().runtime.clone())
+}
+
+#[cfg(not(target_os = "android"))]
 pub(crate) fn compute_cache_dir() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = dirs_next::cache_dir() {
         return Ok(runtime.join("wezterm"));
@@ -1764,6 +1786,7 @@ pub(crate) fn compute_cache_dir() -> anyhow::Result<PathBuf> {
     Ok(crate::HOME_DIR.join(".local/share/wezterm"))
 }
 
+#[cfg(not(target_os = "android"))]
 pub(crate) fn compute_data_dir() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = dirs_next::data_dir() {
         return Ok(runtime.join("wezterm"));
@@ -1772,6 +1795,7 @@ pub(crate) fn compute_data_dir() -> anyhow::Result<PathBuf> {
     Ok(crate::HOME_DIR.join(".local/share/wezterm"))
 }
 
+#[cfg(not(target_os = "android"))]
 pub(crate) fn compute_runtime_dir() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = dirs_next::runtime_dir() {
         return Ok(runtime.join("wezterm"));

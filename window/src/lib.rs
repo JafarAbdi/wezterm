@@ -31,6 +31,7 @@ pub fn default_dpi() -> f64 {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 mod egl;
 
 pub use bitmaps::{BitmapImage, Image};
