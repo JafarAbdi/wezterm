@@ -20,6 +20,7 @@ use std::time::Duration;
 use wezterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, UnknownFieldAction, Value};
 use wezterm_term::UnicodeVersion;
 
+mod android;
 mod background;
 mod bell;
 mod cell;
@@ -45,6 +46,7 @@ pub mod window;
 mod wsl;
 
 pub use crate::config::*;
+pub use android::*;
 pub use background::*;
 pub use bell::*;
 pub use cell::*;
@@ -66,7 +68,7 @@ pub use wsl::*;
 type ErrorCallback = fn(&str);
 
 lazy_static! {
-    pub static ref HOME_DIR: PathBuf = dirs_next::home_dir().expect("can't find HOME dir");
+    pub static ref HOME_DIR: PathBuf = home_dir();
     pub static ref CONFIG_DIRS: Vec<PathBuf> = config_dirs();
     pub static ref RUNTIME_DIR: PathBuf = compute_runtime_dir().unwrap();
     pub static ref DATA_DIR: PathBuf = compute_data_dir().unwrap();
@@ -382,6 +384,22 @@ pub fn create_user_owned_dirs(p: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "android")]
+fn home_dir() -> PathBuf {
+    android_paths().home.clone()
+}
+
+#[cfg(not(target_os = "android"))]
+fn home_dir() -> PathBuf {
+    dirs_next::home_dir().expect("can't find HOME dir")
+}
+
+#[cfg(target_os = "android")]
+fn config_dirs() -> Vec<PathBuf> {
+    vec![android_paths().config.clone()]
+}
+
+#[cfg(not(target_os = "android"))]
 fn xdg_config_home() -> PathBuf {
     match std::env::var_os("XDG_CONFIG_HOME").map(|s| PathBuf::from(s).join("wezterm")) {
         Some(p) => p,
@@ -389,6 +407,7 @@ fn xdg_config_home() -> PathBuf {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn config_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     dirs.push(xdg_config_home());

@@ -68,7 +68,10 @@ windows = { workspace=true, features = [
 ]}
 winreg.workspace = true
 
-[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+[target.'cfg(target_os = "android")'.dependencies]
+filedescriptor.workspace = true
+
+[target.'cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))'.dependencies]
 dirs-next.workspace = true
 filedescriptor.workspace = true
 futures-lite.workspace = true

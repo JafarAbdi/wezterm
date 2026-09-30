@@ -1,4 +1,4 @@
-.PHONY: all fmt build check test docs servedocs
+.PHONY: all fmt build check test docs servedocs android-provision android-native android-build android-check android-inspect android-inspect-selftest android-install android-test
 
 all: build
 
@@ -27,3 +27,30 @@ docs:
 
 servedocs:
 	ci/build-docs.sh serve
+
+ABI ?=
+SUITE ?= native-load
+
+android-provision:
+	ci/android.sh provision
+
+android-native:
+	ci/android.sh native $(ABI)
+
+android-build:
+	ci/android.sh build
+
+android-check:
+	ci/android.sh check $(ABI)
+
+android-inspect:
+	ci/android.sh inspect
+
+android-inspect-selftest:
+	ci/android.sh inspect-selftest
+
+android-install:
+	ci/android.sh install $(SERIAL)
+
+android-test:
+	ci/android.sh test $(SERIAL) $(SUITE)

@@ -32,7 +32,7 @@ pub mod rasterizer;
 pub mod shaper;
 pub mod units;
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
 pub mod fcwrap;
 
 pub use crate::rasterizer::RasterizedGlyph;

@@ -9,7 +9,6 @@ publish = false
 
 [dependencies]
 backtrace.workspace = true
-battery.workspace = true
 chrono.workspace = true
 color-funcs.workspace = true
 config.workspace = true
@@ -32,6 +31,10 @@ termwiz.workspace = true
 time-funcs.workspace = true
 url-funcs.workspace = true
 wezterm-version.workspace = true
+
+# starship-battery has no Android platform backend.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+battery.workspace = true
 
 [target."cfg(windows)".dependencies]
 winapi.workspace = true
