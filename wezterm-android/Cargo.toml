@@ -36,6 +36,7 @@ zstd.workspace = true
 android_logger.workspace = true
 jni.workspace = true
 ndk.workspace = true
+promise.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

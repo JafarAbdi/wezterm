@@ -1,10 +1,17 @@
 //! GUI-thread owner of the logical windows and of the one surface slot the
 //! Activity's `SurfaceView` occupies.
+//!
+//! Every logical window lives here for as long as its terminal does; at
+//! most one of them, the bound window, holds GPU state on the surface.  The
+//! others stay surfaceless and are listed for the platform's selector.
+//! Losing the surface or the binding dispatches `SurfaceLost`, never
+//! `CloseRequested` or `Destroyed`.
 
 #![forbid(unsafe_code)]
 
-use super::monitor::surface_monitor;
+use super::monitor::{note_loop_wakeup, surface_monitor, WindowSummary};
 use super::native_window::NativeWindowLease;
+use super::requests::{platform_requests, PlatformRequest};
 use super::window::{Window, WindowInner};
 use super::AndroidSurfaceEvent;
 use crate::connection::ConnectionOps;
@@ -14,7 +21,7 @@ use crate::{Dimensions, RequestedWindowGeometry, WindowEvent, WindowEventSender,
 use config::ConfigHandle;
 use filedescriptor::{poll, pollfd, POLLIN};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -28,35 +35,13 @@ pub fn set_display_dpi(dpi: usize) {
     DISPLAY_DPI.store(dpi, Ordering::SeqCst);
 }
 
-/// The GUI engine has no promise scheduler yet, so nothing can run on the
-/// GUI thread.
-#[derive(Debug, thiserror::Error)]
-#[error("the GUI engine is not running; surface events cannot be delivered")]
-pub struct NotRunning;
-
-/// Queue a surface callback for the GUI thread.  Safe from any thread; the
-/// event is applied in order with every other GUI-thread task.
-pub fn post_surface_event(event: AndroidSurfaceEvent) -> Result<(), NotRunning> {
-    if !promise::spawn::is_scheduler_configured() {
-        return Err(NotRunning);
-    }
-    promise::spawn::spawn_into_main_thread(async move {
-        match Connection::get() {
-            Some(conn) => conn.apply_surface_event(event),
-            None => log::error!("surface event {event:?} arrived without a Connection"),
-        }
-    })
-    .detach();
-    Ok(())
-}
-
 pub struct Connection {
     dpi: usize,
     next_window_id: Cell<usize>,
-    windows: RefCell<HashMap<usize, Rc<RefCell<WindowInner>>>>,
+    windows: RefCell<BTreeMap<usize, Rc<RefCell<WindowInner>>>>,
     surface: RefCell<SurfaceState<Arc<NativeWindowLease>>>,
-    /// The logical window that presents on the surface slot; the first
-    /// window binds.
+    /// The logical window that presents on the surface slot.  The first
+    /// window binds; `select_window` rebinds.
     bound: Cell<Option<usize>>,
     terminate: Cell<bool>,
 }
@@ -70,7 +55,7 @@ impl Connection {
         Ok(Self {
             dpi,
             next_window_id: Cell::new(1),
-            windows: RefCell::new(HashMap::new()),
+            windows: RefCell::new(BTreeMap::new()),
             surface: RefCell::new(SurfaceState::default()),
             bound: Cell::new(None),
             terminate: Cell::new(false),
@@ -96,9 +81,9 @@ impl Connection {
         self.windows
             .borrow_mut()
             .insert(id, Rc::new(RefCell::new(WindowInner::new(events))));
-        if self.bound.get().is_none() {
+        let binds = self.bound.get().is_none();
+        if binds {
             self.bound.set(Some(id));
-            surface_monitor().update(|s| s.bound_window = Some(id));
             // The caller finishes wiring its handler after this returns;
             // deliver the slot's current state on the next GUI-thread turn.
             promise::spawn::spawn(async move {
@@ -108,7 +93,71 @@ impl Connection {
             })
             .detach();
         }
+        self.publish_windows(|s| {
+            s.windows.push(WindowSummary {
+                id,
+                title: String::new(),
+            });
+            if binds {
+                s.bound_window = Some(id);
+            }
+        });
         Ok(window)
+    }
+
+    fn publish_windows(&self, f: impl FnOnce(&mut super::SurfaceSnapshot)) {
+        surface_monitor().update(f);
+        platform_requests().push(PlatformRequest::WindowsChanged);
+    }
+
+    pub(super) fn set_title(&self, id: usize, title: String) {
+        let unchanged = surface_monitor()
+            .snapshot()
+            .windows
+            .iter()
+            .all(|window| window.id != id || window.title == title);
+        if unchanged {
+            return;
+        }
+        self.publish_windows(|s| {
+            if let Some(window) = s.windows.iter_mut().find(|window| window.id == id) {
+                window.title = title;
+            }
+        });
+    }
+
+    /// Present `id` on the surface slot instead of the window bound now.
+    /// The window that loses the binding drops its GPU state and stays
+    /// alive; an unknown or already bound id changes nothing.
+    pub fn select_window(&self, id: usize) {
+        if self.bound.get() == Some(id) || self.window_by_id(id).is_none() {
+            log::warn!(
+                "ignoring selection of window {id}; bound is {:?}",
+                self.bound.get()
+            );
+            return;
+        }
+        self.bind(Some(id));
+    }
+
+    /// Take the surface away from the bound window.  Its GPU state must be
+    /// gone before another window targets the same native window.
+    fn unbind(&self) {
+        if self.surface.borrow().is_present() {
+            self.dispatch_bound(WindowEvent::FocusChanged(false));
+            self.dispatch_bound(WindowEvent::SurfaceLost);
+        }
+        self.bound.set(None);
+    }
+
+    fn bind(&self, id: Option<usize>) {
+        self.unbind();
+        self.bound.set(id);
+        self.publish_windows(|s| s.bound_window = id);
+        log::info!("window {id:?} is bound to the surface slot");
+        if let Some(id) = id {
+            self.present_current_surface(id);
+        }
     }
 
     pub(super) fn window_by_id(&self, id: usize) -> Option<Rc<RefCell<WindowInner>>> {
@@ -129,14 +178,40 @@ impl Connection {
     }
 
     pub(super) fn close_window(&self, id: usize) {
+        let was_bound = self.bound.get() == Some(id);
+        if was_bound {
+            self.unbind();
+        }
         let Some(inner) = self.windows.borrow_mut().remove(&id) else {
             return;
         };
-        if self.bound.get() == Some(id) {
-            self.bound.set(None);
-            surface_monitor().update(|s| s.bound_window = None);
-        }
         inner.borrow_mut().events.dispatch(WindowEvent::Destroyed);
+        self.publish_windows(|s| {
+            s.windows.retain(|window| window.id != id);
+            s.closed_windows += 1;
+        });
+        if was_bound {
+            let next = self.windows.borrow().keys().next().copied();
+            self.bind(next);
+        }
+    }
+
+    /// The engine is ending and nothing runs on this thread afterwards:
+    /// drop the bound window's GPU state, then release the native window.
+    /// Returns whether no reference to a native window survives.
+    pub fn retire(&self) -> bool {
+        // Also when the slot is already absent: a handler that panicked
+        // while it applied that loss may have kept its GPU state.
+        self.dispatch_bound(WindowEvent::SurfaceLost);
+        let lease = self.surface.take().into_lease();
+        let released = lease.map_or(true, |lease| Arc::strong_count(&lease) == 1);
+        surface_monitor().update(|s| {
+            s.state = "absent";
+            s.generation = None;
+            s.width = 0;
+            s.height = 0;
+        });
+        released
     }
 
     /// The lease behind `window`'s raw handle, while it is bound and a
@@ -148,18 +223,22 @@ impl Connection {
         self.surface.borrow().lease().cloned()
     }
 
-    fn bound_window(&self) -> Option<Rc<RefCell<WindowInner>>> {
+    pub fn bound_window(&self) -> Option<Window> {
+        self.bound.get().map(Window::new)
+    }
+
+    fn bound_inner(&self) -> Option<Rc<RefCell<WindowInner>>> {
         self.bound.get().and_then(|id| self.window_by_id(id))
     }
 
     fn dispatch_bound(&self, event: WindowEvent) {
-        if let Some(inner) = self.bound_window() {
+        if let Some(inner) = self.bound_inner() {
             inner.borrow_mut().events.dispatch(event);
         }
     }
 
     fn invalidate_bound(&self) {
-        if let Some(inner) = self.bound_window() {
+        if let Some(inner) = self.bound_inner() {
             inner.borrow_mut().invalidated = true;
         }
     }
@@ -194,7 +273,7 @@ impl Connection {
         self.invalidate_bound();
     }
 
-    fn apply_surface_event(&self, event: AndroidSurfaceEvent) {
+    pub fn apply_surface_event(&self, event: AndroidSurfaceEvent) {
         log::info!("surface event {event:?}");
         let (next, effects) = self.surface.take().apply(event);
         let generation = next.generation().map(|g| g.get());
@@ -205,6 +284,10 @@ impl Connection {
             SurfaceState::Present { .. } => "present",
         };
         *self.surface.borrow_mut() = next;
+        // Published before the effects run: frames are counted against the
+        // new generation, and the platform thread that waits for a
+        // retirement sees `absent` when it returns.  Other observers see
+        // `absent` before `live_leases` drops.
         surface_monitor().update(|s| {
             if s.generation != generation {
                 s.frames_presented = 0;
@@ -256,7 +339,7 @@ impl Connection {
 
     /// Paint the bound window once if it was invalidated and can present.
     fn paint_invalidated(&self) {
-        let Some(inner) = self.bound_window() else {
+        let Some(inner) = self.bound_inner() else {
             return;
         };
         if !self.surface.borrow().is_present() {
@@ -300,6 +383,7 @@ impl ConnectionOps for Connection {
                     if err.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(err) => return Err(err.into()),
             }
+            note_loop_wakeup();
             while SPAWN_QUEUE.run() {}
             self.paint_invalidated();
         }

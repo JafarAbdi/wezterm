@@ -20,18 +20,12 @@ pub struct GuiOptions {
 
 /// Run the GUI on the calling thread until its message loop terminates.
 ///
-/// `ready` runs exactly once before the loop starts, with the bootstrap
-/// result.  From a successful `ready` on, the promise scheduler accepts
-/// work for this thread.
-pub fn run(options: GuiOptions, ready: impl FnOnce(anyhow::Result<()>)) -> anyhow::Result<()> {
-    let gui = match bootstrap(options) {
-        Ok(gui) => gui,
-        Err(err) => {
-            ready(Err(anyhow::anyhow!("{err:#}")));
-            return Err(err);
-        }
-    };
-    ready(Ok(()));
+/// `running` runs once, after a successful bootstrap and before the loop
+/// starts.  From then on the promise scheduler accepts work for this
+/// thread.
+pub fn run(options: GuiOptions, running: impl FnOnce()) -> anyhow::Result<()> {
+    let gui = bootstrap(options)?;
+    running();
     let result = gui.run_forever();
     Mux::shutdown();
     frontend::shutdown();
@@ -53,12 +47,7 @@ fn bootstrap(options: GuiOptions) -> anyhow::Result<Rc<frontend::GuiFrontEnd>> {
 
     if options.diagnostic_applet {
         #[cfg(debug_assertions)]
-        promise::spawn::spawn(async {
-            if let Err(err) = diagnostic::run().await {
-                log::error!("diagnostic applet ended: {err:#}");
-            }
-        })
-        .detach();
+        diagnostic::open_window();
         #[cfg(not(debug_assertions))]
         log::warn!("the diagnostic applet exists only in debug builds");
     }

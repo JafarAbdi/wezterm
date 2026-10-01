@@ -40,9 +40,29 @@ object NativeApp {
     @JvmStatic
     external fun nativeSurfaceChanged(generation: Long, width: Int, height: Int)
 
-    /** Blocks until the GUI thread released the native window; false when the engine dropped the event. */
+    /**
+     * Blocks until the GUI thread released the native window. False when the
+     * engine ended instead: its shutdown has finished, but it did not confirm
+     * the release.
+     */
     @JvmStatic
     external fun nativeSurfaceDestroyed(generation: Long): Boolean
+
+    /** Binds logical window `id` to the surface. Throws when the engine is not accepting events. */
+    @JvmStatic
+    external fun nativeSelectWindow(id: Long)
+
+    /** Blocks until the GUI thread asks for something; null once the engine ended. See [PlatformRequests]. */
+    @JvmStatic
+    external fun nativeNextRequest(): String?
+
+    /** Answers a `clipboard_get` request; null `text` means the read was refused. Throws when the engine ended. */
+    @JvmStatic
+    external fun nativeClipboardText(request: Long, text: String?)
+
+    /** Blocks until the status revision differs from `since`, or `timeoutMs` elapsed; returns the current revision. */
+    @JvmStatic
+    external fun nativeAwaitSurfaceChange(since: Long, timeoutMs: Long): Long
 
     @JvmStatic
     private external fun nativeSurfaceStatus(): String
@@ -68,6 +88,16 @@ object NativeApp {
     @JvmStatic
     external fun nativeDiagnosticFault(kind: Int): String
 
+    /**
+     * Debug builds only. Runs `open-window`, `paste`,
+     * `panic-on-queued-destroy` or `panic-with-clipboard-read` on the GUI
+     * thread, or arms `panic-in-surface-lost`; false when the command is
+     * unknown or no GUI thread accepts work. `panic-with-clipboard-read`
+     * blocks until the read resolves and is also false when it did not fail.
+     */
+    @JvmStatic
+    external fun nativeDiagnosticGui(command: String): Boolean
+
     /** Render stage codes shared by [nativeDiagnosticFault] and [nativeAwaitRenderFailures]. */
     const val STAGE_GPU_CREATION = 2
     const val STAGE_DRAW = 3
@@ -91,6 +121,7 @@ object NativeApp {
      */
     fun startTerminal(context: Context, configOverrides: String): String {
         val app = context.applicationContext
+        PlatformRequests.start(app)
         return nativeTerminalStart(
             app.filesDir.absolutePath,
             app.cacheDir.absolutePath,
@@ -107,6 +138,9 @@ object NativeApp {
 /** Mirror of the Rust `terminal::Status`. */
 data class SurfaceStatus(
     val engine: String,
+    /** Why the engine failed; empty otherwise. */
+    val engineMessage: String,
+    val revision: Long,
     val state: String,
     val generation: Long,
     val width: Int,
@@ -117,6 +151,12 @@ data class SurfaceStatus(
     val retireAcks: Long,
     val liveLeases: Int,
     val boundWindow: Long?,
+    /** Every logical window, bound or surfaceless. */
+    val windows: List<WindowSummary>,
+    val closedWindows: Long,
+    val clipboardRequests: Long,
+    val clipboardResponses: Long,
+    val loopWakeups: Long,
     val gpuCreationFailures: Long,
     val drawFailures: Long,
     val rawJson: String,
@@ -126,8 +166,12 @@ data class SurfaceStatus(
             val root = JSONObject(json)
             val surface = root.getJSONObject("surface")
             val render = root.getJSONObject("render")
+            val engine = root.getJSONObject("engine")
+            val windows = surface.getJSONArray("windows")
             return SurfaceStatus(
-                engine = root.getJSONObject("engine").getString("status"),
+                engine = engine.getString("status"),
+                engineMessage = engine.optString("message"),
+                revision = surface.getLong("revision"),
                 state = surface.getString("state"),
                 generation = if (surface.isNull("generation")) 0 else surface.getLong("generation"),
                 width = surface.getInt("width"),
@@ -138,6 +182,14 @@ data class SurfaceStatus(
                 retireAcks = surface.getLong("retire_acks"),
                 liveLeases = surface.getInt("live_leases"),
                 boundWindow = if (surface.isNull("bound_window")) null else surface.getLong("bound_window"),
+                windows = List(windows.length()) {
+                    val window = windows.getJSONObject(it)
+                    WindowSummary(window.getLong("id"), window.getString("title"))
+                },
+                closedWindows = surface.getLong("closed_windows"),
+                clipboardRequests = surface.getLong("clipboard_requests"),
+                clipboardResponses = surface.getLong("clipboard_responses"),
+                loopWakeups = surface.getLong("loop_wakeups"),
                 gpuCreationFailures = render.getLong("gpu_creation"),
                 drawFailures = render.getLong("draw"),
                 rawJson = json,
@@ -145,6 +197,9 @@ data class SurfaceStatus(
         }
     }
 }
+
+/** One logical window as the native side lists it. */
+data class WindowSummary(val id: Long, val title: String)
 
 /** Mirror of the Rust `InitResponse` envelope. */
 data class InitResponse(val initCalls: Int, val outcome: InitOutcome, val rawJson: String) {

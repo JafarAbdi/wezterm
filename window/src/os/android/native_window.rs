@@ -61,8 +61,9 @@ impl Drop for NativeWindowLease {
             "surface generation {} native window released",
             self.generation.get()
         );
-        if let Some(ack) = self.retire.lock().unwrap().take() {
-            super::monitor::surface_monitor().update(|s| s.retire_acks += 1);
+        let ack = self.retire.lock().unwrap().take();
+        super::monitor::surface_monitor().update(|s| s.retire_acks += u64::from(ack.is_some()));
+        if let Some(ack) = ack {
             ack.send();
         }
     }

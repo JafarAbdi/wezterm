@@ -988,6 +988,11 @@ impl TermWindow {
             myself.subscribe_to_pane_updates();
             myself.emit_window_event("window-config-reloaded", None);
             myself.emit_status_event();
+            if cfg!(target_os = "android") {
+                // The window selector lists a window by title before any
+                // surface event reaches it.
+                myself.update_title();
+            }
         }
 
         crate::update::start_update_checker();
@@ -1021,6 +1026,7 @@ impl TermWindow {
                 Ok(true)
             }
             WindowEvent::SurfaceLost => {
+                renderfault::injected_surface_lost_panic();
                 self.surface_lost();
                 Ok(true)
             }

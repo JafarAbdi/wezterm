@@ -45,7 +45,9 @@ class SurfaceTest {
             "surface did not reach $state (generation $generation) within ${TIMEOUT_MS}ms: ${NativeApp.surfaceStatus().rawJson}",
             NativeApp.nativeAwaitSurfaceState(state, generation, TIMEOUT_MS),
         )
-        return NativeApp.surfaceStatus()
+        // `absent` is published before the lease is released; only the thread
+        // inside surfaceDestroyed is guaranteed to see both.
+        return TerminalHarness.awaitStatus("$state settled") { state != "absent" || it.liveLeases == 0 }
     }
 
     private fun awaitFrames(generation: Long, minFrames: Long): SurfaceStatus {

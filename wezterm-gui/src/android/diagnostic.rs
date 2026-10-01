@@ -4,7 +4,13 @@
 //! fallback glyphs into a mux pane, so the Android surface shows what
 //! `TermWindow` renders without any shell or remote domain.
 
+use crate::termwindow::TermWindowNotif;
+use ::window::{Connection, ConnectionOps, WindowOps};
+use anyhow::Context;
+use config::keyassignment::{ClipboardPasteSource, KeyAssignment};
 use mux::termwiztermtab::TermWizTerminal;
+use mux::Mux;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use termwiz::cell::{AttributeChange, CellAttributes, Intensity, Underline};
 use termwiz::color::{AnsiColor, ColorAttribute};
 use termwiz::input::InputEvent;
@@ -25,30 +31,76 @@ pub const ROWS: [&str; 8] = [
     "cursor> ",
 ];
 
-/// Create the applet's mux window and run it until its pane goes away.
-pub async fn run() -> anyhow::Result<()> {
-    let size = TerminalSize {
-        rows: 24,
-        cols: 80,
-        pixel_width: 80 * 8,
-        pixel_height: 24 * 16,
-        dpi: 0,
-    };
-    mux::termwiztermtab::run(size, None, draw_until_closed, None).await
+static WINDOWS_OPENED: AtomicUsize = AtomicUsize::new(0);
+
+/// Open one more applet window.  Each is its own mux window with its own
+/// logical GUI window; the first one is titled `diagnostic 1`.
+pub fn open_window() {
+    let number = WINDOWS_OPENED.fetch_add(1, Ordering::SeqCst) + 1;
+    promise::spawn::spawn(async move {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 80 * 8,
+            pixel_height: 24 * 16,
+            dpi: 0,
+        };
+        let draw = move |term| draw_until_closed(term, number);
+        if let Err(err) = mux::termwiztermtab::run(size, None, draw, None).await {
+            log::error!("diagnostic applet {number} ended: {err:#}");
+        }
+    })
+    .detach();
 }
 
-fn draw_until_closed(mut term: TermWizTerminal) -> anyhow::Result<()> {
+/// Paste the clipboard into the active pane of the window bound to the
+/// surface, through the same key assignment a paste shortcut performs.
+pub fn paste_into_bound_window() -> anyhow::Result<()> {
+    let bound = Connection::get()
+        .and_then(|conn| conn.bound_window())
+        .context("no window is bound")?;
+    let gui_window = crate::frontend::front_end()
+        .gui_windows()
+        .into_iter()
+        .find(|gui_window| gui_window.window == bound)
+        .context("the bound window has no terminal window")?;
+    let pane = Mux::get()
+        .get_active_tab_for_window(gui_window.mux_window_id)
+        .and_then(|tab| tab.get_active_pane())
+        .context("the bound window has no active pane")?;
+    bound.notify(TermWindowNotif::PerformAssignment {
+        pane_id: pane.pane_id(),
+        assignment: KeyAssignment::PasteFrom(ClipboardPasteSource::Clipboard),
+        tx: None,
+    });
+    Ok(())
+}
+
+/// Start a clipboard read on the window bound to the surface.
+pub fn read_bound_clipboard() -> anyhow::Result<promise::Future<String>> {
+    let bound = Connection::get()
+        .and_then(|conn| conn.bound_window())
+        .context("no window is bound")?;
+    Ok(bound.get_clipboard(::window::Clipboard::Clipboard))
+}
+
+fn draw_until_closed(mut term: TermWizTerminal, number: usize) -> anyhow::Result<()> {
     term.no_grab_mouse_in_raw_mode();
     term.set_raw_mode()?;
     let mut size = term.get_screen_size()?;
     let mut redraws = 0u64;
+    let mut pasted = String::new();
     loop {
         redraws += 1;
-        term.render(&grid(size.cols, size.rows, redraws))?;
+        term.render(&grid(number, size.cols, size.rows, redraws, &pasted))?;
         term.flush()?;
-        if let Some(InputEvent::Resized { cols, rows }) = term.poll_input(None)? {
-            size.cols = cols;
-            size.rows = rows;
+        match term.poll_input(None)? {
+            Some(InputEvent::Resized { cols, rows }) => {
+                size.cols = cols;
+                size.rows = rows;
+            }
+            Some(InputEvent::Paste(text)) => pasted = text,
+            _ => {}
         }
     }
 }
@@ -65,13 +117,20 @@ fn text(s: &str) -> Change {
     Change::Text(s.to_string())
 }
 
-fn grid(cols: usize, rows: usize, redraws: u64) -> Vec<Change> {
+/// The first window draws exactly [`ROWS`]; later windows append their
+/// number to row 0, and pasted text follows the prompt of the last row.
+fn grid(number: usize, cols: usize, rows: usize, redraws: u64, pasted: &str) -> Vec<Change> {
+    let heading = match number {
+        1 => ROWS[0].to_string(),
+        _ => format!("{} #{number}", ROWS[0]),
+    };
     vec![
+        Change::Title(format!("diagnostic {number}")),
         Change::ClearScreen(ColorAttribute::Default),
         Change::CursorVisibility(CursorVisibility::Visible),
         Change::CursorShape(CursorShape::SteadyBlock),
         Change::Attribute(AttributeChange::Intensity(Intensity::Bold)),
-        text(ROWS[0]),
+        text(&heading),
         reset(),
         text(&format!("\r\ncols={cols} rows={rows} redraw={redraws}\r\n")),
         text("attrs: "),
@@ -114,7 +173,7 @@ fn grid(cols: usize, rows: usize, redraws: u64) -> Vec<Change> {
         text("on-blue"),
         reset(),
         text(&format!(
-            "\r\n{}\r\n{}\r\n{}\r\n{}",
+            "\r\n{}\r\n{}\r\n{}\r\n{}{pasted}",
             ROWS[4], ROWS[5], ROWS[6], ROWS[7]
         )),
     ]
