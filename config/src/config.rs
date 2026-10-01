@@ -100,7 +100,7 @@ pub struct Config {
     /// search ahead of the standard font locations for fonts.
     /// Relative paths are taken to be relative to the directory
     /// from which the config was loaded.
-    #[dynamic(default)]
+    #[dynamic(default = "default_font_dirs")]
     pub font_dirs: Vec<PathBuf>,
 
     #[dynamic(default)]
@@ -346,7 +346,7 @@ pub struct Config {
     #[dynamic(default = "default_harfbuzz_features")]
     pub harfbuzz_features: Vec<String>,
 
-    #[dynamic(default)]
+    #[dynamic(default = "default_front_end")]
     pub front_end: FrontEndSelection,
 
     /// Whether to select the higher powered discrete GPU when
@@ -817,7 +817,7 @@ pub struct Config {
     #[dynamic(default)]
     pub sort_fallback_fonts_by_coverage: bool,
 
-    #[dynamic(default)]
+    #[dynamic(default = "default_search_font_dirs_for_fallback")]
     pub search_font_dirs_for_fallback: bool,
 
     #[dynamic(default)]
@@ -1626,6 +1626,31 @@ impl Config {
         // de-facto standard for identifying the terminal.
         cmd.env("TERM_PROGRAM", "WezTerm");
         cmd.env("TERM_PROGRAM_VERSION", crate::wezterm_version());
+    }
+}
+
+/// Android has no font service to ask; the platform's own fallback faces
+/// (the files `/system/etc/fonts.xml` names) live in `/system/fonts`, so
+/// that directory is the default font database and takes part in glyph
+/// fallback.
+fn default_font_dirs() -> Vec<PathBuf> {
+    if cfg!(target_os = "android") {
+        vec![PathBuf::from("/system/fonts")]
+    } else {
+        vec![]
+    }
+}
+
+fn default_search_font_dirs_for_fallback() -> bool {
+    cfg!(target_os = "android")
+}
+
+/// Android has no OpenGL window backend, so its only renderer is wgpu.
+fn default_front_end() -> FrontEndSelection {
+    if cfg!(target_os = "android") {
+        FrontEndSelection::WebGpu
+    } else {
+        FrontEndSelection::OpenGL
     }
 }
 

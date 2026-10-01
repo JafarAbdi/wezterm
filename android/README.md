@@ -4,8 +4,10 @@ Native Android client that attaches to a laptop's WezTerm multiplexer over
 SSH through your own Tailscale network. Everything you type runs on the
 laptop.
 
-Current state: the app only shows a native initialization diagnostic. It does
-not render a terminal or connect anywhere yet.
+Current state: the app renders WezTerm's own terminal window on a native
+surface, using the bundled fonts plus the device's `/system/fonts` for CJK
+and other scripts. Debug builds show a built-in diagnostic text grid;
+nothing runs a shell and nothing connects anywhere yet.
 
 ## Build
 
@@ -27,8 +29,15 @@ APKs land in `android/app/build/outputs/apk/debug/app-<abi>-debug.apk`.
 ```sh
 adb devices
 make android-install SERIAL=<serial>
-make android-test SERIAL=<serial> SUITE=native-load   # rebuilds for the device ABI, then runs the suite
+make android-test SERIAL=<serial> SUITE=native-load   # checks and rebuilds for the device ABI, then runs the suite
+make android-test SERIAL=<serial> SUITE=surface       # renders, retires and resumes the terminal surface
 ```
 
-The launcher entry "WezTerm" opens the diagnostic screen and prints a
-`WezTermDiag` line to logcat.
+The launcher entry "WezTerm" opens the terminal surface and logs
+`WezTermSurface` lines; `org.wezterm.android/.DiagnosticActivity` still shows
+the native initialization report (`WezTermDiag`).
+
+On the API 35 x86_64 emulator started with `-gpu swiftshader`, run the app
+and the `surface` suite with
+`WEZTERM_ANDROID_CONFIG_OVERRIDES='webgpu_preferred_adapter={name="Android Emulator OpenGL ES Translator (Google SwiftShader)",backend="Gl",device_type="Cpu"}'`;
+its Vulkan implementation aborts the emulator otherwise (see `AGENTS.md`).

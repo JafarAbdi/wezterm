@@ -9,7 +9,7 @@ use window::raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
     RawWindowHandle, WindowHandle,
 };
-use window::{BitmapImage, Dimensions, Rect, Window};
+use window::{BitmapImage, Dimensions, Rect, SurfaceLease, Window, WindowOps};
 
 #[repr(C)]
 #[derive(Copy, Clone, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -40,6 +40,9 @@ pub struct WebGpuState {
 pub struct RawHandlePair {
     window: RawWindowHandle,
     display: RawDisplayHandle,
+    /// Keeps the native surface behind `window` alive for as long as the
+    /// wgpu surface built on it exists.
+    _lease: Option<SurfaceLease>,
 }
 
 impl RawHandlePair {
@@ -47,6 +50,7 @@ impl RawHandlePair {
         Self {
             window: window.window_handle().expect("window handle").as_raw(),
             display: window.display_handle().expect("display handle").as_raw(),
+            _lease: window.surface_lease(),
         }
     }
 }
@@ -188,6 +192,28 @@ pub fn adapter_info_to_gpu_info(info: wgpu::AdapterInfo) -> GpuInfo {
     }
 }
 
+/// The instance backends to create: only the one a
+/// `webgpu_preferred_adapter` names, otherwise all of them.
+///
+/// Each backend creates its own surface on the window.  On Android a
+/// Vulkan surface connects the native window as a producer, after which
+/// the GL backend cannot create its EGL surface on the same window, so a
+/// preference for the GL adapter must keep Vulkan away from the window.
+fn preferred_backends(config: &ConfigHandle) -> wgpu::Backends {
+    let backend = config
+        .webgpu_preferred_adapter
+        .as_ref()
+        .map(|preference| preference.backend.as_str());
+    match backend {
+        Some("Vulkan") => wgpu::Backends::VULKAN,
+        Some("Metal") => wgpu::Backends::METAL,
+        Some("Dx12") => wgpu::Backends::DX12,
+        Some("Gl") => wgpu::Backends::GL,
+        Some("BrowserWebGpu") => wgpu::Backends::BROWSER_WEBGPU,
+        _ => wgpu::Backends::all(),
+    }
+}
+
 fn compute_compatibility_list(
     instance: &wgpu::Instance,
     backends: wgpu::Backends,
@@ -223,7 +249,7 @@ impl WebGpuState {
         dimensions: Dimensions,
         config: &ConfigHandle,
     ) -> anyhow::Result<Self> {
-        let backends = wgpu::Backends::all();
+        let backends = preferred_backends(config);
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends,
             ..Default::default()
@@ -319,22 +345,33 @@ impl WebGpuState {
         let downlevel_caps = adapter.get_downlevel_capabilities();
         log::trace!("downlevel_caps: {downlevel_caps:?}");
 
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::empty(),
-                // WebGL doesn't support all of wgpu's features, so if
-                // we're building for the web we'll have to disable some.
-                required_limits: if cfg!(target_arch = "wasm32") {
-                    wgpu::Limits::downlevel_webgl2_defaults()
-                } else {
-                    wgpu::Limits::downlevel_defaults()
-                }
-                .using_resolution(adapter.limits()),
-                label: None,
-                memory_hints: Default::default(),
-                trace: wgpu::Trace::Off,
-            })
-            .await?;
+        let device_descriptor = |limits: wgpu::Limits| wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::empty(),
+            required_limits: limits.using_resolution(adapter.limits()),
+            label: None,
+            memory_hints: Default::default(),
+            trace: wgpu::Trace::Off,
+        };
+        // WebGL doesn't support all of wgpu's features, so if
+        // we're building for the web we'll have to disable some.
+        let limits = if cfg!(target_arch = "wasm32") {
+            wgpu::Limits::downlevel_webgl2_defaults()
+        } else {
+            wgpu::Limits::downlevel_defaults()
+        };
+        let (device, queue) = match adapter.request_device(&device_descriptor(limits)).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                // GLES 3.0 class adapters (the Android emulator's GL
+                // translator) reject the compute limits of the downlevel
+                // defaults.  Rendering uses vertex and fragment stages
+                // only, so the WebGL2 profile is sufficient.
+                log::warn!("request_device: {err:#}; retrying with the WebGL2 limit profile");
+                adapter
+                    .request_device(&device_descriptor(wgpu::Limits::downlevel_webgl2_defaults()))
+                    .await?
+            }
+        };
 
         let queue = Arc::new(queue);
 

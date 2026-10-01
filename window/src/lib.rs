@@ -15,6 +15,7 @@ pub mod connection;
 pub mod os;
 pub mod screen;
 mod spawn;
+pub mod surface;
 
 pub use cursor_icon::CursorIcon;
 pub use raw_window_handle;
@@ -158,6 +159,19 @@ pub enum WindowEvent {
     /// Called when the window is being destroyed by the window system
     Destroyed,
 
+    /// A presentation surface for the window became available.  Backends
+    /// whose surfaces arrive after the window exists (Android) send this
+    /// before the matching `Resized`; GPU state may be created now.
+    SurfaceAvailable {
+        dimensions: Dimensions,
+    },
+
+    /// The presentation surface is going away.  Every GPU reference to it
+    /// must be dropped before the handler returns.  The logical window
+    /// stays alive and a later `SurfaceAvailable` resumes rendering; this
+    /// is neither `CloseRequested` nor `Destroyed`.
+    SurfaceLost,
+
     /// Called when the window has been resized
     Resized {
         dimensions: Dimensions,
@@ -240,6 +254,27 @@ impl WindowEventSender {
 #[error("Graphics drivers lost context")]
 pub struct GraphicsDriversLostContext {}
 
+/// Shared ownership of the native presentation surface behind a window's
+/// raw handle.  GPU state that targets the handle keeps a clone, so the
+/// backend releases the native surface only after every GPU reference to
+/// it is gone.
+#[derive(Clone)]
+pub struct SurfaceLease {
+    _holder: std::sync::Arc<dyn Send + Sync>,
+}
+
+impl SurfaceLease {
+    pub fn new(holder: std::sync::Arc<dyn Send + Sync>) -> Self {
+        Self { _holder: holder }
+    }
+}
+
+impl std::fmt::Debug for SurfaceLease {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt.write_str("SurfaceLease")
+    }
+}
+
 #[async_trait(?Send)]
 pub trait WindowOps {
     /// Show a hidden window
@@ -255,6 +290,16 @@ pub trait WindowOps {
     fn finish_frame(&self, frame: glium::Frame) -> anyhow::Result<()> {
         frame.finish()?;
         Ok(())
+    }
+
+    /// Advise the window that a frame was presented on its surface.
+    fn frame_presented(&self) {}
+
+    /// The lease behind `window_handle()` when the backend leases its
+    /// presentation surfaces (Android).  GPU state built on the handle
+    /// holds it for as long as it references the surface.
+    fn surface_lease(&self) -> Option<SurfaceLease> {
+        None
     }
 
     /// Hide a visible window

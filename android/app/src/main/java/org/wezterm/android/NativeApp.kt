@@ -1,6 +1,7 @@
 package org.wezterm.android
 
 import android.content.Context
+import android.view.Surface
 import org.json.JSONObject
 
 /**
@@ -22,9 +23,54 @@ object NativeApp {
         verboseLogging: Boolean,
     ): String
 
-    /** Debug builds only; the symbol is absent from release libraries. */
+    @JvmStatic
+    private external fun nativeTerminalStart(
+        filesDir: String,
+        cacheDir: String,
+        dpi: Int,
+        verboseLogging: Boolean,
+        diagnosticApplet: Boolean,
+        configOverrides: String,
+    ): String
+
+    /** Hands the surface's native window to the GUI thread. Throws when the engine is not running. */
+    @JvmStatic
+    external fun nativeSurfaceCreated(generation: Long, surface: Surface, width: Int, height: Int)
+
+    @JvmStatic
+    external fun nativeSurfaceChanged(generation: Long, width: Int, height: Int)
+
+    /** Blocks until the GUI thread released the native window; false when the engine dropped the event. */
+    @JvmStatic
+    external fun nativeSurfaceDestroyed(generation: Long): Boolean
+
+    @JvmStatic
+    private external fun nativeSurfaceStatus(): String
+
+    /** Blocks until `minFrames` frames were presented on `generation`, or `timeoutMs` elapsed. */
+    @JvmStatic
+    external fun nativeAwaitSurfaceFrames(generation: Long, minFrames: Long, timeoutMs: Long): Boolean
+
+    /** Blocks until the surface slot is in `state` (`generation <= 0` accepts any), or `timeoutMs` elapsed. */
+    @JvmStatic
+    external fun nativeAwaitSurfaceState(state: String, generation: Long, timeoutMs: Long): Boolean
+
+    /** Blocks until `minFailures` GPU failures of `stage` were recorded, or `timeoutMs` elapsed. */
+    @JvmStatic
+    external fun nativeAwaitRenderFailures(stage: Int, minFailures: Long, timeoutMs: Long): Boolean
+
+    /**
+     * Debug builds only; the symbol is absent from release libraries.
+     * `0` panics and any kind that is not a render stage throws;
+     * [STAGE_GPU_CREATION] and [STAGE_DRAW] arm a one-shot GPU failure on
+     * the GUI thread.
+     */
     @JvmStatic
     external fun nativeDiagnosticFault(kind: Int): String
+
+    /** Render stage codes shared by [nativeDiagnosticFault] and [nativeAwaitRenderFailures]. */
+    const val STAGE_GPU_CREATION = 2
+    const val STAGE_DRAW = 3
 
     /** Initialize the native engine (idempotent) and parse its report. */
     fun initialize(context: Context): InitResponse {
@@ -36,6 +82,67 @@ object NativeApp {
             BuildConfig.DEBUG,
         )
         return InitResponse.parse(json)
+    }
+
+    /**
+     * Start the GUI thread once per process and return its state as JSON.
+     * Debug builds open the diagnostic applet; `configOverrides` holds
+     * `key=value` lines and is honoured by debug builds only.
+     */
+    fun startTerminal(context: Context, configOverrides: String): String {
+        val app = context.applicationContext
+        return nativeTerminalStart(
+            app.filesDir.absolutePath,
+            app.cacheDir.absolutePath,
+            app.resources.displayMetrics.densityDpi,
+            BuildConfig.DEBUG,
+            BuildConfig.DEBUG,
+            if (BuildConfig.DEBUG) configOverrides else "",
+        )
+    }
+
+    fun surfaceStatus(): SurfaceStatus = SurfaceStatus.parse(nativeSurfaceStatus())
+}
+
+/** Mirror of the Rust `terminal::Status`. */
+data class SurfaceStatus(
+    val engine: String,
+    val state: String,
+    val generation: Long,
+    val width: Int,
+    val height: Int,
+    val framesPresented: Long,
+    val totalFramesPresented: Long,
+    val staleEvents: Long,
+    val retireAcks: Long,
+    val liveLeases: Int,
+    val boundWindow: Long?,
+    val gpuCreationFailures: Long,
+    val drawFailures: Long,
+    val rawJson: String,
+) {
+    companion object {
+        fun parse(json: String): SurfaceStatus {
+            val root = JSONObject(json)
+            val surface = root.getJSONObject("surface")
+            val render = root.getJSONObject("render")
+            return SurfaceStatus(
+                engine = root.getJSONObject("engine").getString("status"),
+                state = surface.getString("state"),
+                generation = if (surface.isNull("generation")) 0 else surface.getLong("generation"),
+                width = surface.getInt("width"),
+                height = surface.getInt("height"),
+                framesPresented = surface.getLong("frames_presented"),
+                totalFramesPresented = surface.getLong("total_frames_presented"),
+                staleEvents = surface.getLong("stale_events"),
+                retireAcks = surface.getLong("retire_acks"),
+                liveLeases = surface.getInt("live_leases"),
+                boundWindow = if (surface.isNull("bound_window")) null else surface.getLong("bound_window"),
+                gpuCreationFailures = render.getLong("gpu_creation"),
+                drawFailures = render.getLong("draw"),
+                rawJson = json,
+            )
+        }
     }
 }
 

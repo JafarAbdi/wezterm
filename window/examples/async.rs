@@ -89,6 +89,8 @@ impl MyWindow {
             | WindowEvent::DroppedString(_)
             | WindowEvent::PerformKeyAssignment(_)
             | WindowEvent::MouseLeave
+            | WindowEvent::SurfaceAvailable { .. }
+            | WindowEvent::SurfaceLost
             | WindowEvent::SetInnerSizeCompleted => {}
         }
     }

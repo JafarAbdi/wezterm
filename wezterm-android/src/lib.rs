@@ -10,13 +10,31 @@
 #![deny(unsafe_code)]
 
 mod dirs;
+pub mod engine;
 #[cfg(target_os = "android")]
 pub mod ffi;
 mod probe;
+#[cfg(target_os = "android")]
+pub mod terminal;
 
 pub use config::AndroidPaths;
 pub use dirs::{DirsError, create_app_dirs};
 pub use probe::{FontReport, GpuAdapter, NativeVersions, ShapingProbe};
+
+/// Parse debug config overrides: one `key=value` per line, values being
+/// Lua expressions.  Blank lines are skipped.
+pub fn parse_config_overrides(text: &str) -> Result<Vec<(String, String)>, String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.split_once('=')
+                .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+                .filter(|(key, _)| !key.is_empty())
+                .ok_or_else(|| format!("config override {line:?} is not key=value"))
+        })
+        .collect()
+}
 
 use serde::Serialize;
 use std::path::PathBuf;
@@ -208,5 +226,19 @@ mod tests {
         assert_eq!(value["outcome"]["status"], "failed");
         assert_eq!(value["outcome"]["stage"], "fonts");
         assert_eq!(value["outcome"]["message"], "no fonts");
+    }
+
+    #[test]
+    fn config_overrides_parse_key_value_lines() {
+        assert_eq!(
+            parse_config_overrides(" cursor_blink_rate = 0 \n\nfont_size=9.5\n").unwrap(),
+            vec![
+                ("cursor_blink_rate".to_string(), "0".to_string()),
+                ("font_size".to_string(), "9.5".to_string()),
+            ]
+        );
+        assert_eq!(parse_config_overrides("").unwrap(), vec![]);
+        assert!(parse_config_overrides("novalue").is_err());
+        assert!(parse_config_overrides("=1").is_err());
     }
 }

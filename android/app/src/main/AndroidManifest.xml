@@ -8,13 +8,18 @@
         android:allowBackup="false"
         android:extractNativeLibs="false">
         <activity
-            android:name=".DiagnosticActivity"
+            android:name=".TerminalActivity"
             android:exported="true"
+            android:theme="@android:style/Theme.Material.NoActionBar"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity
+            android:name=".DiagnosticActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden" />
     </application>
 </manifest>
