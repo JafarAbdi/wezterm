@@ -135,7 +135,10 @@ class EngineFailureTest {
             assertFalse("wezterm-requests left nativeNextRequest", requests?.isAlive ?: false)
             assertNull("the request queue is closed", NativeApp.nativeNextRequest())
 
-            val failed = receipt("03-bootstrap-failure")
+            val failed = awaitStatus("bootstrap failed and queued surface released") {
+                it.engine == "failed" && it.liveLeases == 0
+            }
+            receipt("03-bootstrap-failure")
             assertEquals("failed", failed.engine)
             assertTrue(failed.rawJson, failed.rawJson.contains("\"stage\":\"config_overrides\""))
             assertEquals("no logical window was created", 0, failed.windows.size)
