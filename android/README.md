@@ -9,6 +9,11 @@ surface, using the bundled fonts plus the device's `/system/fonts` for CJK
 and other scripts. Debug builds show a built-in diagnostic text grid;
 nothing runs a shell and nothing connects anywhere yet.
 
+Terminal windows live as long as the app process. Rotating, pressing Back
+or Home, or switching apps only detaches the screen; reopening the app
+shows the same window. When more than one window exists, a "Window 1 of 2"
+label appears in the top corner; tap it to pick the window to show.
+
 ## Build
 
 Requirements: Android SDK with platform 35, build-tools 35.0.0 and NDK
@@ -31,6 +36,7 @@ adb devices
 make android-install SERIAL=<serial>
 make android-test SERIAL=<serial> SUITE=native-load   # checks and rebuilds for the device ABI, then runs the suite
 make android-test SERIAL=<serial> SUITE=surface       # renders, retires and resumes the terminal surface
+make android-test SERIAL=<serial> SUITE=lifecycle     # rotation, Back, window selector, clipboard, engine failure
 ```
 
 The launcher entry "WezTerm" opens the terminal surface and logs
@@ -38,6 +44,6 @@ The launcher entry "WezTerm" opens the terminal surface and logs
 the native initialization report (`WezTermDiag`).
 
 On the API 35 x86_64 emulator started with `-gpu swiftshader`, run the app
-and the `surface` suite with
+and the `surface` and `lifecycle` suites with
 `WEZTERM_ANDROID_CONFIG_OVERRIDES='webgpu_preferred_adapter={name="Android Emulator OpenGL ES Translator (Google SwiftShader)",backend="Gl",device_type="Cpu"}'`;
 its Vulkan implementation aborts the emulator otherwise (see `AGENTS.md`).

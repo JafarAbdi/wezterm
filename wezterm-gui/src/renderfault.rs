@@ -3,7 +3,7 @@
 //! the recovery paths under test.
 
 use serde::Serialize;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -70,6 +70,21 @@ pub(crate) fn injected(stage: RenderStage) -> Option<anyhow::Error> {
         .compare_exchange(stage as u8, 0, Ordering::SeqCst, Ordering::SeqCst)
         .ok()
         .map(|_| anyhow::anyhow!("injected {stage:?} failure"))
+}
+
+static SURFACE_LOST_PANIC: AtomicBool = AtomicBool::new(false);
+
+/// Make the next `SurfaceLost` handler panic before it drops GPU state.
+#[cfg(debug_assertions)]
+pub fn arm_surface_lost_panic() {
+    SURFACE_LOST_PANIC.store(true, Ordering::SeqCst);
+}
+
+/// Panics if `arm_surface_lost_panic` armed it, once.
+pub(crate) fn injected_surface_lost_panic() {
+    if SURFACE_LOST_PANIC.swap(false, Ordering::SeqCst) {
+        panic!("injected SurfaceLost handler panic");
+    }
 }
 
 pub(crate) fn record(stage: RenderStage) {

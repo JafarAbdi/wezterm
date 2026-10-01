@@ -192,24 +192,26 @@ pub fn adapter_info_to_gpu_info(info: wgpu::AdapterInfo) -> GpuInfo {
     }
 }
 
-/// The instance backends to create: only the one a
-/// `webgpu_preferred_adapter` names, otherwise all of them.
+/// The instance backends to create: all of them, except on Android,
+/// where a `webgpu_preferred_adapter` narrows them to the one it names.
 ///
 /// Each backend creates its own surface on the window.  On Android a
 /// Vulkan surface connects the native window as a producer, after which
 /// the GL backend cannot create its EGL surface on the same window, so a
 /// preference for the GL adapter must keep Vulkan away from the window.
-fn preferred_backends(config: &ConfigHandle) -> wgpu::Backends {
+/// Other platforms keep every backend, so a preference that matches no
+/// adapter still falls back across backends.
+fn instance_backends(config: &ConfigHandle) -> wgpu::Backends {
+    if !cfg!(target_os = "android") {
+        return wgpu::Backends::all();
+    }
     let backend = config
         .webgpu_preferred_adapter
         .as_ref()
         .map(|preference| preference.backend.as_str());
     match backend {
         Some("Vulkan") => wgpu::Backends::VULKAN,
-        Some("Metal") => wgpu::Backends::METAL,
-        Some("Dx12") => wgpu::Backends::DX12,
         Some("Gl") => wgpu::Backends::GL,
-        Some("BrowserWebGpu") => wgpu::Backends::BROWSER_WEBGPU,
         _ => wgpu::Backends::all(),
     }
 }
@@ -249,7 +251,7 @@ impl WebGpuState {
         dimensions: Dimensions,
         config: &ConfigHandle,
     ) -> anyhow::Result<Self> {
-        let backends = preferred_backends(config);
+        let backends = instance_backends(config);
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends,
             ..Default::default()

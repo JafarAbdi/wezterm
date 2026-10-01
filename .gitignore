@@ -72,3 +72,4 @@ dhat-heap.json
 /android/app/src/main/jniLibs/
 /android/local.properties
 /ci/android.local.env
+/android/.kotlin/

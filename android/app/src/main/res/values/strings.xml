@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">WezTerm</string>
+    <string name="window_selector">Window %1$d of %2$d</string>
+    <string name="window_selector_title">Windows</string>
+    <string name="window_untitled">Window %1$d</string>
+    <string name="engine_ended">WezTerm engine %1$s. %2$s</string>
 </resources>

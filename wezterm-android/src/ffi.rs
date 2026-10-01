@@ -11,7 +11,9 @@
 //!   behind a `Surface`, acquired here on the calling Java thread and moved
 //!   into a [`NativeWindowLease`] that the GUI thread owns.  The GUI thread
 //!   never calls back into Java, so a Java thread blocked in
-//!   `nativeSurfaceDestroyed` cannot be waited on by the GUI thread.
+//!   `nativeSurfaceDestroyed` cannot be waited on by the GUI thread.  What
+//!   the GUI thread needs from Java (clipboard, selector refresh) a Java
+//!   thread fetches by blocking in `nativeNextRequest`.
 //! * The process environment is never mutated; sandbox paths reach `config`
 //!   through `config::set_android_paths`.
 //! * Symbol names must match the `external fun` declarations in
@@ -53,6 +55,8 @@ fn install_logger(verbose: bool) {
 enum Fault {
     #[error(transparent)]
     Surface(#[from] SurfaceBridgeError),
+    #[error(transparent)]
+    NotAccepting(#[from] crate::engine::NotAccepting),
     #[error("{0}")]
     Overrides(String),
     #[error(transparent)]
@@ -210,6 +214,74 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeSurfaceDestroyed
         .resolve::<ThrowRuntimeExAndDefault>()
 }
 
+/// `NativeApp.nativeSelectWindow(id)`: bind logical window `id` to the
+/// surface.  Throws when the engine is not accepting events.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeSelectWindow<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    id: jlong,
+) {
+    unowned_env
+        .with_env(|_env| -> Result<(), Fault> { Ok(terminal::select_window(id)?) })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeNextRequest()`: block until the GUI thread asks the
+/// platform for something and return the JSON
+/// [`window::os::android::PlatformRequest`]; null once the engine ended.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeNextRequest<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+) -> JString<'caller> {
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<_> {
+            match terminal::next_request() {
+                Some(request) => JString::from_str(
+                    env,
+                    serde_json::to_string(&request).expect("PlatformRequest serializes"),
+                ),
+                None => Ok(JString::null()),
+            }
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeClipboardText(request, text)`: the answer to a
+/// `clipboard_get` request; a null `text` means the read was refused.
+/// Throws when the engine is not accepting events.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeClipboardText<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    request: jlong,
+    text: JString<'caller>,
+) {
+    unowned_env
+        .with_env(|_env| -> Result<(), Fault> {
+            let text = (!text.is_null()).then(|| text.to_string());
+            Ok(terminal::clipboard_text(request, text)?)
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeAwaitSurfaceChange(since, timeoutMs)`: block until the
+/// status revision differs from `since`; returns the current revision.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeAwaitSurfaceChange<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    since: jlong,
+    timeout_ms: jlong,
+) -> jlong {
+    unowned_env
+        .with_env(|_env| -> jni::errors::Result<jlong> {
+            Ok(terminal::await_change(since, timeout_ms))
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
 /// `NativeApp.nativeSurfaceStatus()`: JSON [`terminal::Status`].
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeSurfaceStatus<'caller>(
@@ -323,6 +395,29 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeDiagnosticFault<
             arm(stage);
             log::warn!("armed a {stage:?} failure at Java's request");
             Ok(JString::from_str(env, format!("{stage:?}"))?)
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeDiagnosticGui(command)`: debug-only.  Runs
+/// `open-window`, `paste`, `panic-on-queued-destroy` or
+/// `panic-with-clipboard-read` on the GUI thread, or arms
+/// `panic-in-surface-lost`; false when the command is unknown or no GUI
+/// thread accepts work.  `panic-with-clipboard-read` blocks until the read
+/// resolves and is also false when the read did not fail.
+#[cfg(debug_assertions)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeDiagnosticGui<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    command: JString<'caller>,
+) -> jboolean {
+    use terminal::DiagnosticCommand;
+    unowned_env
+        .with_env(|_env| -> jni::errors::Result<jboolean> {
+            let accepted =
+                DiagnosticCommand::parse(&command.to_string()).is_some_and(terminal::diagnostic);
+            Ok(if accepted { JNI_TRUE } else { JNI_FALSE })
         })
         .resolve::<ThrowRuntimeExAndDefault>()
 }

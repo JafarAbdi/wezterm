@@ -7048,6 +7048,7 @@ dependencies = [
  "log",
  "ndk",
  "openssl",
+ "promise",
  "serde",
  "serde_json",
  "ssh2",

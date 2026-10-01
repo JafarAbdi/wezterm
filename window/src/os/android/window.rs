@@ -3,6 +3,7 @@
 
 use super::connection::Connection;
 use super::monitor::surface_monitor;
+use super::requests::{platform_requests, PlatformRequest};
 use super::{unsupported, Unsupported};
 use crate::connection::ConnectionOps;
 use crate::{
@@ -128,21 +129,26 @@ impl WindowOps for Window {
     }
 
     fn set_title(&self, title: &str) {
-        log::debug!("window {} title: {title}", self.0);
+        let id = self.0;
+        let title = title.to_string();
+        promise::spawn::spawn_into_main_thread(async move {
+            if let Some(conn) = Connection::get() {
+                conn.set_title(id, title);
+            }
+        })
+        .detach();
     }
 
     fn set_inner_size(&self, _width: usize, _height: usize) {}
 
+    /// Android has one clipboard; both kinds read it.
     fn get_clipboard(&self, _clipboard: Clipboard) -> Future<String> {
-        Future::err(
-            Unsupported {
-                operation: "WindowOps::get_clipboard",
-            }
-            .into(),
-        )
+        platform_requests().read_clipboard()
     }
 
-    fn set_clipboard(&self, _clipboard: Clipboard, _text: String) {}
+    fn set_clipboard(&self, _clipboard: Clipboard, text: String) {
+        platform_requests().push(PlatformRequest::ClipboardSet { text });
+    }
 
     fn surface_lease(&self) -> Option<SurfaceLease> {
         let lease = Connection::get()?.surface_lease_for(self.0)?;

@@ -177,6 +177,13 @@ impl<L> SurfaceState<L> {
         }
     }
 
+    pub fn into_lease(self) -> Option<L> {
+        match self {
+            Self::Absent { .. } => None,
+            Self::Unsized { lease, .. } | Self::Present { lease, .. } => Some(lease),
+        }
+    }
+
     pub fn is_present(&self) -> bool {
         matches!(self, Self::Present { .. })
     }

@@ -8,7 +8,7 @@
 #   ci/android.sh inspect               gate the built artifacts (ELF, symbols, alignment, APK, signature); nonzero on any failure
 #   ci/android.sh inspect-selftest      prove the gate rejects missing and malformed artifacts using fixture copies
 #   ci/android.sh install <serial>      install the APK matching the device ABI
-#   ci/android.sh test <serial> <suite> check the Rust crates for the device ABI, rebuild, and run connected instrumentation for <suite>
+#   ci/android.sh test <serial> <suite> check the Rust crates for the device ABI, rebuild, and run connected instrumentation for <suite> (native-load, surface, lifecycle)
 #
 # Machine-specific SDK/NDK locations come from the environment or from the
 # untracked ci/android.local.env written by `provision`.
@@ -33,10 +33,24 @@ REQUIRED_JNI_EXPORTS=(
   Java_org_wezterm_android_NativeApp_nativeAwaitSurfaceFrames
   Java_org_wezterm_android_NativeApp_nativeAwaitSurfaceState
   Java_org_wezterm_android_NativeApp_nativeAwaitRenderFailures
+  Java_org_wezterm_android_NativeApp_nativeAwaitSurfaceChange
+  Java_org_wezterm_android_NativeApp_nativeSelectWindow
+  Java_org_wezterm_android_NativeApp_nativeNextRequest
+  Java_org_wezterm_android_NativeApp_nativeClipboardText
+  Java_org_wezterm_android_NativeApp_nativeDiagnosticGui
 )
-declare -A SUITE_CLASS=(
-  [native-load]=org.wezterm.android.NativeLoadTest
-  [surface]=org.wezterm.android.SurfaceTest
+# Entries of one suite (a class, or class#method) run in order, each in its
+# own app process: the GUI engine starts once per process and every
+# EngineFailureTest method ends it.
+declare -A SUITE_CLASSES=(
+  [native-load]="NativeLoadTest"
+  [surface]="SurfaceTest"
+  [lifecycle]="LifecycleTest
+    EngineFailureTest#guiThreadPanicWithAQueuedDestroyReleasesTheSurfaceAndTheUiThread
+    EngineFailureTest#guiThreadPanicRightAfterAClipboardReadStartedFailsThatRead
+    EngineFailureTest#bootstrapFailureBeforeAConnectionExistsReleasesTheRequestThread
+    EngineFailureTest#surfaceLostHandlerPanicStillReleasesTheNativeWindowInTheShutdown
+    EngineFailureTest#surfaceLostHandlerPanicInTheShutdownReportsTheSurfaceAsNotReleased"
 )
 
 CARGO_NDK_VERSION=4.1.2
@@ -113,9 +127,13 @@ cargo_ndk() {
 cmd_native() {
   local abi
   for abi in $(abis_or_all "$@"); do
-    cargo_ndk "$abi" -o "$JNI_LIBS" build --locked -p wezterm-android
-    mkdir -p "$SYMBOLS_DIR/$abi"
-    cp "target/${RUST_TARGET[$abi]}/debug/$LIB" "$SYMBOLS_DIR/$abi/$LIB"
+    cargo_ndk "$abi" build --locked -p wezterm-android
+    local built=target/${RUST_TARGET[$abi]}/debug/$LIB
+    mkdir -p "$SYMBOLS_DIR/$abi" "$JNI_LIBS/$abi"
+    cp "$built" "$SYMBOLS_DIR/$abi/$LIB"
+    # Gradle copies the jniLibs input several times; DWARF stays only in
+    # the symbols copy.  --strip-debug leaves .text and the symbol tables.
+    "$NDK_BIN/llvm-strip" --strip-debug -o "$JNI_LIBS/$abi/$LIB" "$built"
   done
 }
 
@@ -146,6 +164,8 @@ sysroot_exports() {
 
 dt_needed() { "$NDK_BIN/llvm-readelf" -d "$1" 2>/dev/null | awk '/NEEDED/ {gsub(/[\[\]]/, "", $NF); print $NF}'; }
 readelf_field() { "$NDK_BIN/llvm-readelf" -h "$1" 2>/dev/null | awk -v key="$2:" '$1==key {sub(/^[^:]*:[ ]*/, ""); print}'; }
+defined_symbols_sha256() { "$NDK_BIN/llvm-nm" --defined-only "$1" 2>/dev/null | sort | sha256sum | cut -d' ' -f1; }
+has_section() { "$NDK_BIN/llvm-readelf" -S "$1" 2>/dev/null | grep -c " $2 " || true; }
 text_sha256() { "$NDK_BIN/llvm-objcopy" --dump-section .text=/dev/stdout "$1" /dev/null 2>/dev/null | sha256sum | cut -d' ' -f1; }
 
 dependency_inventory() {
@@ -197,6 +217,8 @@ inspect_so() {
   assert_file "$abi unstripped symbols" "$symbols"
   if [ -f "$symbols" ]; then
     assert_eq "$abi unstripped symbols carry the shipped .text" "$(text_sha256 "$symbols")" "$(text_sha256 "$so")"
+    assert_eq "$abi unstripped symbols define the shipped symbols" "$(defined_symbols_sha256 "$symbols")" "$(defined_symbols_sha256 "$so")"
+    assert_eq "$abi DWARF sections (symbols / jniLibs)" "$(has_section "$symbols" .debug_info) / $(has_section "$so" .debug_info)" "1 / 0"
   fi
 }
 
@@ -312,6 +334,20 @@ cmd_inspect_selftest() {
   expect_reject stale-package "x86_64 APK packages the current jniLibs .text"
   rm "$dir/jniLibs/x86_64/$LIB" "$dir/symbols/x86_64/$LIB"
 
+  dir=$(fixture symbols-without-dwarf); ln -sf "$ROOT/$JNI_LIBS/x86_64/$LIB" "$dir/symbols/x86_64/$LIB"
+  expect_reject symbols-without-dwarf "x86_64 DWARF sections (symbols / jniLibs): got '0 / 0'"
+
+  dir=$(fixture dwarf-in-jnilibs); ln -sf "$ROOT/$SYMBOLS_DIR/x86_64/$LIB" "$dir/jniLibs/x86_64/$LIB"
+  expect_reject dwarf-in-jnilibs "x86_64 DWARF sections (symbols / jniLibs): got '1 / 1'"
+
+  dir=$(fixture foreign-symbols); ln -sf "$ROOT/$SYMBOLS_DIR/arm64-v8a/$LIB" "$dir/symbols/x86_64/$LIB"
+  expect_reject foreign-symbols "x86_64 unstripped symbols carry the shipped .text"
+
+  dir=$(fixture altered-symbol-table); rm "$dir/jniLibs/x86_64/$LIB"
+  "$NDK_BIN/llvm-objcopy" --add-symbol selftest_extra=.text:0,global "$JNI_LIBS/x86_64/$LIB" "$dir/jniLibs/x86_64/$LIB"
+  expect_reject altered-symbol-table "x86_64 unstripped symbols define the shipped symbols"
+  rm "$dir/jniLibs/x86_64/$LIB"
+
   echo "selftest: all cases behaved; receipts under $INSPECT_DIR/selftest/*/out/inspect.txt"
 }
 
@@ -327,17 +363,24 @@ cmd_install() {
 
 cmd_test() {
   local serial=${1:?serial} suite=${2:?suite}
-  local class=${SUITE_CLASS[$suite]:-}
-  [ -n "$class" ] || die "unknown suite '$suite' (known: ${!SUITE_CLASS[*]})"
+  local classes=${SUITE_CLASSES[$suite]:-} class
+  [ -n "$classes" ] || die "unknown suite '$suite' (known: ${!SUITE_CLASSES[*]})"
   local abi; abi=$(device_abi "$serial"); require_abi "$abi"
   # The Rust under test must pass its own gate before it is packaged.
   cmd_check "$abi"
   # WEZTERM_ANDROID_CONFIG_OVERRIDES: key=value config lines the suite passes
   # to TerminalActivity (debug builds only), e.g. to pin a wgpu adapter on an
   # emulator whose default adapter is unusable.
-  ANDROID_SERIAL=$serial gradle :app:connectedDebugAndroidTest \
-    -Pandroid.testInstrumentationRunnerArguments.class="$class" \
-    -Pandroid.testInstrumentationRunnerArguments.configOverrides="${WEZTERM_ANDROID_CONFIG_OVERRIDES:-}"
+  # Gradle keeps one result directory; each class's report is copied aside.
+  local results=android/app/build/outputs/androidTest-results
+  rm -rf "$results/$suite"
+  for class in $classes; do
+    ANDROID_SERIAL=$serial gradle :app:connectedDebugAndroidTest \
+      -Pandroid.testInstrumentationRunnerArguments.class="org.wezterm.android.$class" \
+      -Pandroid.testInstrumentationRunnerArguments.configOverrides="${WEZTERM_ANDROID_CONFIG_OVERRIDES:-}"
+    mkdir -p "$results/$suite"
+    cp "$results"/connected/debug/TEST-*.xml "$results/$suite/$class.xml"
+  done
 }
 
 case "${1:-}" in
