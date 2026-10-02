@@ -23,11 +23,12 @@
 
 #![allow(unsafe_code)]
 
-use crate::InitRequest;
+use crate::profile::ProfileFields;
 use crate::terminal::{self, RetireOutcome, StartRequest, SurfaceBridgeError};
+use crate::{InitRequest, sshmux};
 use jni::EnvUnowned;
 use jni::errors::ThrowRuntimeExAndDefault;
-use jni::objects::{JClass, JObject, JString};
+use jni::objects::{JByteArray, JClass, JObject, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
 use ndk::native_window::NativeWindow;
 use std::path::PathBuf;
@@ -360,6 +361,189 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeAwaitRenderFailu
                     JNI_FALSE
                 },
             )
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeConnect(host, port, user, remoteWezterm)`: validate the
+/// profile and start attaching to the laptop mux.  Returns JSON:
+/// `{"status":"started","attempt":n}`,
+/// `{"status":"invalid_profile","field":…,"message":…}`, or
+/// `{"status":"busy"|"storage"|"starting","message":…}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeConnect<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    host: JString<'caller>,
+    port: JString<'caller>,
+    user: JString<'caller>,
+    remote_wezterm: JString<'caller>,
+) -> JString<'caller> {
+    use crate::sshmux::ConnectRefused;
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<_> {
+            let fields = ProfileFields {
+                host: host.to_string(),
+                port: port.to_string(),
+                user: user.to_string(),
+                remote_wezterm: remote_wezterm.to_string(),
+            };
+            let outcome = match sshmux::connect(&fields) {
+                Ok(attempt) => serde_json::json!({"status": "started", "attempt": attempt}),
+                Err(ConnectRefused::Profile(err)) => serde_json::json!({
+                    "status": "invalid_profile",
+                    "field": err.field(),
+                    "message": err.to_string(),
+                }),
+                Err(err @ ConnectRefused::Busy(_)) => {
+                    serde_json::json!({"status": "busy", "message": err.to_string()})
+                }
+                Err(err @ ConnectRefused::Storage) => {
+                    serde_json::json!({"status": "storage", "message": err.to_string()})
+                }
+                Err(err @ ConnectRefused::Starting) => {
+                    serde_json::json!({"status": "starting", "message": err.to_string()})
+                }
+            };
+            log::info!("nativeConnect -> {}", outcome["status"]);
+            JString::from_str(env, outcome.to_string())
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeConnectionStatus()`: JSON [`sshmux::Status`].
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeConnectionStatus<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+) -> JString<'caller> {
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<_> {
+            JString::from_str(
+                env,
+                serde_json::to_string(&sshmux::status()).expect("Status serializes"),
+            )
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeAwaitConnectionChange(since, timeoutMs)`: block until
+/// the connection revision differs from `since`; returns the current one.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeAwaitConnectionChange<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    since: jlong,
+    timeout_ms: jlong,
+) -> jlong {
+    unowned_env
+        .with_env(|_env| -> jni::errors::Result<jlong> {
+            Ok(sshmux::await_change(since, timeout_ms))
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+fn accepted(outcome: Result<(), crate::connection::AnswerRefused>, what: &str) -> jboolean {
+    match outcome {
+        Ok(()) => JNI_TRUE,
+        Err(err) => {
+            log::warn!("{what} refused: {err}");
+            JNI_FALSE
+        }
+    }
+}
+
+/// `NativeApp.nativeAnswerHostTrust(attempt, prompt, trust)`: false when
+/// that prompt is not pending (already answered, or its attempt ended).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeAnswerHostTrust<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    attempt: jlong,
+    prompt: jlong,
+    trust: jboolean,
+) -> jboolean {
+    unowned_env
+        .with_env(|_env| -> jni::errors::Result<jboolean> {
+            let outcome = sshmux::answer_host_trust(
+                u64::try_from(attempt).unwrap_or(0),
+                u64::try_from(prompt).unwrap_or(0),
+                trust == JNI_TRUE,
+            );
+            Ok(accepted(outcome, "host trust answer"))
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeAnswerText(attempt, prompt, text)`: answer a secret or
+/// text prompt; a null `text` cancels it.  False when that prompt is not
+/// pending.  The text is never logged.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeAnswerText<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    attempt: jlong,
+    prompt: jlong,
+    text: JString<'caller>,
+) -> jboolean {
+    unowned_env
+        .with_env(|_env| -> jni::errors::Result<jboolean> {
+            let text = (!text.is_null()).then(|| text.to_string());
+            let outcome = sshmux::answer_text(
+                u64::try_from(attempt).unwrap_or(0),
+                u64::try_from(prompt).unwrap_or(0),
+                text,
+            );
+            Ok(accepted(outcome, "prompt answer"))
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeImportIdentity(key)`: store the private key the user
+/// picked as the app's identity.  Returns `""` on success, otherwise
+/// `<code>: <message>` with the code of [`crate::sshstore::ImportError`].
+/// The bytes are never logged.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeImportIdentity<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    key: JByteArray<'caller>,
+) -> JString<'caller> {
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<_> {
+            let bytes = env.convert_byte_array(&key)?;
+            let outcome = match sshmux::import_identity(&bytes) {
+                Ok(()) => String::new(),
+                Err(err) => format!("{}: {err}", err.code()),
+            };
+            log::info!(
+                "nativeImportIdentity -> {}",
+                if outcome.is_empty() {
+                    "imported"
+                } else {
+                    "refused"
+                }
+            );
+            JString::from_str(env, outcome)
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeDiagnosticMux()`: debug-only JSON
+/// [`sshmux::MuxCensus`] taken on the GUI thread; null when no GUI thread
+/// answers.
+#[cfg(debug_assertions)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeDiagnosticMux<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+) -> JString<'caller> {
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<_> {
+            match terminal::diagnostic_mux() {
+                Some(census) => JString::from_str(env, census),
+                None => Ok(JString::null()),
+            }
         })
         .resolve::<ThrowRuntimeExAndDefault>()
 }

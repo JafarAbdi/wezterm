@@ -43,12 +43,16 @@ type Event = PlatformEvent<Arc<NativeWindowLease>>;
 /// End the engine from the GUI thread (or from the thread that failed to
 /// spawn it): retire what the window backend holds, then everything queued.
 fn shut(end: EngineEnd) {
-    match &end {
+    let ended = match &end {
         EngineEnd::Failed { stage, message } => {
             log::error!("GUI engine failed at {stage:?}: {message}");
+            format!("the GUI engine failed: {message}")
         }
-        EngineEnd::Stopped => log::info!("GUI engine stopped"),
-    }
+        EngineEnd::Stopped => {
+            log::info!("GUI engine stopped");
+            "the GUI engine stopped".to_string()
+        }
+    };
     ENGINE.shut(end, || {
         platform_requests().close();
         // A window handler that panics here leaves its GPU state behind;
@@ -61,6 +65,9 @@ fn shut(end: EngineEnd) {
         );
         released
     });
+    // After the gate stopped accepting work: an attach task that never ran
+    // or never finishes can no longer leave a prompt or an attempt open.
+    crate::sshmux::engine_ended(&ended);
 }
 
 fn failed(stage: EngineStage, message: String) -> EngineEnd {
@@ -97,6 +104,7 @@ pub fn start(request: StartRequest) -> EngineState {
     if let Err(state) = ENGINE.begin() {
         return state;
     }
+    crate::sshmux::open_store(&request.init.files_dir);
     if let Err(err) = std::thread::Builder::new()
         .name("wezterm-gui".into())
         .spawn(move || gui_thread(request))
@@ -144,7 +152,15 @@ fn run_gui(request: StartRequest) -> Result<(), EngineEnd> {
         return Err(failed(EngineStage::Init, format!("{stage:?}: {message}")));
     }
 
-    let mut overrides = vec![("check_for_updates".to_string(), "false".to_string())];
+    let mut overrides = vec![
+        ("check_for_updates".to_string(), "false".to_string()),
+        // A laptop mux without panes, or a lost connection, is a state the
+        // app shows; it never ends the engine.
+        (
+            "quit_when_all_windows_are_closed".to_string(),
+            "false".to_string(),
+        ),
+    ];
     overrides.extend(request.config_overrides);
     config::set_config_overrides(&overrides)
         .map_err(|err| failed(EngineStage::ConfigOverrides, format!("{err:#}")))?;
@@ -159,6 +175,8 @@ fn run_gui(request: StartRequest) -> Result<(), EngineEnd> {
         let queued = ENGINE.publish_running(thread);
         log::info!("GUI engine running; {queued:?} platform event(s) were queued");
         wake();
+        // The connection screen enables Connect once the engine runs.
+        platform_requests().connection_changed();
     })
     .map_err(|err| failed(EngineStage::Gui, format!("{err:#}")))
 }
@@ -343,6 +361,21 @@ pub fn diagnostic(command: DiagnosticCommand) -> bool {
         DiagnosticCommand::PanicInSurfaceLost => wezterm_gui::renderfault::arm_surface_lost_panic(),
     }
     true
+}
+
+/// The mux census as JSON, taken on the GUI thread; `None` when no GUI
+/// thread answers.
+#[cfg(debug_assertions)]
+pub fn diagnostic_mux() -> Option<String> {
+    if !matches!(engine_state(), EngineState::Running { .. }) {
+        return None;
+    }
+    let (tx, rx) = channel();
+    on_gui_thread(move || {
+        tx.send(crate::sshmux::census()).ok();
+    });
+    let census = rx.recv_timeout(DIAGNOSTIC_WAIT).ok()?;
+    Some(serde_json::to_string(&census).expect("MuxCensus serializes"))
 }
 
 #[cfg(debug_assertions)]

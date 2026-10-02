@@ -16,8 +16,8 @@ terminal engine.
 |---|---|---|
 | `wezterm-gui` (lib) | `Mux`, `ClientDomain`, `TermWindow`, fonts, glyph cache, renderer | Android lifecycle |
 | `window::os::android` | `Connection`/`Window` contracts, the GUI-thread message loop, the logical windows and which one is bound, the surface slot state machine, native-window leases, the request queue to Kotlin | pane state |
-| `wezterm-android` (cdylib) | JNI exports, GUI thread lifecycle, the platform event mailbox (`EngineGate`), app-private path publication, initialization report | a second terminal model |
-| Kotlin (`android/app`) | Activities, `SurfaceView`, IME, dialogs, the window selector, document picker, clipboard | pane cache, window list copy, wire protocol |
+| `wezterm-android` (cdylib) | JNI exports, GUI thread lifecycle, the platform event mailbox (`EngineGate`), app-private path publication, initialization report, the validated `Profile`, the connection phase and its pending prompt (`Connections`), the private SSH directory (`SshStore`) | a second terminal model |
+| Kotlin (`android/app`) | Activities, `SurfaceView`, IME, dialogs, the window selector, document picker, clipboard, the profile form's text (`SharedPreferences`) | pane cache, window list copy, wire protocol, connection state, prompt ownership |
 
 Unsafe code lives in `wezterm-android/src/ffi.rs` (JNI exports and
 `ANativeWindow_fromSurface`) and in one documented block of
@@ -106,8 +106,71 @@ The process environment is never mutated on Android. `config::AndroidPaths`
 is published once through `config::set_android_paths` before any path static
 is read; `HOME_DIR`, `CONFIG_DIRS`, `DATA_DIR`, `CACHE_DIR` and `RUNTIME_DIR`
 resolve from it, and the `WEZTERM_CONFIG_*` environment publication is
-compiled out. SSH still reads `~/.ssh` through `dirs_next::home_dir()`; a
-later stage routes it through explicit config instead.
+compiled out.
+
+## Connection
+
+The mux has no domain until the user connects. `sshmux::connect` validates
+`ProfileFields` into a `Profile` (tailnet address or `*.ts.net` name, port,
+login name, optional absolute remote `wezterm` path), registers one
+`ClientDomain` built from the existing `SshDomain` config and calls
+`ClientDomain::attach_with_ui(None, ui)`: the desktop attach with no primary
+window, so the laptop's windows map to mux windows and an empty laptop mux
+creates nothing. No `LocalDomain`, server publisher, Lua startup hook or
+spawn-if-empty exists on this path. The proxy command is derived as
+`<quoted remote wezterm> cli --prefer-mux --no-auto-start proxy`; the user
+cannot enter one. Each attempt registers its own domain (`laptop-<attempt>`);
+a failed attempt leaves a detached, clientless domain behind.
+
+SSH options come only from the profile: `wezterm_ssh::Config`
+reads no configuration file on Android, `userknownhostsfile` and
+`identityfile` point into `<filesDir>/ssh` (mode `0700`; files `0600`),
+`identitiesonly=yes`, no agent, and `wezterm_ssh_destination_networks`
+holds the tailnet ranges. `wezterm_ssh::DestinationNetworks` is the one
+address validator: the profile checks a literal address with it, and the
+SSH thread resolves a `*.ts.net` name once and dials the first resolved
+address it accepts, so no other address is ever dialed and nothing is
+resolved twice. Host trust stays keyed by the name the user entered.
+Host verification, `known_hosts` updates, authentication and the codec
+check are the native libssh and `wezterm-client` code, unchanged.
+
+`mux::connui::ConnectionUI::with_consumer` hands the attach's UI requests to
+the thread `wezterm-connect-ui`. Progress text, `Input` (echo off is a
+secret) and the typed `HostTrust` request become state in
+`connection::Connections`: phase `idle`, `attaching`, `attached`, `failed`
+or `disconnected`, an attempt id and at most one prompt with a one-use id.
+The prompt's promise moves into that state before Kotlin is told
+(`PlatformRequest::ConnectionChanged`). It leaves through one answer or
+cancellation carrying both ids, the end of its attempt, or the end of the
+engine; anything later is refused. One connect operation runs at a time.
+Activities and surfaces are not part of this state: `ConnectionPanel`
+renders `nativeConnectionStatus` and re-shows a pending prompt after a
+restart. Connect is refused (`starting`) until the engine runs; the status
+carries `ready` and the engine posts `ConnectionChanged` when it starts
+running, which enables the button. Failures are classified by error type
+(`mux::ssh::SshConnectError`, `IncompatibleVersionError`,
+`VersionCheckFailed`), never by message text. A trusted key of another
+type than the one presented (libssh `KnownHosts::Other`) reaches it as
+`SessionEvent::HostKeyTypeChanged`, stage `HostKeyTypeChanged`, and fails as
+`host_key_changed` without a prompt or a `known_hosts` write; the desktop
+text stays the libssh error.
+
+There is no transport cancel: an attempt without a pending prompt runs
+until SSH or the version check ends it. A lost connection becomes
+`disconnected` when the mux removes the domain's panes; a lost connection
+to an empty laptop mux is not noticed. Reconnect, cancellation of an
+in-flight transport and their convergence are ANDROID-06.
+
+The identity is imported through `ACTION_OPEN_DOCUMENT`, read with a
+bounded loop that works from API 24 (at most 1 MiB plus one byte; a
+zero-byte read is an error), validated as a PEM or OpenSSH private key of
+at most 1 MiB (OpenSSH `MAX_KEY_FILE_SIZE`, `authfile.c` through 8.x) and
+written `0600` through a synced temporary file and a rename. It is a
+file, not a Keystore key. The manifest disables backup and excludes every
+domain from cloud backup and device transfer. Release builds log at info
+level; SSH and attach errors at that level name the endpoint address.
+Prompt answers and key bytes are never logged. Debug builds log at debug
+level, which includes pane titles and working directories from the laptop.
 
 ## Stage status
 
@@ -116,9 +179,11 @@ ANDROID-01: the full GUI closure cross-builds, links and initializes;
 
 ANDROID-02: `TerminalActivity` binds one logical window to its
 `SurfaceView` and `TermWindow` renders through wgpu into it. Debug
-builds open a termwiz diagnostic applet (`wezterm_gui::android::diagnostic`,
-no shell, no domain) whose literal grid is the device evidence. Mux starts
-with no default domain; no SSHMUX connection exists yet. `front_end`
+builds launched with the boolean extra
+`org.wezterm.android.DIAGNOSTIC_APPLET` open a termwiz diagnostic applet
+(`wezterm_gui::android::diagnostic`, no shell, no domain) whose literal
+grid is the device evidence of the surface and lifecycle suites. Mux starts
+with no default domain. `front_end`
 defaults to `WebGpu` on Android; glium `enable_opengl` stays `Unsupported`.
 Glyph fallback: the bundled faces cover Latin, symbols and emoji; on Android
 `font_dirs` defaults to `/system/fonts` (the directory `/system/etc/fonts.xml`
@@ -133,12 +198,19 @@ frame, and the next surface or invalidation renders again. Debug builds arm
 a one-shot failure through `nativeDiagnosticFault(stage)` and wait on the
 counters with `nativeAwaitRenderFailures`.
 
-ANDROID-03 (this checkout): the ordered shutdown, the platform event
-mailbox, logical windows with a Kotlin selector, the request queue and the
-clipboard described above. Debug builds drive them through `nativeDiagnosticGui`
+ANDROID-03: the ordered shutdown, the platform event mailbox, logical
+windows with a Kotlin selector, the request queue and the clipboard
+described above. Debug builds drive them through `nativeDiagnosticGui`
 (`open-window`, `paste`, `panic-on-queued-destroy`,
-`panic-with-clipboard-read`, `panic-in-surface-lost`). No SSHMUX connection
-exists yet; input other than the debug paste is ANDROID-05.
+`panic-with-clipboard-read`, `panic-in-surface-lost`).
+
+ANDROID-04 (this checkout): the connection described above. A normal
+launch shows the connection screen. `nativeDiagnosticMux` (debug) lists
+every mux domain and every pane with its local and laptop ids. Verified
+only against the owned fixtures of `ci/android-sshmux-fixture.sh`, reached
+through the host's own Tailscale address over `lo`: no private Tailscale
+flow, no laptop other than the build host and no phone has been exercised.
+Input other than the debug paste is ANDROID-05.
 
 ## Build policy
 
@@ -158,6 +230,8 @@ Gradle and the script.
 - `minSdk=24`. Rust std needs 21, bionic `openpty()` (linked through
   `portable-pty`) needs 23, `libvulkan.so` for wgpu ships from 24. The
   `inspect` gate lists undefined symbols the API-24 sysroot does not export.
+  `build` runs Gradle lint, which fails on a framework call above minSdk
+  (`NewApi`).
 - Pinned inputs: Rust `wezterm.rustToolchain` (exported as
   `RUSTUP_TOOLCHAIN` for every cargo call of the runner; the desktop build
   keeps its own toolchain choice), cargo-ndk 4.1.2, Temurin JDK 17.0.20.1+1
@@ -195,7 +269,26 @@ Gradle and the script.
   `EngineFailureTest` method in its own process: a GUI-thread panic with a
   destroy queued, a panic right after a clipboard read started, a bootstrap
   failure before a `Connection` exists, and a `SurfaceLost` handler panic
-  on a surface destroy and inside the shutdown). The entries of a suite
+  on a surface destroy and inside the shutdown) and `sshmux`
+  (`SshMuxStartTest` and `SshMuxTest`, one method per process: Connect
+  before the engine runs, the bounded key read, the connection screen,
+  addresses outside the tailnet, host trust rejected, accepted, persisted,
+  changed and changed to another key type, a prompt across Activity
+  restarts, key import through the system picker including documents of
+  exactly 1 MiB and one byte more, attach with pane ids compared to the
+  laptop's, passphrase and password prompts, a missing server, a codec
+  mismatch, an empty server). `sshmux` needs
+  `ci/android-sshmux-fixture.sh up <address>` first: an owned sshd bound to
+  loopback or the host's own Tailscale address, owned mux servers with
+  `HOME` and `XDG_RUNTIME_DIR` inside `target/android-sshmux-fixture`, and
+  generated keys. `down` also stops the server a desktop client without
+  `--no-auto-start` starts for the missing-server account, found through
+  its own pid file in the fixture's runtime directory. The runner copies
+  the fixture endpoint and keys to the device for the suite and removes
+  them after; if the fixture's empty
+  server did not survive, that method is not run and
+  `BLOCKED-empty.txt` says so. Fixture results are never private-route
+  evidence. The entries of a suite
   (class or `class#method`) run one process each because the engine starts
   once per process; reports are copied to
   `android/app/build/outputs/androidTest-results/<suite>/<entry>.xml`.

@@ -115,6 +115,7 @@ fn main() {
                 SessionEvent::HostVerificationFailed(failed) => {
                     anyhow::bail!("{}", failed);
                 }
+                SessionEvent::HostVerified | SessionEvent::HostKeyTypeChanged => {}
                 SessionEvent::Error(err) => {
                     anyhow::bail!("{}", err);
                 }

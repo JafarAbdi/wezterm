@@ -6,7 +6,7 @@ use std::io::Result as IoResult;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wezterm_ssh::{Config, Session, SessionEvent};
 
 #[cfg(unix)]
@@ -86,6 +86,9 @@ pub struct SshdConfig(HashMap<String, Vec<String>>);
 impl Default for SshdConfig {
     fn default() -> Self {
         let mut config = Self::new();
+        config
+            .0
+            .insert("ListenAddress".to_string(), vec!["127.0.0.1".to_string()]);
 
         config.set_authentication_methods(vec!["publickey".to_string()]);
         config.set_use_privilege_separation(false);
@@ -358,10 +361,10 @@ impl Sshd {
                 )
             })?;
 
-        for _ in 0..10 {
-            // Wait until the port is up
-            std::thread::sleep(Duration::from_millis(100));
-
+        // Preserve the fixture's one-second readiness budget, but readiness
+        // is a successful connection, never an elapsed sleep.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
             // If the server exited already, then we know something is wrong!
             if let Some(exit_status) = child.try_wait()? {
                 let output = child.wait_with_output()?;
@@ -390,9 +393,11 @@ impl Sshd {
             }
         }
 
+        child.kill()?;
+        child.wait()?;
         Err(std::io::Error::new(
             std::io::ErrorKind::Other,
-            "ran out of ports when spawning sshd",
+            "timed out waiting for the fixture sshd listener",
         ))
     }
 }
@@ -446,7 +451,12 @@ pub async fn session(#[default(Config::new())] config: Config, sshd: Sshd) -> Se
     // generated identity file, and host file
     let mut config = config.for_host("localhost");
     config.insert("port".to_string(), port.to_string());
+    config.insert("addressfamily".to_string(), "inet".to_string());
     config.insert("wezterm_ssh_verbose".to_string(), "true".to_string());
+    config.insert(
+        "wezterm_ssh_config_dir".to_string(),
+        sshd.tmp.path().display().to_string(),
+    );
 
     // If libssh-rs is not loaded (but ssh2 is), then we use ssh2 as the backend
     #[cfg(not(feature = "libssh-rs"))]
@@ -524,6 +534,8 @@ pub async fn session(#[default(Config::new())] config: Config, sshd: Sshd) -> Se
             SessionEvent::HostVerificationFailed(failed) => {
                 panic!("{}", failed);
             }
+            SessionEvent::HostVerified => {}
+            SessionEvent::HostKeyTypeChanged => panic!("host key type changed"),
             SessionEvent::Error(err) => {
                 panic!("{}", err);
             }

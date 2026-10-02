@@ -6,6 +6,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import org.json.JSONException
 import org.json.JSONObject
 import kotlin.concurrent.thread
 
@@ -21,6 +22,8 @@ object PlatformRequests {
     /** UI-thread observer; the visible [TerminalActivity] registers itself. */
     interface Listener {
         fun onWindowsChanged()
+
+        fun onConnectionChanged()
 
         fun onEngineEnded()
     }
@@ -39,7 +42,13 @@ object PlatformRequests {
         thread(name = "wezterm-requests", isDaemon = true) {
             while (true) {
                 val request = NativeApp.nativeNextRequest() ?: break
-                main.post { handle(app, JSONObject(request)) }
+                main.post {
+                    try {
+                        handle(app, JSONObject(request))
+                    } catch (_: JSONException) {
+                        Log.e(TAG, "invalid platform request")
+                    }
+                }
             }
             main.post { listener?.onEngineEnded() }
         }
@@ -47,7 +56,7 @@ object PlatformRequests {
 
     private fun handle(app: Context, request: JSONObject) {
         val clipboard = app.getSystemService(ClipboardManager::class.java)
-        when (val type = request.getString("type")) {
+        when (request.getString("type")) {
             "clipboard_get" -> {
                 val id = request.getLong("request")
                 // Null while the app has no input focus (Android 10+) or the clip holds no text.
@@ -60,7 +69,8 @@ object PlatformRequests {
             }
             "clipboard_set" -> clipboard.setPrimaryClip(ClipData.newPlainText("WezTerm", request.getString("text")))
             "windows_changed" -> listener?.onWindowsChanged()
-            else -> Log.e(TAG, "unknown platform request '$type'")
+            "connection_changed" -> listener?.onConnectionChanged()
+            else -> Log.e(TAG, "unknown platform request")
         }
     }
 }

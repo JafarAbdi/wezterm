@@ -58,6 +58,37 @@ impl LineEditorHost for PasswordPromptHost {
     }
 }
 
+/// Why [`ssh_connect_with_ui`] failed, for callers that present failures
+/// themselves.  Each variant displays the text the terminal UI always
+/// showed.
+#[derive(Debug, thiserror::Error)]
+pub enum SshConnectError {
+    /// The server presented a key that differs from the trusted one.
+    #[error("Host key verification failed")]
+    HostKeyChanged,
+    /// The session ended with `message` while it was at `stage`.
+    #[error("Error: {message}")]
+    Session {
+        stage: SshConnectStage,
+        message: String,
+    },
+    #[error("Authentication was cancelled")]
+    AuthenticationCancelled,
+}
+
+/// How far a session got before it failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshConnectStage {
+    /// Reaching the host, the handshake or verifying its key.
+    Connect,
+    /// The user declined to trust the host key.
+    HostTrustDeclined,
+    /// The host presented a key of another type than the trusted one.
+    HostKeyTypeChanged,
+    /// The host key was verified; authentication did not succeed.
+    Authenticate,
+}
+
 pub fn ssh_connect_with_ui(
     route: wezterm_ssh::ResolvedSshRoute,
     ui: &mut ConnectionUI,
@@ -70,6 +101,7 @@ pub fn ssh_connect_with_ui(
             .expect("ssh config to always set hostname");
         ui.output_str(&format!("Connecting to {} using SSH\n", remote_address));
         let (session, events) = Session::connect_route(route.clone())?;
+        let mut stage = SshConnectStage::Connect;
 
         while let Ok(event) = smol::block_on(events.recv()) {
             match event {
@@ -79,17 +111,18 @@ pub fn ssh_connect_with_ui(
                     }
                 }
                 SessionEvent::HostVerify(verify) => {
-                    ui.output_str(&format!("{}\n", verify.message));
-                    let ok = if let Ok(line) = ui.input("Enter [y/n]> ") {
-                        match line.as_ref() {
-                            "y" | "Y" | "yes" | "YES" => true,
-                            "n" | "N" | "no" | "NO" | _ => false,
-                        }
-                    } else {
-                        false
-                    };
+                    let ok = ui.confirm_host_trust(
+                        &verify.message,
+                        &verify.remote_address,
+                        &verify.fingerprint,
+                    );
+                    if !ok {
+                        stage = SshConnectStage::HostTrustDeclined;
+                    }
                     smol::block_on(verify.answer(ok)).context("send verify response")?;
                 }
+                SessionEvent::HostVerified => stage = SshConnectStage::Authenticate,
+                SessionEvent::HostKeyTypeChanged => stage = SshConnectStage::HostKeyTypeChanged,
                 SessionEvent::Authenticate(auth) => {
                     if !auth.username.is_empty() {
                         ui.output_str(&format!("Authentication for {}\n", auth.username));
@@ -112,7 +145,7 @@ pub fn ssh_connect_with_ui(
                         if let Ok(line) = res {
                             answers.push(line);
                         } else {
-                            anyhow::bail!("Authentication was cancelled");
+                            return Err(SshConnectError::AuthenticationCancelled.into());
                         }
                     }
                     smol::block_on(auth.answer(answers))?;
@@ -120,10 +153,10 @@ pub fn ssh_connect_with_ui(
                 SessionEvent::HostVerificationFailed(failed) => {
                     let message = format_host_verification_for_terminal(failed);
                     ui.output(message);
-                    anyhow::bail!("Host key verification failed");
+                    return Err(SshConnectError::HostKeyChanged.into());
                 }
-                SessionEvent::Error(err) => {
-                    anyhow::bail!("Error: {}", err);
+                SessionEvent::Error(message) => {
+                    return Err(SshConnectError::Session { stage, message }.into());
                 }
                 SessionEvent::Authenticated => return Ok(session),
             }
@@ -658,6 +691,7 @@ fn connect_ssh_session(
                 }
                 smol::block_on(auth.answer(answers))?;
             }
+            SessionEvent::HostVerified | SessionEvent::HostKeyTypeChanged => {}
             SessionEvent::Error(err) => {
                 shim.output_line(&format!("Error: {}", err))?;
             }
@@ -1187,5 +1221,47 @@ mod tests {
         assert_ne!(route.jumps()[0]["identityfile"], "/tmp/target-key");
         assert_eq!(route.target()["user"], "target-user");
         assert_eq!(route.target()["identityfile"], "/tmp/target-key");
+    }
+
+    /// The typed errors replaced `bail!` calls; the terminal UI prints
+    /// them with `{:?}` and logs them with `{}`, so both must stay the
+    /// text those calls produced.
+    #[test]
+    fn connect_errors_keep_the_text_the_terminal_always_showed() {
+        let shown = |err: SshConnectError| {
+            let err = anyhow::Error::from(err);
+            (format!("{err}"), format!("{err:?}"), format!("{err:#}"))
+        };
+        let same = |text: &str| (text.to_string(), text.to_string(), text.to_string());
+        assert_eq!(
+            shown(SshConnectError::HostKeyChanged),
+            same("Host key verification failed")
+        );
+        assert_eq!(
+            shown(SshConnectError::AuthenticationCancelled),
+            same("Authentication was cancelled")
+        );
+        assert_eq!(
+            shown(SshConnectError::Session {
+                stage: SshConnectStage::Authenticate,
+                message: "password auth status: Denied".to_string(),
+            }),
+            same("Error: password auth status: Denied")
+        );
+    }
+
+    #[test]
+    fn connect_errors_are_found_by_type() {
+        let err = anyhow::Error::from(SshConnectError::Session {
+            stage: SshConnectStage::HostTrustDeclined,
+            message: "user declined to trust host".to_string(),
+        });
+        assert!(matches!(
+            err.downcast_ref::<SshConnectError>(),
+            Some(SshConnectError::Session {
+                stage: SshConnectStage::HostTrustDeclined,
+                ..
+            })
+        ));
     }
 }

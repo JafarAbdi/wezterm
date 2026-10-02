@@ -8,7 +8,7 @@
 #   ci/android.sh inspect               gate the built artifacts (ELF, symbols, alignment, APK, signature); nonzero on any failure
 #   ci/android.sh inspect-selftest      prove the gate rejects missing and malformed artifacts using fixture copies
 #   ci/android.sh install <serial>      install the APK matching the device ABI
-#   ci/android.sh test <serial> <suite> check the Rust crates for the device ABI, rebuild, and run connected instrumentation for <suite> (native-load, surface, lifecycle)
+#   ci/android.sh test <serial> <suite> check the Rust crates for the device ABI, rebuild, and run connected instrumentation for <suite> (native-load, surface, lifecycle, sshmux; sshmux needs ci/android-sshmux-fixture.sh up)
 #
 # Machine-specific SDK/NDK locations come from the environment or from the
 # untracked ci/android.local.env written by `provision`.
@@ -38,6 +38,13 @@ REQUIRED_JNI_EXPORTS=(
   Java_org_wezterm_android_NativeApp_nativeNextRequest
   Java_org_wezterm_android_NativeApp_nativeClipboardText
   Java_org_wezterm_android_NativeApp_nativeDiagnosticGui
+  Java_org_wezterm_android_NativeApp_nativeConnect
+  Java_org_wezterm_android_NativeApp_nativeConnectionStatus
+  Java_org_wezterm_android_NativeApp_nativeAwaitConnectionChange
+  Java_org_wezterm_android_NativeApp_nativeAnswerHostTrust
+  Java_org_wezterm_android_NativeApp_nativeAnswerText
+  Java_org_wezterm_android_NativeApp_nativeImportIdentity
+  Java_org_wezterm_android_NativeApp_nativeDiagnosticMux
 )
 # Entries of one suite (a class, or class#method) run in order, each in its
 # own app process: the GUI engine starts once per process and every
@@ -51,7 +58,23 @@ declare -A SUITE_CLASSES=(
     EngineFailureTest#bootstrapFailureBeforeAConnectionExistsReleasesTheRequestThread
     EngineFailureTest#surfaceLostHandlerPanicStillReleasesTheNativeWindowInTheShutdown
     EngineFailureTest#surfaceLostHandlerPanicInTheShutdownReportsTheSurfaceAsNotReleased"
+  [sshmux]="SshMuxStartTest#connectWhileTheEngineStartsIsRefusedAndStartsNoAttempt
+    SshMuxTest#theKeyReadStopsAtItsLimitAndRefusesAZeroRead
+    SshMuxTest#aNormalLaunchShowsTheConnectionScreenAndRefusesAddressesOutsideTheTailnet
+    SshMuxTest#anUnknownHostIsRejectedThenTrustedOnceAndWrongPasswordsFailClosed
+    SshMuxTest#aPendingPromptSurvivesLeavingTheActivityAndIsAnsweredOnce
+    SshMuxTest#aChangedHostKeyFailsClosedAndKeepsTheTrustedKey
+    SshMuxTest#anImportedIdentityAttachesToTheExistingPanesAndStartsNothing
+    SshMuxTest#anEncryptedIdentityAsksForItsPassphraseThroughTheSecretPrompt
+    SshMuxTest#anUnauthorizedIdentityFailsAuthenticationAndAttachesNothing
+    SshMuxTest#aMissingMuxServerIsAVisibleFailureAndNothingIsStarted
+    SshMuxTest#aCodecMismatchIsADistinctFailureAndAttachesNoPanes
+    SshMuxTest#anEmptyMuxServerShowsTheEmptyStateAndSpawnsNothing"
 )
+# The sshmux suite talks to the owned fixture of ci/android-sshmux-fixture.sh.
+SSHMUX_FIXTURE=${WEZTERM_SSHMUX_FIXTURE_DIR:-target/android-sshmux-fixture}
+SSHMUX_DEVICE_DIR=/data/local/tmp/wezterm-sshmux
+SSHMUX_PICKER_DIR=/sdcard/Download/wezterm-fixture
 
 CARGO_NDK_VERSION=4.1.2
 JDK_VERSION="17.0.20.1+1"
@@ -140,7 +163,8 @@ cmd_native() {
 gradle() { ./android/gradlew -p android --console=plain "$@"; }
 
 cmd_build() {
-  gradle :app:assembleDebug
+  # lintDebug fails on any error, including a framework call above minSdk (NewApi).
+  gradle :app:assembleDebug :app:lintDebug
   ls -l "$APK_DIR"/*.apk
 }
 
@@ -374,6 +398,20 @@ cmd_test() {
   # Gradle keeps one result directory; each class's report is copied aside.
   local results=android/app/build/outputs/androidTest-results
   rm -rf "$results/$suite"
+  if [ "$suite" = sshmux ]; then
+    [ -f "$SSHMUX_FIXTURE/device/fixture.properties" ] || die "the sshmux suite needs the owned fixture: ci/android-sshmux-fixture.sh up <address>"
+    if grep -qx 'empty=blocked' "$SSHMUX_FIXTURE/device/fixture.properties"; then
+      # No listening empty server exists; that row is blocked, not run and not passed.
+      classes=$(grep -v anEmptyMuxServer <<< "$classes")
+      mkdir -p "$results/$suite"
+      echo "BLOCKED: the fixture's empty mux server did not survive; SshMuxTest#anEmptyMuxServerShowsTheEmptyStateAndSpawnsNothing was not run" | tee "$results/$suite/BLOCKED-empty.txt"
+    fi
+    # The fixture's generated keys and endpoint exist on the device only for the suite.
+    trap "adb -s '$serial' shell rm -rf $SSHMUX_PICKER_DIR $SSHMUX_DEVICE_DIR/fixture.properties" EXIT
+    adb -s "$serial" shell "rm -rf $SSHMUX_DEVICE_DIR $SSHMUX_PICKER_DIR && mkdir -p $SSHMUX_DEVICE_DIR $SSHMUX_PICKER_DIR"
+    adb -s "$serial" push "$SSHMUX_FIXTURE/device/fixture.properties" "$SSHMUX_DEVICE_DIR/" > /dev/null
+    adb -s "$serial" push "$SSHMUX_FIXTURE"/device/wezterm-fixture-* "$SSHMUX_PICKER_DIR/" > /dev/null
+  fi
   for class in $classes; do
     ANDROID_SERIAL=$serial gradle :app:connectedDebugAndroidTest \
       -Pandroid.testInstrumentationRunnerArguments.class="org.wezterm.android.$class" \

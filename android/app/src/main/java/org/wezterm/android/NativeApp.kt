@@ -98,6 +98,32 @@ object NativeApp {
     @JvmStatic
     external fun nativeDiagnosticGui(command: String): Boolean
 
+    @JvmStatic
+    private external fun nativeConnect(host: String, port: String, user: String, remoteWezterm: String): String
+
+    @JvmStatic
+    private external fun nativeConnectionStatus(): String
+
+    /** Blocks until the connection revision differs from `since`, or `timeoutMs` elapsed; returns the current revision. */
+    @JvmStatic
+    external fun nativeAwaitConnectionChange(since: Long, timeoutMs: Long): Long
+
+    /** Answers a host-trust prompt once. False when that prompt is no longer pending. */
+    @JvmStatic
+    external fun nativeAnswerHostTrust(attempt: Long, prompt: Long, trust: Boolean): Boolean
+
+    /** Answers a secret or text prompt once; null `text` cancels it. False when that prompt is no longer pending. */
+    @JvmStatic
+    external fun nativeAnswerText(attempt: Long, prompt: Long, text: String?): Boolean
+
+    /** Stores a picked private key in app-private storage. Empty on success, else `<code>: <message>`. */
+    @JvmStatic
+    external fun nativeImportIdentity(key: ByteArray): String
+
+    /** Debug builds only: JSON census of mux domains and panes; null when no GUI thread answers. */
+    @JvmStatic
+    external fun nativeDiagnosticMux(): String?
+
     /** Render stage codes shared by [nativeDiagnosticFault] and [nativeAwaitRenderFailures]. */
     const val STAGE_GPU_CREATION = 2
     const val STAGE_DRAW = 3
@@ -116,23 +142,122 @@ object NativeApp {
 
     /**
      * Start the GUI thread once per process and return its state as JSON.
-     * Debug builds open the diagnostic applet; `configOverrides` holds
-     * `key=value` lines and is honoured by debug builds only.
+     * `diagnosticApplet` opens the diagnostic applet instead of the
+     * connection screen and `configOverrides` holds `key=value` lines;
+     * both are honoured by debug builds only, and only by the call that
+     * starts the engine.
      */
-    fun startTerminal(context: Context, configOverrides: String): String {
+    fun startTerminal(context: Context, configOverrides: String, diagnosticApplet: Boolean): String {
         val app = context.applicationContext
         PlatformRequests.start(app)
+        if (!terminalStarted) {
+            terminalStarted = true
+            this.diagnosticApplet = BuildConfig.DEBUG && diagnosticApplet
+        }
         return nativeTerminalStart(
             app.filesDir.absolutePath,
             app.cacheDir.absolutePath,
             app.resources.displayMetrics.densityDpi,
             BuildConfig.DEBUG,
-            BuildConfig.DEBUG,
+            this.diagnosticApplet,
             if (BuildConfig.DEBUG) configOverrides else "",
         )
     }
 
+    private var terminalStarted = false
+
+    /** Whether this process shows the diagnostic applet instead of the connection screen. UI thread only. */
+    var diagnosticApplet = false
+        private set
+
     fun surfaceStatus(): SurfaceStatus = SurfaceStatus.parse(nativeSurfaceStatus())
+
+    /** Validate the profile and start attaching to the laptop mux. */
+    fun connect(profile: Profile): ConnectOutcome =
+        ConnectOutcome.parse(nativeConnect(profile.host, profile.port, profile.user, profile.remoteWezterm))
+
+    fun connectionStatus(): ConnectionStatus = ConnectionStatus.parse(nativeConnectionStatus())
+}
+
+/** The connection form as typed; the native side validates it. */
+data class Profile(val host: String, val port: String, val user: String, val remoteWezterm: String)
+
+/** What `nativeConnect` did. */
+sealed interface ConnectOutcome {
+    data class Started(val attempt: Long) : ConnectOutcome
+
+    /** `field` is `host`, `port`, `user` or `remote_wezterm`. */
+    data class InvalidProfile(val field: String, val message: String) : ConnectOutcome
+
+    /** Busy, the engine is still starting, or private storage is unavailable. */
+    data class Refused(val status: String, val message: String) : ConnectOutcome
+
+    companion object {
+        fun parse(json: String): ConnectOutcome {
+            val root = JSONObject(json)
+            return when (val status = root.getString("status")) {
+                "started" -> Started(root.getLong("attempt"))
+                "invalid_profile" -> InvalidProfile(root.getString("field"), root.getString("message"))
+                else -> Refused(status, root.getString("message"))
+            }
+        }
+    }
+}
+
+/** A prompt the attaching connection waits on; `id` is valid for one answer. */
+sealed interface ConnectionPrompt {
+    val id: Long
+
+    data class HostTrust(override val id: Long, val remoteAddress: String, val fingerprint: String) : ConnectionPrompt
+
+    data class Secret(override val id: Long, val text: String) : ConnectionPrompt
+
+    data class Text(override val id: Long, val text: String) : ConnectionPrompt
+}
+
+/** Mirror of the Rust `sshmux::Status`. The native side owns this state; nothing here is cached. */
+data class ConnectionStatus(
+    val revision: Long,
+    /** `idle`, `attaching`, `attached`, `failed` or `disconnected`. */
+    val phase: String,
+    val attempt: Long,
+    val progress: String,
+    val prompt: ConnectionPrompt?,
+    /** Mux windows the laptop has, while attached. */
+    val windows: Int,
+    val failureKind: String,
+    val failureMessage: String,
+    val identity: Boolean,
+    /** The engine runs, so Connect can start an attempt. */
+    val ready: Boolean,
+) {
+    companion object {
+        fun parse(json: String): ConnectionStatus {
+            val root = JSONObject(json)
+            val prompt = root.optJSONObject("prompt")?.let {
+                val id = it.getLong("id")
+                when (val kind = it.getString("kind")) {
+                    "host_trust" -> ConnectionPrompt.HostTrust(id, it.getString("remote_address"), it.getString("fingerprint"))
+                    "secret" -> ConnectionPrompt.Secret(id, it.getString("text"))
+                    "text" -> ConnectionPrompt.Text(id, it.getString("text"))
+                    else -> error("unknown prompt kind '$kind'")
+                }
+            }
+            val failure = root.optJSONObject("failure")
+            return ConnectionStatus(
+                revision = root.getLong("revision"),
+                phase = root.getString("phase"),
+                attempt = root.optLong("attempt"),
+                progress = root.optString("progress"),
+                prompt = prompt,
+                windows = root.optInt("windows"),
+                failureKind = failure?.getString("kind") ?: "",
+                failureMessage = failure?.getString("message") ?: "",
+                identity = root.getBoolean("identity"),
+                ready = root.getBoolean("ready"),
+            )
+        }
+    }
 }
 
 /** Mirror of the Rust `terminal::Status`. */

@@ -22,11 +22,13 @@ log.workspace = true
 openssl.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+shell-words.workspace = true
 ssh2.workspace = true
 termwiz.workspace = true
 thiserror.workspace = true
 wezterm-font.workspace = true
 wezterm-gui = { workspace = true, features = ["vendored-fonts"] }
+wezterm-ssh.workspace = true
 wezterm-version.workspace = true
 wgpu.workspace = true
 window.workspace = true
@@ -35,8 +37,10 @@ zstd.workspace = true
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger.workspace = true
 jni.workspace = true
+mux.workspace = true
 ndk.workspace = true
 promise.workspace = true
+wezterm-client.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

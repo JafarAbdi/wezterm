@@ -584,6 +584,11 @@ impl Config {
     /// Convenience method for adding the ~/.ssh/config and system-wide
     /// `/etc/ssh/config` files to the list of configs
     pub fn add_default_config_files(&mut self) {
+        // An Android app has no user or system ssh configuration; every
+        // option comes from the profile the app validated.
+        if cfg!(target_os = "android") {
+            return;
+        }
         if let Some(home) = dirs_next::home_dir() {
             self.add_config_file(home.join(".ssh").join("config"));
         }

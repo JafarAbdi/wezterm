@@ -31,7 +31,9 @@ object TerminalHarness {
             .putExtra(TerminalActivity.EXTRA_CONFIG_OVERRIDES, overrides)
     }
 
-    fun launch(): ActivityScenario<TerminalActivity> = ActivityScenario.launch(launchIntent())
+    /** Launch with the diagnostic applet, the terminal content of the surface and lifecycle suites. */
+    fun launch(): ActivityScenario<TerminalActivity> =
+        ActivityScenario.launch(launchIntent().putExtra(TerminalActivity.EXTRA_DIAGNOSTIC_APPLET, true))
 
     /** Log the native status under `phase`; the host collects these lines as receipts. */
     fun receipt(phase: String, note: String = ""): SurfaceStatus {

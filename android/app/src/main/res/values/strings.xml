@@ -5,4 +5,40 @@
     <string name="window_selector_title">Windows</string>
     <string name="window_untitled">Window %1$d</string>
     <string name="engine_ended">WezTerm engine %1$s. %2$s</string>
+
+    <string name="connect_title">Attach to the laptop\'s WezTerm</string>
+    <string name="connect_host">Laptop Tailscale address</string>
+    <string name="connect_port">SSH port (22)</string>
+    <string name="connect_user">SSH user</string>
+    <string name="connect_remote_wezterm">wezterm path on the laptop (optional)</string>
+    <string name="connect_button">Connect</string>
+    <string name="identity_import">Import SSH key…</string>
+    <string name="identity_present">An SSH key is imported.</string>
+    <string name="identity_absent">No SSH key imported. Password login only.</string>
+    <string name="identity_imported">SSH key imported.</string>
+    <string name="identity_refused">SSH key not imported: %1$s</string>
+    <string name="identity_unreadable">The selected file could not be read.</string>
+
+    <string name="connection_attaching">Connecting… %1$s</string>
+    <string name="connection_empty">Connected. The laptop\'s mux server has no sessions. Nothing was started.</string>
+    <string name="connection_disconnected">Disconnected from the laptop.</string>
+    <string name="connection_busy">A connection is already in progress.</string>
+
+    <string name="failure_unreachable">Could not reach the laptop over SSH.</string>
+    <string name="failure_host_key_rejected">Host key not trusted. Nothing was saved.</string>
+    <string name="failure_host_key_changed">HOST KEY CHANGED. The laptop presented a different SSH host key than the trusted one. Not connecting; the trusted key was kept.</string>
+    <string name="failure_authentication">SSH authentication failed.</string>
+    <string name="failure_authentication_cancelled">Authentication cancelled.</string>
+    <string name="failure_server_unavailable">The laptop\'s WezTerm mux server did not answer. Start wezterm-mux-server on the laptop and check the wezterm path. This app never starts it.</string>
+    <string name="failure_incompatible_version">The laptop\'s WezTerm speaks a different mux protocol version than this app.</string>
+    <string name="failure_engine_ended">The WezTerm engine ended.</string>
+    <string name="failure_other">Could not attach to the laptop.</string>
+
+    <string name="prompt_host_trust_title">Unknown SSH host</string>
+    <string name="prompt_host_trust_message">%1$s\n\nFingerprint\n%2$s\n\nTrust this host and continue connecting?</string>
+    <string name="prompt_trust">Trust</string>
+    <string name="prompt_reject">Reject</string>
+    <string name="prompt_secret_title">SSH authentication</string>
+    <string name="prompt_ok">OK</string>
+    <string name="prompt_cancel">Cancel</string>
 </resources>
