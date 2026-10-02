@@ -258,7 +258,16 @@ Gradle and the script.
   symbols whose `.text` or defined symbols differ from the shipped
   library, using symlinked fixture trees under
   `target/android-inspect/selftest/`.
-- `test <serial> <suite>` runs `check` for the device ABI first. Suites:
+- `test <serial> <suite>` requires an explicit serial and runs `check`
+  for its ABI first. Gradle only assembles `assembleDebug` and
+  `assembleDebugAndroidTest`; the runner installs both APKs and invokes
+  `am instrument` through `adb -s <serial>`. No device enumeration or
+  Gradle connected/provider task is used. `ci/android_instrument.py`
+  owns the exact method inventory and process plan. Run its negative
+  controls with `uv run --no-project python ci/test_android_instrument.py`.
+  Parsing requires the actual adb exit, paired literal start/completion
+  records for every expected method and the final runner result; failures,
+  errors, skips and incomplete runs fail the command. Suites:
   `native-load` (`NativeLoadTest`), `surface` (`SurfaceTest`: frames,
   stale generations, zero size, rotation resize, ordered retire/resume,
   and recovery from an injected GPU creation failure and draw failure) and
@@ -285,13 +294,18 @@ Gradle and the script.
   `--no-auto-start` starts for the missing-server account, found through
   its own pid file in the fixture's runtime directory. The runner copies
   the fixture endpoint and keys to the device for the suite and removes
-  them after; if the fixture's empty
-  server did not survive, that method is not run and
-  `BLOCKED-empty.txt` says so. Fixture results are never private-route
+  them in the exit trap; if the fixture's empty server did not survive,
+  `BLOCKED-empty.txt` records the blocker and the command fails without
+  omitting a required method. Fixture results are never private-route
   evidence. The entries of a suite
   (class or `class#method`) run one process each because the engine starts
-  once per process; reports are copied to
+  once per process; literal JUnit is written to
   `android/app/build/outputs/androidTest-results/<suite>/<entry>.xml`.
+  Sibling `.command`, `.instrument`, `.exit` and `.logcat*` files preserve
+  execution and capture receipts in a private directory. Prior result
+  directories move to `<suite>.previous.*/results`, not deletion. Each
+  logcat child is launched through `exec`, then terminated and waited for
+  before parsing or exit. The runner never kills the shared adb server.
   `WEZTERM_ANDROID_CONFIG_OVERRIDES` (`key=value` lines, debug builds only)
   reaches `TerminalActivity` as an intent extra; the same extra
   (`org.wezterm.android.CONFIG_OVERRIDES`) works with `am start --es`.
