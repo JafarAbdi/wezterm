@@ -84,6 +84,7 @@ class SurfaceTest {
         Log.i(TAG, "launching with config overrides: ${overrides.ifEmpty { "(none)" }}")
         val intent = Intent(instrumentation.targetContext, TerminalActivity::class.java)
             .putExtra(TerminalActivity.EXTRA_CONFIG_OVERRIDES, overrides)
+            .putExtra(TerminalActivity.EXTRA_DIAGNOSTIC_APPLET, true)
         val scenario = ActivityScenario.launch<TerminalActivity>(intent)
         try {
             val first = awaitState("present")

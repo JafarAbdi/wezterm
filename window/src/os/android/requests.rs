@@ -29,6 +29,16 @@ pub enum PlatformRequest {
     },
     /// A logical window appeared, went away, was renamed or was bound.
     WindowsChanged,
+    /// The connection phase or its pending prompt changed.
+    ConnectionChanged,
+}
+
+impl PlatformRequest {
+    /// The platform re-reads state when it sees one of these, so two in a
+    /// row say nothing more than one.
+    fn is_refresh(&self) -> bool {
+        matches!(self, Self::WindowsChanged | Self::ConnectionChanged)
+    }
 }
 
 /// The platform did not answer a clipboard read with text.
@@ -69,12 +79,17 @@ impl PlatformRequests {
         let Some(mailbox) = mailbox.as_mut() else {
             return;
         };
-        let repeated =
-            request == PlatformRequest::WindowsChanged && mailbox.queue.back() == Some(&request);
+        let repeated = request.is_refresh() && mailbox.queue.back() == Some(&request);
         if !repeated {
             mailbox.queue.push_back(request);
             self.changed.notify_all();
         }
+    }
+
+    /// Tell the platform to re-read the connection state.  Callable from
+    /// any thread.
+    pub fn connection_changed(&self) {
+        self.push(PlatformRequest::ConnectionChanged);
     }
 
     /// Ask the platform for the clipboard's text.  Callable from any thread.

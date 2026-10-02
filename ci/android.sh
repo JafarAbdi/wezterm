@@ -8,7 +8,7 @@
 #   ci/android.sh inspect               gate the built artifacts (ELF, symbols, alignment, APK, signature); nonzero on any failure
 #   ci/android.sh inspect-selftest      prove the gate rejects missing and malformed artifacts using fixture copies
 #   ci/android.sh install <serial>      install the APK matching the device ABI
-#   ci/android.sh test <serial> <suite> check the Rust crates for the device ABI, rebuild, and run connected instrumentation for <suite> (native-load, surface, lifecycle)
+#   ci/android.sh test <serial> <suite> check the Rust crates for the device ABI, rebuild, and run serial-only instrumentation for <suite> (native-load, surface, lifecycle, sshmux; sshmux needs ci/android-sshmux-fixture.sh up)
 #
 # Machine-specific SDK/NDK locations come from the environment or from the
 # untracked ci/android.local.env written by `provision`.
@@ -38,20 +38,18 @@ REQUIRED_JNI_EXPORTS=(
   Java_org_wezterm_android_NativeApp_nativeNextRequest
   Java_org_wezterm_android_NativeApp_nativeClipboardText
   Java_org_wezterm_android_NativeApp_nativeDiagnosticGui
+  Java_org_wezterm_android_NativeApp_nativeConnect
+  Java_org_wezterm_android_NativeApp_nativeConnectionStatus
+  Java_org_wezterm_android_NativeApp_nativeAwaitConnectionChange
+  Java_org_wezterm_android_NativeApp_nativeAnswerHostTrust
+  Java_org_wezterm_android_NativeApp_nativeAnswerText
+  Java_org_wezterm_android_NativeApp_nativeImportIdentity
+  Java_org_wezterm_android_NativeApp_nativeDiagnosticMux
 )
-# Entries of one suite (a class, or class#method) run in order, each in its
-# own app process: the GUI engine starts once per process and every
-# EngineFailureTest method ends it.
-declare -A SUITE_CLASSES=(
-  [native-load]="NativeLoadTest"
-  [surface]="SurfaceTest"
-  [lifecycle]="LifecycleTest
-    EngineFailureTest#guiThreadPanicWithAQueuedDestroyReleasesTheSurfaceAndTheUiThread
-    EngineFailureTest#guiThreadPanicRightAfterAClipboardReadStartedFailsThatRead
-    EngineFailureTest#bootstrapFailureBeforeAConnectionExistsReleasesTheRequestThread
-    EngineFailureTest#surfaceLostHandlerPanicStillReleasesTheNativeWindowInTheShutdown
-    EngineFailureTest#surfaceLostHandlerPanicInTheShutdownReportsTheSurfaceAsNotReleased"
-)
+# The sshmux suite talks to the owned fixture of ci/android-sshmux-fixture.sh.
+SSHMUX_FIXTURE=${WEZTERM_SSHMUX_FIXTURE_DIR:-target/android-sshmux-fixture}
+SSHMUX_DEVICE_DIR=/data/local/tmp/wezterm-sshmux
+SSHMUX_PICKER_DIR=/sdcard/Download/wezterm-fixture
 
 CARGO_NDK_VERSION=4.1.2
 JDK_VERSION="17.0.20.1+1"
@@ -140,7 +138,8 @@ cmd_native() {
 gradle() { ./android/gradlew -p android --console=plain "$@"; }
 
 cmd_build() {
-  gradle :app:assembleDebug
+  # lintDebug fails on any error, including a framework call above minSdk (NewApi).
+  gradle :app:assembleDebug :app:lintDebug
   ls -l "$APK_DIR"/*.apk
 }
 
@@ -361,27 +360,78 @@ cmd_install() {
   adb -s "$serial" install -r "$apk"
 }
 
-cmd_test() {
-  local serial=${1:?serial} suite=${2:?suite}
-  local classes=${SUITE_CLASSES[$suite]:-} class
-  [ -n "$classes" ] || die "unknown suite '$suite' (known: ${!SUITE_CLASSES[*]})"
-  local abi; abi=$(device_abi "$serial"); require_abi "$abi"
-  # The Rust under test must pass its own gate before it is packaged.
-  cmd_check "$abi"
-  # WEZTERM_ANDROID_CONFIG_OVERRIDES: key=value config lines the suite passes
-  # to TerminalActivity (debug builds only), e.g. to pin a wgpu adapter on an
-  # emulator whose default adapter is unusable.
-  # Gradle keeps one result directory; each class's report is copied aside.
+shell_quote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
+cmd_test() (
+  local serial=${1:?explicit serial required} suite=${2:?suite}
+  case "$serial" in -*|*[[:space:]]*) die "invalid explicit serial '$serial'" ;; esac
+  local classes class
+  classes=$(uv run --no-project python ci/android_instrument.py plan "$suite")
   local results=android/app/build/outputs/androidTest-results
-  rm -rf "$results/$suite"
+  mkdir -p "$results"
+  if [ -e "$results/$suite" ]; then
+    mv "$results/$suite" "$(mktemp -d "$results/$suite.previous.XXXXXX")/results"
+  fi
+  results=$results/$suite
+  mkdir -m 700 "$results"
+  local logcat_pid= logcat_exit= fixture_files=0
+  stop_logcat() {
+    if [ -n "$logcat_pid" ]; then
+      kill "$logcat_pid" 2>/dev/null || true
+      local status=0
+      wait "$logcat_pid" || status=$?
+      printf '%s\n' "$status" > "$logcat_exit"
+      logcat_pid=
+    fi
+  }
+  cleanup() {
+    local status=$?
+    stop_logcat
+    if [ "$fixture_files" = 1 ]; then
+      adb -s "$serial" shell rm -rf "$SSHMUX_PICKER_DIR" "$SSHMUX_DEVICE_DIR/fixture.properties" || status=1
+    fi
+    exit "$status"
+  }
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' HUP TERM
+  if [ "$suite" = sshmux ]; then
+    [ -f "$SSHMUX_FIXTURE/device/fixture.properties" ] || die "the sshmux suite needs the owned fixture: ci/android-sshmux-fixture.sh up <address>"
+    if grep -qx 'empty=blocked' "$SSHMUX_FIXTURE/device/fixture.properties"; then
+      echo "BLOCKED: required empty mux fixture unavailable; no method omitted" > "$results/BLOCKED-empty.txt"
+      die "required empty mux fixture unavailable"
+    fi
+  fi
+  local abi; abi=$(device_abi "$serial"); require_abi "$abi"
+  cmd_check "$abi"
+  gradle :app:assembleDebug :app:assembleDebugAndroidTest
+  cmd_install "$serial"
+  adb -s "$serial" install -r android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+  if [ "$suite" = sshmux ]; then
+    fixture_files=1
+    adb -s "$serial" shell "rm -rf $SSHMUX_DEVICE_DIR $SSHMUX_PICKER_DIR && mkdir -p $SSHMUX_DEVICE_DIR $SSHMUX_PICKER_DIR"
+    adb -s "$serial" push "$SSHMUX_FIXTURE/device/fixture.properties" "$SSHMUX_DEVICE_DIR/" > /dev/null
+    adb -s "$serial" push "$SSHMUX_FIXTURE"/device/wezterm-fixture-* "$SSHMUX_PICKER_DIR/" > /dev/null
+  fi
   for class in $classes; do
-    ANDROID_SERIAL=$serial gradle :app:connectedDebugAndroidTest \
-      -Pandroid.testInstrumentationRunnerArguments.class="org.wezterm.android.$class" \
-      -Pandroid.testInstrumentationRunnerArguments.configOverrides="${WEZTERM_ANDROID_CONFIG_OVERRIDES:-}"
-    mkdir -p "$results/$suite"
-    cp "$results"/connected/debug/TEST-*.xml "$results/$suite/$class.xml"
+    local receipt=$results/$class
+    local command=(adb -s "$serial" shell am instrument -w -r
+      -e class "org.wezterm.android.$class"
+      -e configOverrides "$(shell_quote "${WEZTERM_ANDROID_CONFIG_OVERRIDES:-}")"
+      org.wezterm.android.test/androidx.test.runner.AndroidJUnitRunner)
+    printf '%q ' "${command[@]}" > "$receipt.command"
+    printf '\n' >> "$receipt.command"
+    (exec adb -s "$serial" logcat -v time 'wezterm:V' 'WezTermSurface:V' 'WezTermSshMuxTest:V' 'TestRunner:V' 'AndroidRuntime:E' '*:S') > "$receipt.logcat" 2>&1 &
+    logcat_pid=$!
+    printf '%s\n' "$logcat_pid" > "$receipt.logcat.pid"
+    logcat_exit=$receipt.logcat.exit
+    local status=0
+    "${command[@]}" > "$receipt.instrument" 2>&1 || status=$?
+    printf '%s\n' "$status" > "$receipt.exit"
+    stop_logcat
+    uv run --no-project python ci/android_instrument.py parse "$suite" "$class" "$receipt.instrument" "$receipt.exit" "$receipt.xml"
   done
-}
+)
 
 case "${1:-}" in
   provision)        shift; cmd_provision "$@" ;;

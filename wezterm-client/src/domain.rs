@@ -934,14 +934,47 @@ impl Domain for ClientDomain {
             return Ok(());
         }
 
-        let domain_id = self.local_domain_id;
-        let config = self.config.clone();
-
-        let activity = mux::activity::Activity::new();
         let ui = ConnectionUI::with_params(ConnectionUIParams {
             window_id,
             ..Default::default()
         });
+        self.attach_with_ui(window_id, ui).await
+    }
+
+    fn detachable(&self) -> bool {
+        true
+    }
+
+    fn detach(&self) -> anyhow::Result<()> {
+        self.perform_detach();
+        Ok(())
+    }
+
+    fn state(&self) -> DomainState {
+        if self.inner.lock().unwrap().is_some() {
+            DomainState::Attached
+        } else {
+            DomainState::Detached
+        }
+    }
+}
+
+impl ClientDomain {
+    /// Attach, reporting progress and asking for trust and credentials
+    /// through `ui`.  `Domain::attach` calls this with a terminal UI.
+    pub async fn attach_with_ui(
+        &self,
+        window_id: Option<WindowId>,
+        ui: ConnectionUI,
+    ) -> anyhow::Result<()> {
+        if self.state() == DomainState::Attached {
+            return Ok(());
+        }
+
+        let domain_id = self.local_domain_id;
+        let config = self.config.clone();
+
+        let activity = mux::activity::Activity::new();
         ui.title("wezterm: Connecting...");
 
         ui.async_run_and_log_error({
@@ -987,22 +1020,5 @@ impl Domain for ClientDomain {
         drop(activity);
         ui.close();
         Ok(())
-    }
-
-    fn detachable(&self) -> bool {
-        true
-    }
-
-    fn detach(&self) -> anyhow::Result<()> {
-        self.perform_detach();
-        Ok(())
-    }
-
-    fn state(&self) -> DomainState {
-        if self.inner.lock().unwrap().is_some() {
-            DomainState::Attached
-        } else {
-            DomainState::Detached
-        }
     }
 }

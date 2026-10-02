@@ -2,6 +2,7 @@ package org.wezterm.android
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.Intent
 import android.graphics.Color
 import android.os.Bundle
 import android.os.SystemClock
@@ -13,7 +14,10 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.TextView
+import java.io.IOException
+import java.io.InputStream
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.concurrent.thread
 
 /**
  * Hosts the terminal `SurfaceView` and forwards its lifecycle to the GUI
@@ -35,11 +39,21 @@ class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Li
     internal lateinit var selector: TextView
     internal lateinit var engineBanner: TextView
     internal var selectorDialog: AlertDialog? = null
+    internal lateinit var connection: ConnectionPanel
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val engine = NativeApp.startTerminal(this, intent.getStringExtra(EXTRA_CONFIG_OVERRIDES) ?: "")
+        val engine = NativeApp.startTerminal(
+            this,
+            intent.getStringExtra(EXTRA_CONFIG_OVERRIDES) ?: "",
+            intent.getBooleanExtra(EXTRA_DIAGNOSTIC_APPLET, false),
+        )
         Log.i(TAG, "engine $engine")
+        connection = ConnectionPanel(this) {
+            val pick = Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*")
+            @Suppress("DEPRECATION")
+            startActivityForResult(pick, REQUEST_IDENTITY)
+        }
         surfaceView = SurfaceView(this)
         surfaceView.holder.addCallback(this)
         selector = overlayText().apply {
@@ -51,6 +65,7 @@ class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Li
         val fill = ViewGroup.LayoutParams.MATCH_PARENT
         val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
         container.addView(surfaceView, FrameLayout.LayoutParams(fill, fill))
+        container.addView(connection.view, FrameLayout.LayoutParams(fill, fill))
         container.addView(selector, FrameLayout.LayoutParams(wrap, wrap, Gravity.TOP or Gravity.END))
         container.addView(engineBanner, FrameLayout.LayoutParams(fill, wrap, Gravity.BOTTOM))
         container.setOnApplyWindowInsetsListener { _, insets ->
@@ -76,13 +91,52 @@ class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Li
         super.onStart()
         PlatformRequests.listener = this
         onWindowsChanged()
+        onConnectionChanged()
         showEngineEnd()
     }
 
     override fun onStop() {
         PlatformRequests.listener = null
         selectorDialog?.dismiss()
+        connection.dismissPrompt()
         super.onStop()
+    }
+
+    override fun onConnectionChanged() {
+        connection.render(NativeApp.connectionStatus(), terminalVisible = NativeApp.diagnosticApplet)
+    }
+
+    /**
+     * The document the user picked as SSH key: its bytes go to app-private
+     * storage through the native side and are wiped here. Nothing is logged.
+     */
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        val document = data?.data
+        if (requestCode != REQUEST_IDENTITY || resultCode != RESULT_OK || document == null) return
+        thread(name = "wezterm-identity-import") {
+            val key = try {
+                // One byte more than a key file may have, so an oversized document is refused natively.
+                contentResolver.openInputStream(document)?.use { readAtMost(it, MAX_KEY_FILE_SIZE + 1) }
+            } catch (e: IOException) {
+                null
+            } catch (e: SecurityException) {
+                null
+            }
+            val refusal = key?.let { NativeApp.nativeImportIdentity(it) }
+            key?.fill(0)
+            runOnUiThread {
+                val text = when {
+                    refusal == null -> getString(R.string.identity_unreadable)
+                    refusal.isEmpty() -> getString(R.string.identity_imported)
+                    else -> getString(R.string.identity_refused, refusal.substringAfter(": "))
+                }
+                connection.importOutcome.text = text
+                onConnectionChanged()
+            }
+        }
     }
 
     @Deprecated("Deprecated in Java")
@@ -97,7 +151,10 @@ class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Li
         selector.text = getString(R.string.window_selector, bound + 1, status.windows.size)
     }
 
-    override fun onEngineEnded() = showEngineEnd()
+    override fun onEngineEnded() {
+        showEngineEnd()
+        onConnectionChanged()
+    }
 
     private fun showEngineEnd() {
         val status = NativeApp.surfaceStatus()
@@ -152,6 +209,40 @@ class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Li
 
         /** Intent extra with `key=value` config override lines; debug builds only. */
         const val EXTRA_CONFIG_OVERRIDES = "org.wezterm.android.CONFIG_OVERRIDES"
+
+        /**
+         * Boolean intent extra: open the diagnostic applet instead of the
+         * connection screen. Debug builds only, and only on the launch that
+         * starts the engine.
+         */
+        const val EXTRA_DIAGNOSTIC_APPLET = "org.wezterm.android.DIAGNOSTIC_APPLET"
+
+        private const val REQUEST_IDENTITY = 1
+
+        /** OpenSSH's `MAX_KEY_FILE_SIZE`; the native import enforces it. */
+        private const val MAX_KEY_FILE_SIZE = 1024 * 1024
+    }
+}
+
+/**
+ * The first `limit` bytes of `input`, or all of it when shorter. A read of
+ * zero bytes breaks the `InputStream` contract and is an error rather than
+ * a retry. `InputStream.readNBytes` needs API 33; minSdk is 24. The working
+ * buffer is wiped; the caller wipes the copy.
+ */
+internal fun readAtMost(input: InputStream, limit: Int): ByteArray {
+    val buffer = ByteArray(limit)
+    var filled = 0
+    try {
+        while (filled < limit) {
+            val read = input.read(buffer, filled, limit - filled)
+            if (read < 0) break
+            if (read == 0) throw IOException("the document returned no bytes")
+            filled += read
+        }
+        return buffer.copyOf(filled)
+    } finally {
+        buffer.fill(0)
     }
 }
 

@@ -53,6 +53,15 @@ pub enum UIRequest {
         respond: Promise<()>,
     },
     Close,
+    /// Ask whether to trust a host whose key is not known yet.
+    HostTrust {
+        /// The text a terminal shows before its y/n prompt.
+        message: String,
+        /// `host:port` of the server.
+        remote_address: String,
+        fingerprint: String,
+        respond: Promise<bool>,
+    },
 }
 
 struct ConnectionUIImpl {
@@ -92,6 +101,19 @@ impl ConnectionUIImpl {
                     mut respond,
                 }) => {
                     respond.result(self.sleep(&reason, duration));
+                }
+                Ok(UIRequest::HostTrust {
+                    message,
+                    mut respond,
+                    ..
+                }) => {
+                    let message = format!("{}\n", message).replace("\n", "\r\n");
+                    self.term.render(&[Change::Text(message)])?;
+                    let trusted = match self.input_prompt("Enter [y/n]> ") {
+                        Ok(line) => matches!(line.as_ref(), "y" | "Y" | "yes" | "YES"),
+                        Err(_) => false,
+                    };
+                    respond.ok(trusted);
                 }
                 Err(err) if err.is_timeout() => {}
                 Err(err) => bail!("recv_timeout: {}", err),
@@ -226,6 +248,9 @@ impl HeadlessImpl {
                     std::thread::sleep(duration);
                     respond.result(Ok(()));
                 }
+                Ok(UIRequest::HostTrust { mut respond, .. }) => {
+                    respond.ok(false);
+                }
                 Err(err) if err.is_timeout() => {}
                 Err(err) => bail!("recv_timeout: {}", err),
             }
@@ -293,6 +318,33 @@ impl ConnectionUI {
             ui.run()
         });
         Self { tx }
+    }
+
+    /// A UI whose requests the caller consumes, in order, until every
+    /// clone of the UI is dropped.  The consumer owns each `respond`
+    /// promise from the moment it takes the request.
+    pub fn with_consumer() -> (Self, impl Iterator<Item = UIRequest> + Send) {
+        let (tx, rx) = unbounded();
+        (Self { tx }, rx.into_iter())
+    }
+
+    /// Ask the user whether to trust a host whose key is not known.  A UI
+    /// that cannot ask does not trust.
+    pub fn confirm_host_trust(
+        &self,
+        message: &str,
+        remote_address: &str,
+        fingerprint: &str,
+    ) -> bool {
+        let mut promise = Promise::new();
+        let future = promise.get_future().unwrap();
+        let sent = self.tx.send(UIRequest::HostTrust {
+            message: message.to_string(),
+            remote_address: remote_address.to_string(),
+            fingerprint: fingerprint.to_string(),
+            respond: promise,
+        });
+        sent.is_ok() && block_on(future).unwrap_or(false)
     }
 
     pub fn run_and_log_error<T, F>(&self, f: F) -> anyhow::Result<T>

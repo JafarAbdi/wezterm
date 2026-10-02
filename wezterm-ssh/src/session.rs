@@ -16,6 +16,11 @@ use std::time::{Duration, Instant};
 pub enum SessionEvent {
     Banner(Option<String>),
     HostVerify(HostVerificationEvent),
+    /// The host key of a hop passed verification; authentication follows.
+    HostVerified,
+    /// The host presented a key of a type other than the one trusted for
+    /// it.  Nothing was asked or written; an `Error` follows.
+    HostKeyTypeChanged,
     Authenticate(AuthenticationEvent),
     HostVerificationFailed(HostVerificationFailed),
     Error(String),

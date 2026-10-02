@@ -77,6 +77,12 @@ pub struct IncompatibleVersionError {
     pub codec_vers: usize,
 }
 
+/// The server did not answer the version request: it is not running, is
+/// not wezterm, or its output is not the mux protocol.
+#[derive(Error, Debug)]
+#[error("{0}")]
+pub struct VersionCheckFailed(pub String);
+
 macro_rules! rpc {
     ($method_name:ident, $request_type:ident, $response_type:ident) => {
         pub async fn $method_name(&self, pdu: $request_type) -> anyhow::Result<$response_type> {
@@ -1209,7 +1215,7 @@ impl Client {
                     )
                 };
                 ui.output_str(&msg);
-                bail!("{}", msg);
+                Err(VersionCheckFailed(msg).into())
             }
         }
     }

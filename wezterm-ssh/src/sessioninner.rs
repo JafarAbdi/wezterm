@@ -1,5 +1,6 @@
 use crate::channelwrap::ChannelWrap;
 use crate::config::{ConfigMap, ResolvedSshRoute};
+use crate::destination::DestinationNetworks;
 use crate::dirwrap::DirWrap;
 use crate::filewrap::FileWrap;
 use crate::pty::*;
@@ -117,6 +118,9 @@ impl SessionInner {
         socket: Option<Socket>,
         emit_authenticated: bool,
     ) -> anyhow::Result<SessionWrap> {
+        if socket.is_some() && config.contains_key("wezterm_ssh_destination_networks") {
+            anyhow::bail!("wezterm_ssh_destination_networks cannot restrict a ProxyJump hop");
+        }
         let backend = config
             .get("wezterm_ssh_backend")
             .map(|s| s.as_str())
@@ -214,7 +218,18 @@ impl SessionInner {
         sess.set_option(libssh_rs::SshOption::Hostname(hostname.clone()))?;
         sess.set_option(libssh_rs::SshOption::User(Some(user)))?;
         sess.set_option(libssh_rs::SshOption::Port(port))?;
-        sess.options_parse_config(None)?; // FIXME: overridden config path?
+        if let Some(dir) = config.get("wezterm_ssh_config_dir") {
+            // libssh resolves HOME through getpwuid, not the process environment.
+            sess.set_option(libssh_rs::SshOption::SshDir(Some(dir.clone())))?;
+            sess.set_option(libssh_rs::SshOption::GlobalKnownHosts(Some(format!(
+                "{dir}/known_hosts"
+            ))))?;
+            sess.set_option(libssh_rs::SshOption::ProcessConfig(false))?;
+        } else if cfg!(target_os = "android") {
+            anyhow::bail!("Android SSH requires an app-private SSH directory");
+        } else {
+            sess.options_parse_config(None)?;
+        }
         if let Some(agent) = config.get("identityagent") {
             sess.set_option(libssh_rs::SshOption::IdentityAgent(Some(agent.clone())))?;
         }
@@ -272,6 +287,9 @@ impl SessionInner {
             .context("notifying user of banner")?;
 
         self.host_verification_libssh(config, &sess, &hostname, port)?;
+        self.tx_event
+            .try_send(SessionEvent::HostVerified)
+            .context("notifying user that the host is verified")?;
         self.authenticate_libssh(config, &sess)?;
 
         if let Ok(banner) = sess.get_issue_banner() {
@@ -349,6 +367,9 @@ impl SessionInner {
 
         self.host_verification(config, &sess, &hostname, port, &remote_address)
             .context("host verification")?;
+        self.tx_event
+            .try_send(SessionEvent::HostVerified)
+            .context("notifying user that the host is verified")?;
 
         self.authenticate(config, &sess, &user, &hostname)
             .context("authentication")?;
@@ -383,6 +404,9 @@ impl SessionInner {
     ) -> anyhow::Result<(Socket, Option<KillOnDropChild>)> {
         match config.get("proxycommand").map(|s| s.as_str()) {
             Some("none") | None => {}
+            Some(_) if config.contains_key("wezterm_ssh_destination_networks") => {
+                anyhow::bail!("wezterm_ssh_destination_networks cannot restrict a ProxyCommand")
+            }
             Some(proxy_command) => {
                 let mut cmd;
                 if cfg!(windows) {
@@ -427,10 +451,22 @@ impl SessionInner {
             }
         }
 
+        let destinations = config.get("wezterm_ssh_destination_networks");
+        let allowed = destinations
+            .map(|networks| networks.parse::<DestinationNetworks>())
+            .transpose()?;
         let addr = (hostname, port)
             .to_socket_addrs()?
-            .find(|addr| self.filter_sock_addr(config, addr))
-            .with_context(|| format!("resolving address for {}", hostname))?;
+            .filter(|addr| self.filter_sock_addr(config, addr))
+            .find(|addr| {
+                allowed
+                    .as_ref()
+                    .map_or(true, |nets| nets.contains(addr.ip()))
+            })
+            .with_context(|| match destinations {
+                Some(networks) => format!("{hostname} has no address in {networks}"),
+                None => format!("resolving address for {}", hostname),
+            })?;
         if verbose {
             log::info!("resolved {hostname}:{port} -> {addr:?}");
         }

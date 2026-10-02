@@ -159,12 +159,14 @@ impl crate::sessioninner::SessionInner {
                 }],
                 reply,
             }))
-            .unwrap();
+            .map_err(|_| libssh_rs::Error::fatal("authentication prompt was cancelled"))?;
 
-            let mut answers = smol::block_on(answers.recv())
-                .context("waiting for authentication answers from user")
-                .unwrap();
-            Ok(answers.remove(0))
+            let answers = smol::block_on(answers.recv())
+                .map_err(|_| libssh_rs::Error::fatal("authentication prompt was cancelled"))?;
+            answers
+                .into_iter()
+                .next()
+                .ok_or_else(|| libssh_rs::Error::fatal("authentication prompt has no answer"))
         });
 
         use libssh_rs::{AuthMethods, AuthStatus};
@@ -241,11 +243,10 @@ impl crate::sessioninner::SessionInner {
                         }],
                         reply,
                     }))
-                    .unwrap();
+                    .context("sending authentication prompt")?;
 
                 let mut answers = smol::block_on(answers.recv())
-                    .context("waiting for authentication answers from user")
-                    .unwrap();
+                    .context("waiting for authentication answers from user")?;
                 let pw = answers.remove(0);
 
                 match sess.userauth_password(None, Some(&pw))? {

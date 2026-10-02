@@ -9,11 +9,16 @@
 
 #![deny(unsafe_code)]
 
+pub mod connection;
 mod dirs;
 pub mod engine;
 #[cfg(target_os = "android")]
 pub mod ffi;
 mod probe;
+pub mod profile;
+#[cfg(target_os = "android")]
+pub mod sshmux;
+pub mod sshstore;
 #[cfg(target_os = "android")]
 pub mod terminal;
 
