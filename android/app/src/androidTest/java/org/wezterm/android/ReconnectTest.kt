@@ -102,6 +102,12 @@ class ReconnectTest {
         Log.i(TAG, "receipt phase=$phase $note")
     }
 
+    /** Log a census whole, its thread and descriptor maps included, in parts under logcat's entry limit. */
+    private fun retain(label: String, census: JSONObject) {
+        val parts = census.toString().chunked(3000)
+        parts.forEachIndexed { index, part -> Log.i(TAG, "census $label part=${index + 1}/${parts.size} $part") }
+    }
+
     /** Assert that nothing of the ended attempt remains: no thread, prompt or mux domain, so a new one can start. */
     private fun assertReleased(status: ConnectionStatus) {
         assertEquals("no thread of the attempt remains", 0, status.workers)
@@ -481,6 +487,7 @@ class ReconnectTest {
         val laptop = fixtureIds("reconnect_panes")
         var first: JSONObject? = null
         for (round in 1..3) {
+            retain("round-$round-before", processCensus())
             val previous = NativeApp.connectionStatus()
             ui.connect(fixture("wezterm_reconnect"), port = fixture("stall_port"))
             val dialing = ui.awaitConnection("round $round dialing the stalled listener") {
@@ -511,6 +518,7 @@ class ReconnectTest {
             ui.assertNothingAttached(ui.censusReceipt("cycle-$round-disconnected"))
 
             val after = processCensus()
+            retain("round-$round-after", after)
             val (threads, sockets) = survivors(first ?: after, after)
             receipt(
                 "cycle-$round",

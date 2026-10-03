@@ -35,7 +35,7 @@ class InstrumentTest(unittest.TestCase):
         self.assertEqual({case.attrib["name"] for case in root}, set(self.methods))
 
     def test_all_plans_keep_process_boundaries(self) -> None:
-        self.assertEqual([len(instrument.entries(suite)) for suite in instrument.EXPECTED], [1, 1, 6, 12, 1, 13])
+        self.assertEqual([len(instrument.entries(suite)) for suite in instrument.EXPECTED], [1, 1, 6, 14, 1, 13])
         for suite in instrument.EXPECTED:
             for entry in instrument.entries(suite):
                 class_name, separator, method = entry.partition("#")

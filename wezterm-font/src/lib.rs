@@ -303,6 +303,16 @@ struct FallbackResolveInfo {
     config: ConfigHandle,
 }
 
+/// Names codepoints of shaped text for the log. Android's logcat must not
+/// hold terminal text, so there only their number is logged.
+fn codepoints_for_log(text: &str) -> String {
+    if cfg!(target_os = "android") {
+        format!("<{} codepoints>", text.chars().count())
+    } else {
+        text.escape_unicode().to_string()
+    }
+}
+
 impl FallbackResolveInfo {
     fn process(self) {
         let fallback_str = self.no_glyphs.iter().collect::<String>();
@@ -318,7 +328,7 @@ impl FallbackResolveInfo {
             Err(err) => log::error!(
                 "Error: {:#} while resolving fallback for {} from font-locator",
                 err,
-                fallback_str.escape_unicode()
+                codepoints_for_log(&fallback_str)
             ),
         }
 
@@ -331,7 +341,7 @@ impl FallbackResolveInfo {
                 Err(err) => log::error!(
                     "Error: {:#} while resolving fallback for {} from font_dirs",
                     err,
-                    fallback_str.escape_unicode()
+                    codepoints_for_log(&fallback_str)
                 ),
             }
         }
@@ -344,7 +354,7 @@ impl FallbackResolveInfo {
             Err(err) => log::error!(
                 "Error: {:#} while resolving fallback for {} for built-in fonts",
                 err,
-                fallback_str.escape_unicode()
+                codepoints_for_log(&fallback_str)
             ),
         }
 
@@ -423,7 +433,7 @@ impl FallbackResolveInfo {
                      configuration so that it can find them.\n\
                      {} has more information about configuring fonts.\n\
                      Set warn_about_missing_glyphs=false to suppress this message.",
-                    fallback_str.escape_unicode(),
+                    codepoints_for_log(&fallback_str),
                     url,
                 );
 
@@ -445,7 +455,7 @@ impl FallbackResolveInfo {
             } else {
                 log::debug!(
                     "No fonts contain glyphs for these codepoints: {}",
-                    fallback_str.escape_unicode()
+                    codepoints_for_log(&fallback_str)
                 );
             }
         }

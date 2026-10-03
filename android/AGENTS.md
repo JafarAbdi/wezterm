@@ -233,10 +233,12 @@ but not typed, composed, pasted or shaped text: `TermWindow` logs window
 events as `WindowEvent::without_text` on Android, the client logs a
 PDU's name where upstream logs the PDU and a laptop's clipboard copy
 (OSC 52) as its selection and byte count, and the logger caps
-`wezterm_font::shaper` at info. One shaper record still holds text, at
-error level and so in release builds too: when loading or sizing a
-fallback font fails, `harfbuzz.rs` logs the error with the cluster it
-was shaping. Running out of fallback fonts is not such a failure.
+`wezterm_font::shaper` at info. The font and glyph records that would
+hold screen text log metadata on Android, at their own level: a fallback
+font that fails to load or size logs the byte count it could not shape
+(not the error, which can quote it), missing glyphs log how many
+codepoints, and a failed or debug glyph load names no glyph. Desktop
+logs them unchanged.
 `debug_key_events` (default false) is upstream's explicit opt-in and
 still logs keys at info.
 
@@ -522,7 +524,11 @@ Gradle and the script.
   restarts, key import through the system picker including documents of
   exactly 1 MiB and one byte more, attach with pane ids compared to the
   laptop's, passphrase and password prompts, a missing server, a codec
-  mismatch, an empty server) and `input` (`InputTest`, one process, its
+  mismatch, an empty server; then `FontLogTest`, one method per process
+  on the `lastpane` shell with a test fallback font: a fallback font file
+  gone before its first load, its wide character drawn as a placeholder
+  that keeps both cells (read from a screenshot), and a codepoint no font
+  covers, each logged without the text) and `input` (`InputTest`, one process, its
   methods in name order on one connection: a command typed through the
   `InputConnection`, composition, deletion around surrogates and combining
   marks, hardware keys and the key row, paste (the IME's, the key row's
@@ -551,7 +557,8 @@ Gradle and the script.
   loss with a host-trust answer after it and Home, then a loss while Back
   hid the surface; three rounds of a cancelled connect and a user
   disconnect, after each of which no worker, prompt or mux domain remains,
-  and after the third no thread or socket beyond the first round's; a GUI
+  and after the third no thread or socket beyond the first round's, each
+  round's thread and descriptor maps logged whole before and after it; a GUI
   engine failure while an attempt waits for the version answer, after which
   its threads, the connection UI thread among them, end and its domain is
   reported stranded; the same failure while a debug hold keeps the

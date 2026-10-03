@@ -44,6 +44,10 @@ EXPECTED = {
             "aCodecMismatchIsADistinctFailureAndAttachesNoPanes",
             "anEmptyMuxServerShowsTheEmptyStateAndSpawnsNothing",
         ],
+        "FontLogTest": [
+            "aClusterNoFallbackFontCanLoadIsLoggedWithoutItsText",
+            "codepointsNoFontCoversAreLoggedWithoutTheirValues",
+        ],
     },
     "input": {
         "InputTest": [
@@ -92,7 +96,7 @@ EXPECTED = {
 
 
 def entries(suite: str) -> list[str]:
-    isolated = {"EngineFailureTest", "ReconnectTest", "SshMuxStartTest", "SshMuxTest"}
+    isolated = {"EngineFailureTest", "FontLogTest", "ReconnectTest", "SshMuxStartTest", "SshMuxTest"}
     return [
         entry
         for class_name, methods in EXPECTED[suite].items()

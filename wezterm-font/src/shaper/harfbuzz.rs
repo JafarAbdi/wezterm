@@ -10,7 +10,7 @@ use ordered_float::NotNan;
 use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
 use std::ops::Range;
-use termwiz::cell::{unicode_column_width, Presentation};
+use termwiz::cell::{grapheme_column_width, unicode_column_width, Presentation};
 use wezterm_bidi::Direction;
 
 // Changing these will switch to using harfbuzz's opentype functions.
@@ -200,6 +200,56 @@ impl HarfbuzzShaper {
                 })))
             }
         }
+    }
+
+    /// Glyphs standing in for `s[range]`: one replacement character per
+    /// grapheme, shaped as text, each at the start of its grapheme in `s`
+    /// and taking that grapheme's cells.
+    fn shape_placeholders(
+        &self,
+        s: &str,
+        range: Range<usize>,
+        font_size: f64,
+        dpi: u32,
+        no_glyphs: &mut Vec<char>,
+        direction: Direction,
+        presentation_width: Option<&PresentationWidth>,
+    ) -> anyhow::Result<Vec<GlyphInfo>> {
+        let text = &s[range.clone()];
+        let placeholders = make_question_string(text);
+        let mut glyphs = self.do_shape(
+            0,
+            &placeholders,
+            font_size,
+            dpi,
+            no_glyphs,
+            None,
+            direction,
+            0..placeholders.len(),
+            None,
+        )?;
+        let graphemes: Vec<(usize, u8)> = Graphemes::new(text)
+            .scan(range.start, |at, grapheme| {
+                let start = *at;
+                *at += grapheme.len();
+                let cells = match presentation_width {
+                    Some(width) => width.num_cells(start..*at),
+                    None => grapheme_column_width(grapheme, None) as u8,
+                };
+                Some((start, cells))
+            })
+            .collect();
+        let placeholder_len = placeholders.len() / graphemes.len();
+        let mut placed = None;
+        for glyph in &mut glyphs {
+            let index = glyph.cluster as usize / placeholder_len;
+            let (start, cells) = graphemes[index];
+            glyph.cluster = start as u32;
+            // Further glyphs of one placeholder draw over its cells.
+            glyph.num_cells = if placed == Some(index) { 0 } else { cells };
+            placed = Some(index);
+        }
+        Ok(glyphs)
     }
 
     fn do_shape(
@@ -478,6 +528,8 @@ impl HarfbuzzShaper {
                 */
 
                 let first_info = &infos[0];
+                // NOT! substr; this is a coalesced sequence of incomplete clusters!
+                let incomplete = first_info.cluster..first_info.cluster + first_info.len;
 
                 let mut shape = match self.do_shape(
                     font_idx + 1,
@@ -487,26 +539,33 @@ impl HarfbuzzShaper {
                     no_glyphs,
                     presentation,
                     direction,
-                    // NOT! substr; this is a coalesced sequence of incomplete clusters!
-                    first_info.cluster..first_info.cluster + first_info.len,
+                    incomplete.clone(),
                     presentation_width,
                 ) {
-                    Ok(shape) => Ok(shape),
+                    Ok(shape) => shape,
                     Err(e) => {
-                        error!("{:?} for {:?}", e, substr);
-                        self.do_shape(
-                            0,
-                            &make_question_string(substr),
+                        // Android's logcat must not hold terminal text: the
+                        // cluster is screen text, and the error may quote it.
+                        if cfg!(target_os = "android") {
+                            error!(
+                                "no fallback font could shape {} bytes of text; \
+                                 showing placeholders",
+                                incomplete.len()
+                            );
+                        } else {
+                            error!("{:?} for {:?}", e, substr);
+                        }
+                        self.shape_placeholders(
+                            s,
+                            incomplete,
                             font_size,
                             dpi,
                             no_glyphs,
-                            presentation,
                             direction,
-                            sub_range,
                             presentation_width,
-                        )
+                        )?
                     }
-                }?;
+                };
 
                 cluster.append(&mut shape);
                 continue;
