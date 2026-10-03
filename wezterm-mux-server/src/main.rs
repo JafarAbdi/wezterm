@@ -230,7 +230,9 @@ fn run() -> anyhow::Result<()> {
 
     let executor = promise::spawn::SimpleExecutor::new();
 
-    spawn_listener().map_err(|e| {
+    // Bind now so clients that just auto-started us can connect; they wait in
+    // the backlog until async_run has rebuilt the session and starts accepting.
+    let listeners = bind_listeners().map_err(|e| {
         log::error!("problem spawning listeners: {:?}", e);
         e
     })?;
@@ -238,7 +240,7 @@ fn run() -> anyhow::Result<()> {
     let activity = Activity::new();
 
     promise::spawn::spawn(async move {
-        if let Err(err) = async_run(cmd).await {
+        if let Err(err) = async_run(cmd, listeners).await {
             terminate_with_error(err);
         }
         drop(activity);
@@ -258,7 +260,10 @@ async fn trigger_mux_startup(lua: Option<Rc<mlua::Lua>>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
+async fn async_run(
+    cmd: Option<CommandBuilder>,
+    listeners: Vec<wezterm_mux_server_impl::local::LocalListener>,
+) -> anyhow::Result<()> {
     let mux = Mux::get();
     let config = config::configuration();
 
@@ -274,6 +279,20 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
     });
 
     let domain = mux.default_domain();
+
+    match mux::session::Store::open(&config.session_db) {
+        Ok(store) => {
+            if let Err(err) = mux::session::restore(&store).await {
+                log::error!(
+                    "session: restoring from {}: {:#}",
+                    config.session_db.display(),
+                    err
+                );
+            }
+            mux::session::start_saver(store);
+        }
+        Err(err) => log::error!("session: {:#}", err),
+    }
 
     {
         if let Err(err) = config::with_lua_config_on_main_thread(trigger_mux_startup).await {
@@ -297,6 +316,13 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
             .spawn(config.initial_size(0, None), cmd, None, *window_id)
             .await?;
     }
+
+    for mut listener in listeners {
+        thread::spawn(move || listener.run());
+    }
+    for tls_server in &config.tls_servers {
+        ossl::spawn_tls_listener(tls_server)?;
+    }
     Ok(())
 }
 
@@ -307,19 +333,13 @@ fn terminate_with_error(err: anyhow::Error) -> ! {
 
 mod ossl;
 
-pub fn spawn_listener() -> anyhow::Result<()> {
-    let config = configuration();
-    for unix_dom in &config.unix_domains {
-        std::env::set_var("WEZTERM_UNIX_SOCKET", unix_dom.socket_path());
-        let mut listener = wezterm_mux_server_impl::local::LocalListener::with_domain(unix_dom)?;
-        thread::spawn(move || {
-            listener.run();
-        });
-    }
-
-    for tls_server in &config.tls_servers {
-        ossl::spawn_tls_listener(tls_server)?;
-    }
-
-    Ok(())
+fn bind_listeners() -> anyhow::Result<Vec<wezterm_mux_server_impl::local::LocalListener>> {
+    configuration()
+        .unix_domains
+        .iter()
+        .map(|unix_dom| {
+            std::env::set_var("WEZTERM_UNIX_SOCKET", unix_dom.socket_path());
+            wezterm_mux_server_impl::local::LocalListener::with_domain(unix_dom)
+        })
+        .collect()
 }
