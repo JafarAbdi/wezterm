@@ -40,6 +40,7 @@ pub mod domain;
 pub mod localpane;
 pub mod pane;
 pub mod renderable;
+pub mod session;
 pub mod ssh;
 pub mod ssh_agent;
 pub mod tab;
@@ -1473,4 +1474,13 @@ impl wezterm_term::DownloadHandler for MuxDownloader {
             });
         }
     }
+}
+
+/// The mux this process's tests share, so `Mux::get()` resolves in the code
+/// under test.
+#[cfg(test)]
+pub(crate) fn test_mux() -> Arc<Mux> {
+    static SHARED: std::sync::Once = std::sync::Once::new();
+    SHARED.call_once(|| Mux::set_mux(&Arc::new(Mux::new(None))));
+    Mux::get()
 }

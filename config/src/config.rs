@@ -882,6 +882,11 @@ pub struct Config {
     #[dynamic(default)]
     pub default_workspace: Option<String>,
 
+    /// SQLite file the mux server saves its local windows, tabs, panes and
+    /// scrollback to, and restores them from on start.
+    #[dynamic(default = "default_session_db")]
+    pub session_db: PathBuf,
+
     #[dynamic(default)]
     pub xcursor_theme: Option<String>,
 
@@ -1770,6 +1775,10 @@ pub(crate) fn compute_data_dir() -> anyhow::Result<PathBuf> {
     }
 
     Ok(crate::HOME_DIR.join(".local/share/wezterm"))
+}
+
+fn default_session_db() -> PathBuf {
+    crate::DATA_DIR.join("sessions.db")
 }
 
 pub(crate) fn compute_runtime_dir() -> anyhow::Result<PathBuf> {

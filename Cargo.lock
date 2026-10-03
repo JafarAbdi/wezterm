@@ -3600,10 +3600,14 @@ dependencies = [
  "procinfo",
  "promise",
  "rangeset",
+ "rusqlite",
  "serde",
+ "serde_json",
  "serial2",
+ "sha2",
  "shell-words",
  "smol",
+ "tempfile",
  "terminfo",
  "termwiz",
  "termwiz-funcs",
@@ -3614,6 +3618,7 @@ dependencies = [
  "wezterm-ssh",
  "wezterm-term",
  "windows-sys 0.61.2",
+ "zstd",
 ]
 
 [[package]]

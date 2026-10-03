@@ -2196,26 +2196,33 @@ impl Into<String> for SerdeUrl {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
     use crate::renderable::*;
     use parking_lot::{MappedMutexGuard, Mutex};
     use rangeset::RangeSet;
     use std::ops::Range;
-    use termwiz::surface::SequenceNo;
+    use termwiz::surface::{SequenceNo, SEQ_ZERO};
     use url::Url;
     use wezterm_term::color::ColorPalette;
     use wezterm_term::{KeyCode, KeyModifiers, Line, MouseEvent, StableRowIndex};
 
-    struct FakePane {
+    /// A pane with no process, no scrollback and a fixed size.
+    pub(crate) struct FakePane {
         id: PaneId,
+        domain: DomainId,
         size: Mutex<TerminalSize>,
     }
 
     impl FakePane {
-        fn new(id: PaneId, size: TerminalSize) -> Arc<dyn Pane> {
+        pub(crate) fn new(id: PaneId, size: TerminalSize) -> Arc<dyn Pane> {
+            Self::in_domain(id, size, 1)
+        }
+
+        pub(crate) fn in_domain(id: PaneId, size: TerminalSize, domain: DomainId) -> Arc<dyn Pane> {
             Arc::new(Self {
                 id,
+                domain,
                 size: Mutex::new(size),
             })
         }
@@ -2227,11 +2234,11 @@ mod test {
         }
 
         fn get_cursor_position(&self) -> StableCursorPosition {
-            unimplemented!();
+            StableCursorPosition::default()
         }
 
         fn get_current_seqno(&self) -> SequenceNo {
-            unimplemented!();
+            SEQ_ZERO
         }
 
         fn get_changed_since(
@@ -2258,8 +2265,8 @@ mod test {
             unimplemented!();
         }
 
-        fn get_lines(&self, _lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
-            unimplemented!();
+        fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
+            (lines.start, vec![])
         }
 
         fn get_logical_lines(&self, _lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
@@ -2267,11 +2274,22 @@ mod test {
         }
 
         fn get_dimensions(&self) -> RenderableDimensions {
-            unimplemented!();
+            let size = *self.size.lock();
+            RenderableDimensions {
+                cols: size.cols,
+                viewport_rows: size.rows,
+                scrollback_rows: size.rows,
+                physical_top: 0,
+                scrollback_top: 0,
+                dpi: size.dpi,
+                pixel_width: size.pixel_width,
+                pixel_height: size.pixel_height,
+                reverse_video: false,
+            }
         }
 
         fn get_title(&self) -> String {
-            unimplemented!()
+            format!("pane {}", self.id)
         }
         fn send_paste(&self, _text: &str) -> anyhow::Result<()> {
             unimplemented!()
@@ -2303,7 +2321,7 @@ mod test {
             unimplemented!()
         }
         fn domain_id(&self) -> DomainId {
-            1
+            self.domain
         }
         fn is_mouse_grabbed(&self) -> bool {
             false

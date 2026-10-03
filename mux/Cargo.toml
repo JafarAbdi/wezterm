@@ -33,10 +33,13 @@ parking_lot.workspace = true
 percent-encoding.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}
 procinfo.workspace = true
+rusqlite = {workspace=true, features=["bundled"]}
 promise.workspace = true
 rangeset.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
+serde_json.workspace = true
 serial2.workspace = true
+sha2.workspace = true
 shell-words.workspace = true
 smol.workspace = true
 terminfo.workspace = true
@@ -48,6 +51,7 @@ url.workspace = true
 wezterm-dynamic.workspace = true
 wezterm-ssh.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }
+zstd.workspace = true
 
 [target."cfg(windows)".dependencies]
 ntapi.workspace = true
@@ -55,3 +59,4 @@ windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
 k9.workspace = true
+tempfile.workspace = true
