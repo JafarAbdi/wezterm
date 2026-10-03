@@ -7,26 +7,39 @@
 //! `ConnectionUI` requests are consumed here and become state in
 //! [`Connections`]; Kotlin shows that state and answers prompts by id.
 //!
-//! No other domain is ever added to the mux, nothing is spawned when the
-//! laptop has no panes, and the proxy command never starts a server.
+//! Each attempt registers one domain, `laptop-<attempt>`, and no other
+//! domain is ever added to the mux.  Nothing is spawned when the laptop has
+//! no panes, and the proxy command never starts a server.  Once the
+//! threads of an attempt have ended, its domain is detached and
+//! unregistered on the GUI thread; an attached connection keeps it, also
+//! while the laptop has no panes.
+//!
+//! [`cancel`] ends an attempt from the calling thread, without a GUI task:
+//! its prompt ends, its transport shuts down, and the attach can no longer
+//! publish.  [`disconnect`] detaches the domain on the GUI thread, so no
+//! pane removal asks the laptop to kill a pane, and only then shuts the
+//! transport down.  A reconnect is a new attempt: a new domain, a new
+//! client and a new pane list.  Nothing reconnects by itself.
 
 #![forbid(unsafe_code)]
 
 use crate::connection::{
-    Answer, AnswerRefused, Busy, Connections, Failure, FailureKind, PromptKind, Responder, Snapshot,
+    Answer, AnswerRefused, Connections, EndRefused, Failure, FailureKind, PromptKind, Refused,
+    Responder, Snapshot,
 };
 use crate::engine::EngineState;
 use crate::profile::{Profile, ProfileError, ProfileFields};
 use crate::sshstore::{ImportError, SshStore};
 use config::SshDomain;
+use crossbeam::channel::{Receiver, Sender};
 use mux::connui::{ConnectionUI, UIRequest};
-use mux::domain::{Domain, DomainState};
+use mux::domain::{Domain, DomainId, DomainState};
 use mux::ssh::{SshConnectError, SshConnectStage};
 use mux::{Mux, MuxNotification};
 use serde::Serialize;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 use termwiz::surface::Change;
 use thiserror::Error;
@@ -34,8 +47,26 @@ use wezterm_client::client::{IncompatibleVersionError, VersionCheckFailed};
 use wezterm_client::domain::{ClientDomain, ClientDomainConfig};
 use window::os::android::platform_requests;
 
-static CONNECTION: Connections = Connections::new(|| platform_requests().connection_changed());
+static CONNECTION: Connections =
+    Connections::new(|| platform_requests().connection_changed(), retire);
 static STORE: OnceLock<SshStore> = OnceLock::new();
+
+/// A channel that disconnects when the engine ends.  An attach task that
+/// the ended GUI thread never finishes keeps its `ConnectionUI`, so the
+/// request channel of its consumer never closes; the consumer stops on
+/// this instead.
+struct EngineLive {
+    live: Mutex<Option<Sender<()>>>,
+    ended: Receiver<()>,
+}
+
+static ENGINE_LIVE: LazyLock<EngineLive> = LazyLock::new(|| {
+    let (live, ended) = crossbeam::channel::bounded(0);
+    EngineLive {
+        live: Mutex::new(Some(live)),
+        ended,
+    }
+});
 
 /// Create the private SSH directory under `files_dir`, once per process.
 pub(crate) fn open_store(files_dir: &Path) {
@@ -53,6 +84,7 @@ pub(crate) fn open_store(files_dir: &Path) {
 /// The GUI engine ended with `message`.
 pub(crate) fn engine_ended(message: &str) {
     CONNECTION.engine_ended(message);
+    ENGINE_LIVE.live.lock().unwrap().take();
 }
 
 /// Why [`connect`] started nothing.
@@ -61,9 +93,9 @@ pub enum ConnectRefused {
     /// A profile field is invalid.
     #[error(transparent)]
     Profile(#[from] ProfileError),
-    /// A connection is attaching or attached.
+    /// A connection is under way, or the last one is still closing.
     #[error(transparent)]
-    Busy(#[from] Busy),
+    Refused(#[from] Refused),
     /// The GUI engine has not started running yet.
     #[error("the terminal engine is still starting")]
     Starting,
@@ -82,7 +114,8 @@ pub fn connect(fields: &ProfileFields) -> Result<u64, ConnectRefused> {
     ) {
         return Err(ConnectRefused::Starting);
     }
-    let attempt = CONNECTION.begin()?;
+    // `_starter` counts this call until the threads below own the attempt.
+    let (attempt, cancel, _starter) = CONNECTION.begin()?;
     // The engine publishes its end to `CONNECTION` after it stops accepting
     // work, so an attempt begun before that is failed by it and one begun
     // after sees the ended state here.
@@ -97,14 +130,19 @@ pub fn connect(fields: &ProfileFields) -> Result<u64, ConnectRefused> {
         return Ok(attempt);
     }
     let domain = profile.ssh_domain(
-        &format!("laptop-{attempt}"),
+        &domain_name(attempt),
         &store.known_hosts(),
         store.identity().as_deref(),
     );
-    let (ui, requests) = ConnectionUI::with_consumer();
+    let (ui, requests) = ConnectionUI::with_consumer(cancel.clone());
+    let worker = cancel.worker();
+    let ended = ENGINE_LIVE.ended.clone();
     let consumer = std::thread::Builder::new()
         .name("wezterm-connect-ui".into())
-        .spawn(move || consume(attempt, requests));
+        .spawn(move || {
+            let _worker = worker;
+            consume(attempt, &requests, &ended)
+        });
     if let Err(err) = consumer {
         CONNECTION.finish(
             attempt,
@@ -120,7 +158,7 @@ pub fn connect(fields: &ProfileFields) -> Result<u64, ConnectRefused> {
             .await
             .map_err(|err| classify(&err));
         if let Err(failure) = &outcome {
-            log::error!("attach attempt {attempt} failed: {:?}", failure.kind);
+            log::error!("attach attempt {attempt} ended: {:?}", failure.kind);
         }
         CONNECTION.finish(attempt, outcome);
     })
@@ -128,12 +166,17 @@ pub fn connect(fields: &ProfileFields) -> Result<u64, ConnectRefused> {
     Ok(attempt)
 }
 
-/// GUI thread: register the domain, attach, and keep the connection state
-/// in step with the mux.  Returns the number of mux windows.
+fn domain_name(attempt: u64) -> String {
+    format!("laptop-{attempt}")
+}
+
+/// GUI thread: register the domain, attach, and keep the window count in
+/// step with the mux.  Returns the number of mux windows.
 async fn attach(attempt: u64, ssh: SshDomain, ui: ConnectionUI) -> anyhow::Result<usize> {
     let mux = Mux::get();
     let domain: Arc<dyn Domain> = Arc::new(ClientDomain::new(ClientDomainConfig::Ssh(ssh)));
     mux.add_domain(&domain);
+    CONNECTION.registered(attempt, domain.domain_id());
     let client = domain
         .downcast_ref::<ClientDomain>()
         .expect("the domain was created as a ClientDomain");
@@ -160,8 +203,8 @@ async fn attach(attempt: u64, ssh: SshDomain, ui: ConnectionUI) -> anyhow::Resul
                     .is_some_and(|domain| domain.state() == DomainState::Attached);
                 if attached {
                     CONNECTION.windows(attempt, mux.iter_windows().len());
-                } else if live.swap(false, Ordering::SeqCst) {
-                    CONNECTION.detached(attempt);
+                } else {
+                    live.store(false, Ordering::SeqCst);
                 }
             })
             .detach();
@@ -169,6 +212,74 @@ async fn attach(attempt: u64, ssh: SshDomain, ui: ConnectionUI) -> anyhow::Resul
         live.load(Ordering::SeqCst)
     });
     Ok(mux.iter_windows().len())
+}
+
+/// Cancel `attempt` while it attaches; refused once it published its panes.
+pub fn cancel(attempt: u64) -> Result<(), EndRefused> {
+    CONNECTION.cancel_attempt(attempt)
+}
+
+/// Disconnect the attached `attempt`.  The laptop's panes are not touched:
+/// the domain is detached before the transport goes down, and a detached
+/// domain's panes are removed without asking the laptop to kill them.
+pub fn disconnect(attempt: u64) -> Result<(), EndRefused> {
+    let transport = CONNECTION.disconnect(attempt)?;
+    // If the engine ends before this runs, its end shuts the transport down.
+    promise::spawn::spawn_into_main_thread(async move {
+        if let Some(domain) = Mux::get().get_domain_by_name(&domain_name(attempt))
+            && let Some(client) = domain.downcast_ref::<ClientDomain>()
+        {
+            client.perform_detach();
+        }
+        transport.shutdown();
+    })
+    .detach();
+    Ok(())
+}
+
+/// The threads of `attempt` have ended: unregister its domain `id` on the
+/// GUI thread.  Detaching first removes the domain's panes while the
+/// domain is still registered and detached, so no `ClientPane::kill` asks
+/// the laptop to kill a pane; it also covers the client thread's own
+/// detach task, which finds no domain once this ran.
+fn retire(attempt: u64, id: DomainId) {
+    promise::spawn::spawn_into_main_thread(async move {
+        if let Some(mux) = Mux::try_get()
+            && let Some(domain) = mux.get_domain(id)
+        {
+            if let Some(client) = domain.downcast_ref::<ClientDomain>() {
+                client.perform_detach();
+            }
+            mux.remove_domain(id);
+        }
+        CONNECTION.retired(attempt);
+    })
+    .detach();
+}
+
+/// Armed by [`hold_next_input`].
+#[cfg(debug_assertions)]
+static HOLD_NEXT_INPUT: AtomicBool = AtomicBool::new(false);
+
+/// The progress line of an attempt whose input request is held.
+#[cfg(debug_assertions)]
+const HELD_INPUT: &str = "debug: an input request is held until the engine ends";
+
+/// Make the consumer of an attempt take its next input request and then
+/// wait for the engine's end and stop without answering or registering it,
+/// as when its `select!` takes the end while that request is queued.  The
+/// attempt shows `HELD_INPUT` as its progress meanwhile.  Debug evidence
+/// only.
+#[cfg(debug_assertions)]
+pub fn hold_next_input() {
+    HOLD_NEXT_INPUT.store(true, Ordering::SeqCst);
+}
+
+/// Shut the transport of the latest attempt down as a failing network
+/// would, whatever its phase.  Debug evidence only.
+#[cfg(debug_assertions)]
+pub fn interrupt_transport() -> bool {
+    CONNECTION.interrupt_transport()
 }
 
 fn classify(err: &anyhow::Error) -> Failure {
@@ -197,10 +308,27 @@ fn classify(err: &anyhow::Error) -> Failure {
 }
 
 /// Own every request of one attempt's `ConnectionUI` until the attach
-/// drops its last clone.  A prompt's promise moves into [`Connections`]
-/// before the platform can see the prompt.
-fn consume(attempt: u64, requests: impl Iterator<Item = UIRequest>) {
-    for request in requests {
+/// drops its last clone or the engine ends.  A prompt's answer moves into
+/// [`Connections`] before the platform can see the prompt; a request still
+/// queued when the engine ends is answered as it is dropped with the
+/// receiver.
+fn consume(attempt: u64, requests: &Receiver<UIRequest>, ended: &Receiver<()>) {
+    loop {
+        let request = crossbeam::select! {
+            recv(requests) -> request => match request {
+                Ok(request) => request,
+                Err(_) => return,
+            },
+            recv(ended) -> _ => return,
+        };
+        #[cfg(debug_assertions)]
+        if matches!(request, UIRequest::Input { .. })
+            && HOLD_NEXT_INPUT.swap(false, Ordering::SeqCst)
+        {
+            CONNECTION.progress(attempt, HELD_INPUT);
+            ended.recv().ok();
+            return;
+        }
         match request {
             UIRequest::Output(changes) => {
                 for change in changes {
@@ -213,7 +341,7 @@ fn consume(attempt: u64, requests: impl Iterator<Item = UIRequest>) {
             UIRequest::Input {
                 prompt,
                 echo,
-                mut respond,
+                respond,
             } => {
                 let kind = if echo {
                     PromptKind::Text { text: prompt }
@@ -232,7 +360,7 @@ fn consume(attempt: u64, requests: impl Iterator<Item = UIRequest>) {
             UIRequest::HostTrust {
                 remote_address,
                 fingerprint,
-                mut respond,
+                respond,
                 ..
             } => {
                 let kind = PromptKind::HostTrust {
@@ -244,9 +372,11 @@ fn consume(attempt: u64, requests: impl Iterator<Item = UIRequest>) {
                 });
                 CONNECTION.ask(attempt, kind, responder);
             }
-            UIRequest::Sleep { mut respond, .. } => {
+            UIRequest::Sleep { respond, .. } => {
                 // Only reconnect loops sleep, and SSHMUX has none.
-                respond.err(anyhow::anyhow!("the Android connection UI does not wait"));
+                respond.result(Err(anyhow::anyhow!(
+                    "the Android connection UI does not wait"
+                )));
             }
             UIRequest::Close => {}
         }
@@ -305,6 +435,49 @@ pub fn import_identity(bytes: &[u8]) -> Result<(), ImportError> {
         .ok_or_else(|| std::io::Error::other("the private SSH directory is unavailable"))?;
     store.import_identity(bytes)?;
     Ok(())
+}
+
+/// Threads and open descriptors of this process.  Debug evidence only.
+#[cfg(debug_assertions)]
+#[derive(Debug, Serialize)]
+pub struct ProcessCensus {
+    /// Every thread of `/proc/self/task`: id and name (`comm`).
+    pub threads: std::collections::BTreeMap<u32, String>,
+    /// Every descriptor of `/proc/self/fd` and what it refers to, the
+    /// census's own directory descriptor excluded.
+    pub fds: std::collections::BTreeMap<u32, String>,
+    /// Threads of the latest attempt that have not ended.
+    pub workers: usize,
+}
+
+/// Take the census on the calling thread.
+#[cfg(debug_assertions)]
+pub fn process_census() -> ProcessCensus {
+    fn entries(dir: &str) -> Vec<(u32, std::path::PathBuf)> {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| Some((entry.file_name().to_str()?.parse().ok()?, entry.path())))
+            .collect()
+    }
+    let threads = entries("/proc/self/task")
+        .into_iter()
+        .map(|(tid, path)| {
+            let name = std::fs::read_to_string(path.join("comm")).unwrap_or_default();
+            (tid, name.trim_end().to_string())
+        })
+        .collect();
+    // The listing's own descriptor no longer resolves once it is closed.
+    let fds = entries("/proc/self/fd")
+        .into_iter()
+        .filter_map(|(fd, path)| Some((fd, std::fs::read_link(path).ok()?.display().to_string())))
+        .collect();
+    ProcessCensus {
+        threads,
+        fds,
+        workers: CONNECTION.snapshot().workers,
+    }
 }
 
 /// The mux as the GUI thread sees it: every domain and every pane with the

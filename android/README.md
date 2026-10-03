@@ -39,6 +39,18 @@ The stored key, host trust and profile are excluded from Android backup
 and device transfer. The key is stored as a file, not in the Android
 Keystore.
 
+While connecting, Cancel (and "Stop connecting" in a trust or password
+dialog) stops the attempt; nothing it started stays behind, and the
+laptop's sessions are not touched. A cancel while the laptop's name is
+still being looked up shows "Cancelling…" until the system's lookup
+returns, and nothing is dialed after it. The "…" key next to Paste disconnects
+from the laptop after asking. A lost connection shows "connection lost".
+In both cases the laptop's sessions keep running, and Reconnect shows them
+again; nothing typed while disconnected is sent. Nothing reconnects by
+itself: not after a lost connection, not after the laptop's last pane
+exits (the app then shows the laptop as empty), and not when the app is
+started again after Android stopped it, which needs Connect.
+
 Terminal windows live as long as the app process. Rotating, pressing Back
 or Home, or switching apps only detaches the screen; reopening the app
 shows the same window. When the laptop has more than one window, a
@@ -107,10 +119,11 @@ make android-test SERIAL=<serial> SUITE=lifecycle     # rotation, Back, window s
 ci/android-sshmux-fixture.sh up "$(tailscale ip -4)"  # test sshd and mux servers on this machine, generated keys only
 make android-test SERIAL=<serial> SUITE=sshmux        # connection screen, host trust, key import, attach, failures
 make android-test SERIAL=<serial> SUITE=input         # typing, keys, paste, selection, resize; needs a fresh `up`
+make android-test SERIAL=<serial> SUITE=reconnect     # cancel, lost connection, reconnect, force-stop, last-pane exit, repeated rounds; needs a fresh `up`
 ci/android-sshmux-fixture.sh down
 ```
 
-The `sshmux` and `input` suites reach the test servers through this
+The `sshmux`, `input` and `reconnect` suites reach the test servers through this
 machine's own Tailscale address, which the kernel delivers over loopback.
 They test the app and the protocol; they do not show that traffic crosses
 a tailnet.

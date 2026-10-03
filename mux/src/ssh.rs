@@ -100,7 +100,10 @@ pub fn ssh_connect_with_ui(
             .get("hostname")
             .expect("ssh config to always set hostname");
         ui.output_str(&format!("Connecting to {} using SSH\n", remote_address));
-        let (session, events) = Session::connect_route(route.clone())?;
+        let (session, events) = match ui.cancel() {
+            Some(cancel) => Session::connect_cancellable(route.clone(), cancel)?,
+            None => Session::connect_route(route.clone())?,
+        };
         let mut stage = SshConnectStage::Connect;
 
         while let Ok(event) = smol::block_on(events.recv()) {

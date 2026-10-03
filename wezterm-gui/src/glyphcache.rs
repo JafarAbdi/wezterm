@@ -668,12 +668,22 @@ impl GlyphCache {
                 // But otherwise: don't allow glyph loading errors to propagate,
                 // as that will result in incomplete window painting.
                 // Log the error and substitute instead.
-                log::error!(
-                    "load_glyph failed; using blank instead. Error: {:#}. {:?} {:?}",
-                    err,
-                    info,
-                    style
-                );
+                if cfg!(target_os = "android") {
+                    // Android's logcat must not hold terminal text: the
+                    // glyph info carries its character, and the error names
+                    // the glyph index.
+                    log::error!(
+                        "load_glyph failed for font {}; using blank instead",
+                        info.font_idx
+                    );
+                } else {
+                    log::error!(
+                        "load_glyph failed; using blank instead. Error: {:#}. {:?} {:?}",
+                        err,
+                        info,
+                        style
+                    );
+                }
                 Rc::new(CachedGlyph {
                     brightness_adjust: 1.0,
                     has_color: false,
@@ -805,7 +815,12 @@ impl GlyphCache {
                      is_square_or_wide={is_square_or_wide} aspect={aspect} \
                      max_pixel_width={max_pixel_width} glyph.width={glyph_width} \
                      -> scale={scale} metrics_only_scale={metrics_only_scale}",
-                    text = info.text,
+                    // Android's logcat must not hold terminal text.
+                    text = if cfg!(target_os = "android") {
+                        "<glyph>"
+                    } else {
+                        info.text.as_str()
+                    },
                     glyph_width = glyph.width,
                 );
             }

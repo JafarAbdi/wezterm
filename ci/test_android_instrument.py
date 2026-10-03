@@ -35,7 +35,7 @@ class InstrumentTest(unittest.TestCase):
         self.assertEqual({case.attrib["name"] for case in root}, set(self.methods))
 
     def test_all_plans_keep_process_boundaries(self) -> None:
-        self.assertEqual([len(instrument.entries(suite)) for suite in instrument.EXPECTED], [1, 1, 6, 12, 1])
+        self.assertEqual([len(instrument.entries(suite)) for suite in instrument.EXPECTED], [1, 1, 6, 14, 1, 13])
         for suite in instrument.EXPECTED:
             for entry in instrument.entries(suite):
                 class_name, separator, method = entry.partition("#")
@@ -83,6 +83,19 @@ class InstrumentTest(unittest.TestCase):
             instrument.parse("input", "InputTest", receipt("InputTest", methods[:-1]), 0)
         with self.assertRaises(ValueError):
             instrument.parse("input", "InputTest#" + methods[0], receipt("InputTest", methods[:1]), 0)
+
+    def test_reconnect_suite_runs_each_method_alone_and_the_force_stop_pair_in_order(self) -> None:
+        methods = instrument.EXPECTED["reconnect"]["ReconnectTest"]
+        entries = instrument.entries("reconnect")
+        self.assertEqual(entries, [f"ReconnectTest#{method}" for method in methods])
+        first = entries.index("ReconnectTest#forceStopWhileAttached1AttachesAndRecordsTheLaptopPanes")
+        self.assertEqual(entries[first + 1], "ReconnectTest#forceStopWhileAttached2RelaunchAttachesTheSamePanesAgain")
+        with self.assertRaises(ValueError):
+            instrument.parse("reconnect", "ReconnectTest", receipt("ReconnectTest", methods), 0)
+        with self.assertRaises(ValueError):
+            instrument.parse("reconnect", entries[0], receipt("ReconnectTest", methods[1:2]), 0)
+        with self.assertRaises(ValueError):
+            instrument.parse("reconnect", entries[0], receipt("ReconnectTest", methods[:2]), 0)
 
     def test_adb_nonzero_with_valid_status(self) -> None:
         self.reject(self.text, adb_exit=255)

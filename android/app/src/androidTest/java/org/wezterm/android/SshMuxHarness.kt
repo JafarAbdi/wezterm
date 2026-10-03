@@ -89,7 +89,10 @@ class SshMuxHarness(private val scenario: ActivityScenario<TerminalActivity>) {
             if (left <= 0) {
                 shell("mkdir -p $SHOTS")
                 shell("screencap -p $SHOTS/timeout.png")
-                error("$what not reached within ${TIMEOUT_MS}ms: phase=${status.phase} prompt=${status.prompt?.javaClass?.simpleName} failure=${status.failureKind}")
+                error(
+                    "$what not reached within ${TIMEOUT_MS}ms: phase=${status.phase} prompt=${status.prompt?.javaClass?.simpleName} " +
+                        "failure=${status.failureKind} workers=${status.workers} domain=${status.domain} closing=${status.closing}",
+                )
             }
             NativeApp.nativeAwaitConnectionChange(status.revision, left)
             status = NativeApp.connectionStatus()
@@ -175,11 +178,11 @@ class SshMuxHarness(private val scenario: ActivityScenario<TerminalActivity>) {
     }
 
     /** Fill the form with the fixture endpoint and `remoteWezterm`, then tap Connect. */
-    fun connect(remoteWezterm: String, host: String = fixture("host")): ConnectionStatus {
+    fun connect(remoteWezterm: String, host: String = fixture("host"), port: String = fixture("port")): ConnectionStatus {
         val before = NativeApp.connectionStatus()
         val panel = panel
         type(panel.host, host)
-        type(panel.port, fixture("port"))
+        type(panel.port, port)
         type(panel.user, fixture("user"))
         type(panel.remoteWezterm, remoteWezterm)
         hideKeyboard()
@@ -375,12 +378,7 @@ class SshMuxHarness(private val scenario: ActivityScenario<TerminalActivity>) {
 
     fun assertNothingAttached(census: JSONObject) {
         assertEquals("no pane exists", 0, census.getJSONArray("panes").length())
-        val domains = census.getJSONArray("domains")
-        for (i in 0 until domains.length()) {
-            val domain = domains.getJSONObject(i)
-            assertTrue("only SSHMUX client domains exist: $domain", domain.getBoolean("client"))
-            assertEquals("no domain is attached: $domain", false, domain.getBoolean("attached"))
-        }
+        assertEquals("no domain is registered", "[]", census.getJSONArray("domains").toString())
         assertEquals("the app started no process", emptyList<String>(), childProcesses())
         assertEquals("no logical window exists", 0, NativeApp.surfaceStatus().windows.size)
     }

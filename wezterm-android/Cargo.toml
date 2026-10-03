@@ -36,6 +36,7 @@ zstd.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger.workspace = true
+crossbeam.workspace = true
 jni.workspace = true
 mux.workspace = true
 ndk.workspace = true
@@ -44,4 +45,5 @@ wezterm-client.workspace = true
 
 [dev-dependencies]
 mux.workspace = true
+socket2.workspace = true
 tempfile.workspace = true

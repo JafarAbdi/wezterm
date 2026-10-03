@@ -46,6 +46,7 @@ class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Li
     internal lateinit var selector: TextView
     internal lateinit var engineBanner: TextView
     internal var selectorDialog: AlertDialog? = null
+    internal var disconnectDialog: AlertDialog? = null
     internal lateinit var connection: ConnectionPanel
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -94,7 +95,7 @@ class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Li
         setContentView(container)
     }
 
-    /** Escape, one-shot Ctrl and Alt, Tab, the arrows and Paste. */
+    /** Escape, one-shot Ctrl and Alt, Tab, the arrows, Paste and the connection's Disconnect. */
     private fun keyRow(terminal: TerminalView): LinearLayout {
         val row = LinearLayout(this).apply { setBackgroundColor(Color.BLACK) }
         fun key(label: Int, description: Int, action: () -> Unit) = Button(this).apply {
@@ -116,6 +117,7 @@ class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Li
         key(R.string.key_up, R.string.key_up_description) { terminal.press(KeyEvent.KEYCODE_DPAD_UP) }
         key(R.string.key_right, R.string.key_right_description) { terminal.press(KeyEvent.KEYCODE_DPAD_RIGHT) }
         key(R.string.key_paste, R.string.key_paste_description) { terminal.paste() }
+        key(R.string.key_connection, R.string.key_connection_description) { confirmDisconnect() }
         terminal.onArmedChanged = {
             ctrl.isSelected = terminal.armedMeta and KeyEvent.META_CTRL_ON != 0
             alt.isSelected = terminal.armedMeta and KeyEvent.META_ALT_ON != 0
@@ -123,6 +125,17 @@ class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Li
         }
         terminal.onArmedChanged()
         return row
+    }
+
+    /** Ask before disconnecting the attempt shown now; the laptop's sessions keep running either way. */
+    private fun confirmDisconnect() {
+        val attempt = NativeApp.connectionStatus().attempt
+        disconnectDialog = AlertDialog.Builder(this)
+            .setTitle(R.string.disconnect_title)
+            .setMessage(R.string.disconnect_message)
+            .setPositiveButton(R.string.connection_disconnect) { _, _ -> NativeApp.nativeDisconnect(attempt) }
+            .setNegativeButton(R.string.prompt_cancel, null)
+            .show()
     }
 
     private fun overlayText() = TextView(this).apply {
@@ -142,6 +155,7 @@ class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Li
     override fun onStop() {
         PlatformRequests.listener = null
         selectorDialog?.dismiss()
+        disconnectDialog?.dismiss()
         connection.dismissPrompt()
         super.onStop()
     }
