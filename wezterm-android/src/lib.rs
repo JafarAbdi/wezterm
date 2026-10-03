@@ -14,6 +14,7 @@ mod dirs;
 pub mod engine;
 #[cfg(target_os = "android")]
 pub mod ffi;
+pub mod input;
 mod probe;
 pub mod profile;
 #[cfg(target_os = "android")]

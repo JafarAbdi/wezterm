@@ -25,10 +25,87 @@ pub struct ClientInner {
     remote_to_local_window: Mutex<HashMap<WindowId, WindowId>>,
     remote_to_local_tab: Mutex<HashMap<TabId, TabId>>,
     remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
-    pub focused_remote_pane_id: Mutex<Option<PaneId>>,
+    pub(crate) focus: Mutex<FocusAdvice>,
+}
+
+/// What this client told the server about its focus.  `SetFocusedPane`
+/// goes out only for a focus this client chose: a focus the server
+/// announced or a resync applied is adopted without being sent back, or
+/// two quick changes would echo between clients and server without end.
+///
+/// Adoption is taken on Android only.  Elsewhere `advise` is upstream's
+/// rule unchanged, so a desktop client still echoes announced focus and
+/// its server-side focus record (`list-clients`, the CLI's default pane)
+/// follows what it shows.
+#[derive(Debug, Default)]
+pub(crate) struct FocusAdvice {
+    /// The remote pane the server holds as this client's focus in the
+    /// window it last focused: the pane it advised, or the one the server
+    /// put in its place in that window since.
+    advised: Option<PaneId>,
+    /// While a focus chosen by the server is applied locally.
+    adopting: bool,
+}
+
+impl FocusAdvice {
+    /// This client focused remote pane `pane`: whether to tell the server.
+    pub(crate) fn advise(&mut self, pane: PaneId) -> bool {
+        if self.adopting || self.advised == Some(pane) {
+            return false;
+        }
+        self.advised = Some(pane);
+        true
+    }
+
+    /// The server moved the focus of a local window from remote pane
+    /// `before` to `after`; it holds `after` in place of what this client
+    /// advised there, but not of what it advised in another window.
+    fn adopted(&mut self, before: Option<PaneId>, after: Option<PaneId>) {
+        if after.is_some() && after != before && (self.advised.is_none() || self.advised == before)
+        {
+            self.advised = after;
+        }
+    }
+}
+
+/// Held while a focus the server chose is applied to a local window.
+pub(crate) struct ServerFocus<'a> {
+    inner: &'a ClientInner,
+    window: Option<WindowId>,
+    before: Option<PaneId>,
+}
+
+impl Drop for ServerFocus<'_> {
+    fn drop(&mut self) {
+        let after = self.inner.window_focus(self.window);
+        let mut focus = self.inner.focus.lock().unwrap();
+        focus.adopting = false;
+        focus.adopted(self.before, after);
+    }
 }
 
 impl ClientInner {
+    /// The remote pane local window `window` shows focused, if it is ours.
+    fn window_focus(&self, window: Option<WindowId>) -> Option<PaneId> {
+        let pane = Mux::get()
+            .get_active_tab_for_window(window?)?
+            .get_active_pane()?;
+        let pane = pane.downcast_ref::<ClientPane>()?;
+        (pane.domain_id() == self.local_domain_id).then_some(pane.remote_pane_id)
+    }
+
+    /// Hold the result while a focus the server chose is applied to local
+    /// `window`.
+    pub(crate) fn adopt_server_focus(&self, window: Option<WindowId>) -> ServerFocus<'_> {
+        let before = self.window_focus(window);
+        self.focus.lock().unwrap().adopting = true;
+        ServerFocus {
+            inner: self,
+            window,
+            before,
+        }
+    }
+
     fn remote_to_local_window(&self, remote_window_id: WindowId) -> Option<WindowId> {
         let map = self.remote_to_local_window.lock().unwrap();
         map.get(&remote_window_id).cloned()
@@ -245,7 +322,7 @@ impl ClientInner {
             remote_to_local_window: Mutex::new(HashMap::new()),
             remote_to_local_tab: Mutex::new(HashMap::new()),
             remote_to_local_pane: Mutex::new(HashMap::new()),
-            focused_remote_pane_id: Mutex::new(None),
+            focus: Mutex::new(FocusAdvice::default()),
         }
     }
 }
@@ -577,6 +654,8 @@ impl ClientDomain {
 
                 log::debug!("domain: {} tree: {:#?}", inner.local_domain_id, tabroot);
                 let mut workspace = None;
+                let adoption = cfg!(target_os = "android")
+                    .then(|| inner.adopt_server_focus(mux.window_containing_tab(tab.tab_id())));
                 tab.sync_with_pane_tree(root_size, tabroot, |entry| {
                     workspace.replace(entry.workspace.clone());
                     remote_panes_to_forget.remove(&entry.pane_id);
@@ -617,6 +696,7 @@ impl ClientDomain {
                         pane
                     }
                 });
+                drop(adoption);
 
                 if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
                     let mut window = mux
@@ -1020,5 +1100,80 @@ impl ClientDomain {
         drop(activity);
         ui.close();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FocusAdvice;
+
+    /// The client applying one `PaneFocused(pane)` for a window that showed
+    /// `before`: `Tab::set_active_pane` advises the pane while adopting.
+    fn announced(focus: &mut FocusAdvice, before: usize, pane: usize) -> bool {
+        focus.adopting = true;
+        let sent = before != pane && focus.advise(pane);
+        focus.adopting = false;
+        focus.adopted(Some(before), Some(pane));
+        sent
+    }
+
+    #[test]
+    fn two_focus_changes_of_this_client_are_sent_once_and_their_announcements_never() {
+        let (top, bottom) = (2, 3);
+        let mut focus = FocusAdvice::default();
+        assert!(focus.advise(bottom));
+        // Taps on the top then the bottom pane before the server answered.
+        assert_eq!([focus.advise(top), focus.advise(bottom)], [true, true]);
+        // The server applies both and announces each twice; the client shows the bottom pane.
+        let sent = [
+            announced(&mut focus, bottom, top),
+            announced(&mut focus, top, top),
+            announced(&mut focus, top, bottom),
+            announced(&mut focus, bottom, bottom),
+        ];
+        assert_eq!(sent, [false; 4]);
+        // Painting the focused bottom pane has nothing to tell.
+        assert!(!focus.advise(bottom));
+    }
+
+    #[test]
+    fn another_actors_focus_changes_are_adopted_without_being_sent() {
+        let (top, bottom) = (2, 3);
+        let mut focus = FocusAdvice::default();
+        assert!(focus.advise(bottom));
+        assert_eq!(
+            [
+                announced(&mut focus, bottom, top),
+                announced(&mut focus, top, bottom)
+            ],
+            [false, false]
+        );
+        assert!(!focus.advise(bottom));
+        // The user then focuses the top pane here: that is sent.
+        assert!(focus.advise(top));
+    }
+
+    #[test]
+    fn a_change_in_another_window_leaves_the_advised_pane() {
+        let (shown, other_before, other_after) = (1, 5, 6);
+        let mut focus = FocusAdvice::default();
+        assert!(focus.advise(shown));
+        assert!(!announced(&mut focus, other_before, other_after));
+        assert!(
+            !focus.advise(shown),
+            "painting the shown pane re-sends nothing"
+        );
+        // Showing the other window is this client's focus: sent.
+        assert!(focus.advise(other_after));
+    }
+
+    #[test]
+    fn a_resync_that_moves_the_shown_windows_focus_is_adopted() {
+        let mut focus = FocusAdvice::default();
+        assert!(focus.advise(3));
+        focus.adopted(Some(3), Some(2));
+        assert!(!focus.advise(2));
+        focus.adopted(Some(2), Some(2));
+        assert!(focus.advise(3));
     }
 }

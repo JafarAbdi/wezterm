@@ -392,3 +392,70 @@ pub(crate) fn census() -> MuxCensus {
     }
     MuxCensus { domains, panes }
 }
+
+/// The pane the bound window sends keyboard input to, as this phone
+/// mirrors it.  Debug evidence only.
+#[cfg(debug_assertions)]
+#[derive(Debug, Serialize)]
+pub struct ActivePane {
+    /// Local pane id.
+    pub pane: usize,
+    /// The laptop's pane id; `None` for a pane that is not remote.
+    pub remote_pane: Option<usize>,
+    /// Viewport height in cells.
+    pub rows: usize,
+    /// Viewport width in cells.
+    pub cols: usize,
+    /// The cursor's viewport row.
+    pub cursor_row: isize,
+    /// The cursor's column.
+    pub cursor_col: usize,
+    /// Up to two viewports of scrollback, then the viewport's rows.  A row
+    /// that wraps onto the next keeps its trailing blanks; other rows are
+    /// trimmed.
+    pub lines: Vec<String>,
+    /// Index in `lines` of the viewport's first row.
+    pub viewport_start: usize,
+    /// Whether each row continues on the next one.
+    pub wrapped: Vec<bool>,
+}
+
+/// GUI thread: the bound window's active pane.
+#[cfg(debug_assertions)]
+pub(crate) fn active_pane() -> anyhow::Result<ActivePane> {
+    use wezterm_client::pane::ClientPane;
+    let (_, pane) = wezterm_gui::android::bound_pane()?;
+    let dims = pane.get_dimensions();
+    let top = dims.physical_top;
+    let cursor = pane.get_cursor_position();
+    let first = dims
+        .scrollback_top
+        .max(top - 2 * dims.viewport_rows as isize);
+    let (first, rows) = pane.get_lines(first..top + dims.viewport_rows as isize);
+    let wrapped: Vec<bool> = rows.iter().map(|row| row.last_cell_was_wrapped()).collect();
+    let lines = rows
+        .iter()
+        .zip(&wrapped)
+        .map(|(row, wrapped)| {
+            let text = row.as_str();
+            if *wrapped {
+                text.into_owned()
+            } else {
+                text.trim_end_matches(' ').to_string()
+            }
+        })
+        .collect();
+    Ok(ActivePane {
+        pane: pane.pane_id(),
+        remote_pane: pane
+            .downcast_ref::<ClientPane>()
+            .map(|pane| pane.remote_pane_id()),
+        rows: dims.viewport_rows,
+        cols: dims.cols,
+        cursor_row: cursor.y - top,
+        cursor_col: cursor.x,
+        lines,
+        viewport_start: usize::try_from(top - first).unwrap_or(0),
+        wrapped,
+    })
+}

@@ -8,11 +8,13 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.SurfaceHolder
-import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
+import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.TextView
 import java.io.IOException
 import java.io.InputStream
@@ -28,6 +30,10 @@ import kotlin.concurrent.thread
  * this thread, so the wait cannot deadlock, and an engine that ends
  * resolves the wait from its shutdown.
  *
+ * The surface fills what the system bars and the soft keyboard leave
+ * free, above a row of keys a soft keyboard lacks; its size is the size of
+ * the laptop pane, which every client of that pane shares.
+ *
  * Leaving this Activity (Back, Home, rotation, finish) only takes the
  * surface away. Logical windows and their panes live in the native engine
  * for the life of the process; nothing here closes one. The selector shows
@@ -35,7 +41,8 @@ import kotlin.concurrent.thread
  */
 class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Listener {
     private var generation = 0L
-    internal lateinit var surfaceView: SurfaceView
+    internal lateinit var surfaceView: TerminalView
+    internal lateinit var keys: LinearLayout
     internal lateinit var selector: TextView
     internal lateinit var engineBanner: TextView
     internal var selectorDialog: AlertDialog? = null
@@ -54,8 +61,9 @@ class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Li
             @Suppress("DEPRECATION")
             startActivityForResult(pick, REQUEST_IDENTITY)
         }
-        surfaceView = SurfaceView(this)
+        surfaceView = TerminalView(this)
         surfaceView.holder.addCallback(this)
+        keys = keyRow(surfaceView)
         selector = overlayText().apply {
             visibility = View.GONE
             setOnClickListener { showSelector() }
@@ -64,7 +72,12 @@ class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Li
         val container = FrameLayout(this)
         val fill = ViewGroup.LayoutParams.MATCH_PARENT
         val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
-        container.addView(surfaceView, FrameLayout.LayoutParams(fill, fill))
+        val terminal = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(surfaceView, LinearLayout.LayoutParams(fill, 0, 1f))
+            addView(keys, LinearLayout.LayoutParams(fill, wrap))
+        }
+        container.addView(terminal, FrameLayout.LayoutParams(fill, fill))
         container.addView(connection.view, FrameLayout.LayoutParams(fill, fill))
         container.addView(selector, FrameLayout.LayoutParams(wrap, wrap, Gravity.TOP or Gravity.END))
         container.addView(engineBanner, FrameLayout.LayoutParams(fill, wrap, Gravity.BOTTOM))
@@ -79,6 +92,37 @@ class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Li
             insets
         }
         setContentView(container)
+    }
+
+    /** Escape, one-shot Ctrl and Alt, Tab, the arrows and Paste. */
+    private fun keyRow(terminal: TerminalView): LinearLayout {
+        val row = LinearLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        fun key(label: Int, description: Int, action: () -> Unit) = Button(this).apply {
+            setText(label)
+            contentDescription = getString(description)
+            isAllCaps = false
+            minWidth = 0
+            minimumWidth = 0
+            setPadding(0, 0, 0, 0)
+            setOnClickListener { action() }
+            row.addView(this, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        key(R.string.key_escape, R.string.key_escape_description) { terminal.press(KeyEvent.KEYCODE_ESCAPE) }
+        val ctrl = key(R.string.key_ctrl, R.string.key_ctrl_description) { terminal.toggleArmed(KeyEvent.META_CTRL_ON) }
+        val alt = key(R.string.key_alt, R.string.key_alt_description) { terminal.toggleArmed(KeyEvent.META_ALT_ON) }
+        key(R.string.key_tab, R.string.key_tab_description) { terminal.press(KeyEvent.KEYCODE_TAB) }
+        key(R.string.key_left, R.string.key_left_description) { terminal.press(KeyEvent.KEYCODE_DPAD_LEFT) }
+        key(R.string.key_down, R.string.key_down_description) { terminal.press(KeyEvent.KEYCODE_DPAD_DOWN) }
+        key(R.string.key_up, R.string.key_up_description) { terminal.press(KeyEvent.KEYCODE_DPAD_UP) }
+        key(R.string.key_right, R.string.key_right_description) { terminal.press(KeyEvent.KEYCODE_DPAD_RIGHT) }
+        key(R.string.key_paste, R.string.key_paste_description) { terminal.paste() }
+        terminal.onArmedChanged = {
+            ctrl.isSelected = terminal.armedMeta and KeyEvent.META_CTRL_ON != 0
+            alt.isSelected = terminal.armedMeta and KeyEvent.META_ALT_ON != 0
+            for (modifier in listOf(ctrl, alt)) modifier.alpha = if (modifier.isSelected) 1f else ARMABLE_ALPHA
+        }
+        terminal.onArmedChanged()
+        return row
     }
 
     private fun overlayText() = TextView(this).apply {
@@ -104,6 +148,9 @@ class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Li
 
     override fun onConnectionChanged() {
         connection.render(NativeApp.connectionStatus(), terminalVisible = NativeApp.diagnosticApplet)
+        val shown = connection.view.visibility == View.GONE
+        surfaceView.acceptsInput = shown
+        keys.visibility = if (shown) View.VISIBLE else View.GONE
     }
 
     /**
@@ -146,6 +193,7 @@ class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Li
 
     override fun onWindowsChanged() {
         val status = NativeApp.surfaceStatus()
+        surfaceView.inputTarget = status.inputTarget
         val bound = status.windows.indexOfFirst { it.id == status.boundWindow }
         selector.visibility = if (status.windows.size > 1) View.VISIBLE else View.GONE
         selector.text = getString(R.string.window_selector, bound + 1, status.windows.size)
@@ -218,6 +266,9 @@ class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Li
         const val EXTRA_DIAGNOSTIC_APPLET = "org.wezterm.android.DIAGNOSTIC_APPLET"
 
         private const val REQUEST_IDENTITY = 1
+
+        /** How the Ctrl and Alt keys look while not armed. */
+        private const val ARMABLE_ALPHA = 0.6f
 
         /** OpenSSH's `MAX_KEY_FILE_SIZE`; the native import enforces it. */
         private const val MAX_KEY_FILE_SIZE = 1024 * 1024

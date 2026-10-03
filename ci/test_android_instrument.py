@@ -35,7 +35,7 @@ class InstrumentTest(unittest.TestCase):
         self.assertEqual({case.attrib["name"] for case in root}, set(self.methods))
 
     def test_all_plans_keep_process_boundaries(self) -> None:
-        self.assertEqual([len(instrument.entries(suite)) for suite in instrument.EXPECTED], [1, 1, 6, 12])
+        self.assertEqual([len(instrument.entries(suite)) for suite in instrument.EXPECTED], [1, 1, 6, 12, 1])
         for suite in instrument.EXPECTED:
             for entry in instrument.entries(suite):
                 class_name, separator, method = entry.partition("#")
@@ -72,6 +72,17 @@ class InstrumentTest(unittest.TestCase):
     def test_wrong_method(self) -> None:
         self.reject(self.text.replace(self.methods[0], "notTheRequiredMethod"))
         self.reject(self.text, entry="NativeLoadTest#notTheRequiredMethod")
+
+    def test_input_suite_is_one_process_needing_every_method_in_order(self) -> None:
+        self.assertEqual(instrument.entries("input"), ["InputTest"])
+        methods = instrument.EXPECTED["input"]["InputTest"]
+        self.assertEqual(methods, sorted(methods), "the methods share one connection in name order")
+        root = instrument.parse("input", "InputTest", receipt("InputTest", methods), 0)
+        self.assertEqual(len(root), len(methods), "one test case per inventory method")
+        with self.assertRaises(ValueError):
+            instrument.parse("input", "InputTest", receipt("InputTest", methods[:-1]), 0)
+        with self.assertRaises(ValueError):
+            instrument.parse("input", "InputTest#" + methods[0], receipt("InputTest", methods[:1]), 0)
 
     def test_adb_nonzero_with_valid_status(self) -> None:
         self.reject(self.text, adb_exit=255)

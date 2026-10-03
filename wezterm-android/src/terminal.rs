@@ -8,18 +8,20 @@
 #![forbid(unsafe_code)]
 
 use crate::engine::{EngineEnd, EngineGate, NotAccepting, PlatformEvent};
+use crate::input::{Input, InputTarget};
 use crate::{InitOutcome, InitRequest};
 use ndk::native_window::NativeWindow;
 use serde::Serialize;
-use std::sync::Arc;
 use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use wezterm_gui::android::TargetChange;
 use wezterm_gui::renderfault::{RenderFailures, RenderStage};
 use window::ConnectionOps;
 use window::os::android::{
-    Connection, NativeWindowLease, PlatformRequest, SurfaceSnapshot, platform_requests,
-    surface_monitor,
+    Connection, InputCounts, NativeWindowLease, PlatformRequest, SurfaceSnapshot,
+    platform_requests, surface_monitor,
 };
 use window::surface::{RetireAck, SurfaceEvent, SurfaceGeneration, SurfaceGeometry};
 
@@ -77,17 +79,176 @@ fn failed(stage: EngineStage, message: String) -> EngineEnd {
 fn drain() {
     while let Some(event) = ENGINE.next() {
         let Some(conn) = Connection::get() else {
-            log::error!("platform event {event:?} arrived without a Connection");
+            log::error!("a platform event arrived without a Connection and was dropped");
             continue;
         };
         match event {
-            PlatformEvent::Surface(event) => conn.apply_surface_event(event),
+            PlatformEvent::Surface(event) => {
+                conn.apply_surface_event(event);
+                fit_if_shown(&conn);
+            }
             PlatformEvent::SelectWindow(id) => conn.select_window(id),
             PlatformEvent::ClipboardText { request, text } => {
                 platform_requests().complete_clipboard(request, text);
             }
+            PlatformEvent::Input(input) => {
+                #[cfg(debug_assertions)]
+                let Some(input) = hold_input(input) else {
+                    continue;
+                };
+                apply_input(&conn, input)
+            }
         }
     }
+}
+
+/// Mux changes that may have moved a window's input to another pane, in
+/// the order the mux announced them, until an observation resolves them.
+static TARGET_CHANGES: Mutex<Vec<TargetChange>> = Mutex::new(Vec::new());
+
+/// GUI thread: the pane the bound window's keyboard input reaches now.
+/// Its generation moves when the pane differs or a change recorded since
+/// the last observation concerns the bound window, even if the input went
+/// back to the same pane; the platform is told.
+fn observe_input_target() -> InputTarget {
+    let changes = std::mem::take(&mut *TARGET_CHANGES.lock().unwrap());
+    let (pane, moved) = wezterm_gui::android::input_target(&changes);
+    InputTarget {
+        pane,
+        generation: surface_monitor().observe_input_pane(pane, moved),
+    }
+}
+
+/// Follow the mux.  A notification arrives with mux state locked, so here
+/// a change of input target is only recorded, in announcement order; a
+/// later GUI-thread task observes it (and every input observes first).  A
+/// tab that changed size makes the bound window fit its tabs again, except
+/// for the notifications that fit raises itself.
+fn follow_mux() {
+    use mux::{Mux, MuxNotification as N};
+    Mux::get().subscribe(|notification| {
+        let change = TargetChange::of(&notification);
+        if let Some(change) = change {
+            TARGET_CHANGES.lock().unwrap().push(change);
+        }
+        if change.is_some() || matches!(notification, N::PaneRemoved(_) | N::WindowCreated(_)) {
+            defer_observation(&notification);
+        }
+        if let N::TabResized(_) = notification
+            && !wezterm_gui::android::fitting()
+        {
+            promise::spawn::spawn_into_main_thread(async { fit() }).detach();
+        }
+        true
+    });
+}
+
+/// GUI thread, after another window became the bound one: the platform
+/// learns which pane input reaches, and the window fits its tabs to the
+/// surface; at the size the surface had, no resize event would.
+fn rebound() {
+    observe_input_target();
+    if let Some(conn) = Connection::get() {
+        fit_if_shown(&conn);
+    }
+}
+
+/// Debug builds: while `Some`, `fit` only counts its calls here.
+#[cfg(debug_assertions)]
+static HELD_FITS: Mutex<Option<usize>> = Mutex::new(None);
+
+/// GUI thread: a window that shows again at the size it had keeps the
+/// dimensions `TermWindow` has, so no resize event fits its tabs; the
+/// laptop may have resized them while it showed nothing.
+fn fit_if_shown(conn: &Connection) {
+    if conn
+        .bound_window()
+        .is_some_and(|window| conn.presents(window))
+    {
+        fit();
+    }
+}
+
+/// GUI thread: the bound window fits its tabs to its surface if it shows.
+fn fit() {
+    #[cfg(debug_assertions)]
+    if let Some(held) = HELD_FITS.lock().unwrap().as_mut() {
+        *held += 1;
+        return;
+    }
+    wezterm_gui::android::fit_bound_window();
+}
+
+/// Debug builds: while `Some`, the observations of `defer_observation`
+/// wait, and the notifications that asked for them are listed.
+#[cfg(debug_assertions)]
+static HELD_OBSERVATIONS: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+/// `notification` is one of those `follow_mux` observes; they carry ids only.
+fn defer_observation(notification: &mux::MuxNotification) {
+    #[cfg(debug_assertions)]
+    if let Some(held) = HELD_OBSERVATIONS.lock().unwrap().as_mut() {
+        held.push(format!("{notification:?}"));
+        return;
+    }
+    let _ = notification;
+    promise::spawn::spawn_into_main_thread(async {
+        observe_input_target();
+    })
+    .detach();
+}
+
+/// Debug builds: while `Some`, inputs wait here in arrival order.
+#[cfg(debug_assertions)]
+static HELD_INPUT: Mutex<Option<Vec<Input>>> = Mutex::new(None);
+
+/// Debug builds: `input` when nothing is held, else keep it.
+#[cfg(debug_assertions)]
+fn hold_input(input: Input) -> Option<Input> {
+    match HELD_INPUT.lock().unwrap().as_mut() {
+        Some(held) => {
+            held.push(input);
+            None
+        }
+        None => Some(input),
+    }
+}
+
+fn apply_input(conn: &Connection, input: Input) {
+    let monitor = surface_monitor();
+    let target = observe_input_target();
+    if let Input::Commit {
+        erase: Some(erase), ..
+    } = &input
+        && erase.target != target
+    {
+        // The text to erase went to another pane, or this one before the
+        // laptop or the phone switched away from it: erasing here would
+        // destroy what the user did not type.  Kotlin forgets its record
+        // when it learns of the new target; nothing is replayed.
+        log::info!(
+            "IME edit refused: it erases in {:?}, input now reaches {target:?}",
+            erase.target
+        );
+        monitor.update(|s| s.input.refused += 1);
+        return;
+    }
+    let cell_height = Some(monitor.snapshot().cell_height as f32).filter(|h| *h > 0.0);
+    let tally: fn(&mut InputCounts) = match input {
+        Input::Preedit(_) => |c| c.preedits += 1,
+        Input::Commit { .. } => |c| c.commits += 1,
+        Input::Key { .. } => |c| c.keys += 1,
+        Input::Paste(_) => |c| c.pastes += 1,
+        Input::Touch { .. } => |c| c.touches += 1,
+    };
+    let delivered = conn.dispatch_input(crate::input::window_events(input, cell_height));
+    monitor.update(|s| {
+        if delivered {
+            tally(&mut s.input)
+        } else {
+            s.input.dropped += 1
+        }
+    });
 }
 
 fn wake() {
@@ -172,6 +333,8 @@ fn run_gui(request: StartRequest) -> Result<(), EngineEnd> {
     };
     wezterm_gui::android::run(options, || {
         let thread = format!("{:?}", std::thread::current().id());
+        follow_mux();
+        window::os::android::on_rebind(rebound);
         let queued = ENGINE.publish_running(thread);
         log::info!("GUI engine running; {queued:?} platform event(s) were queued");
         wake();
@@ -291,6 +454,18 @@ pub fn clipboard_text(request: i64, text: Option<String>) -> Result<(), NotAccep
     })
 }
 
+/// Hand `input` to the GUI thread for the bound window.  False when the
+/// engine does not run: the input is dropped, never kept for later.
+pub fn input(input: Input) -> bool {
+    match post(PlatformEvent::Input(input)) {
+        Ok(()) => true,
+        Err(refused) => {
+            log::warn!("input dropped: {refused}");
+            false
+        }
+    }
+}
+
 /// Block until the GUI thread asks the platform for something; `None`
 /// once the engine ended.
 pub fn next_request() -> Option<PlatformRequest> {
@@ -313,6 +488,24 @@ pub enum DiagnosticCommand {
     PanicWithClipboardRead,
     /// Make the next `SurfaceLost` handler panic before it drops GPU state.
     PanicInSurfaceLost,
+    /// Hold the input-target observations mux notifications schedule.
+    HoldTargetObservations,
+    /// Run one observation for every held one and stop holding.
+    ReleaseTargetObservations,
+    /// Hold the bound window's fits.
+    HoldFits,
+    /// Run one fit for any held, on the GUI thread, and stop holding;
+    /// reports whether any was held.
+    ReleaseFits,
+    /// Keep platform input from the GUI thread, in arrival order.
+    HoldInput,
+    /// Apply all held input in one GUI-thread task, in arrival order, and
+    /// stop holding; reports whether any was held.
+    ReleaseInput,
+    /// Keep the bound window's active tab's pane tree and size.
+    SnapshotBoundTab,
+    /// Apply the kept pane tree to its tab as a resync applies the laptop's.
+    ApplyBoundTabSnapshot,
 }
 
 #[cfg(debug_assertions)]
@@ -325,6 +518,14 @@ impl DiagnosticCommand {
             "panic-on-queued-destroy" => Some(Self::PanicOnQueuedDestroy),
             "panic-with-clipboard-read" => Some(Self::PanicWithClipboardRead),
             "panic-in-surface-lost" => Some(Self::PanicInSurfaceLost),
+            "hold-target-observations" => Some(Self::HoldTargetObservations),
+            "release-target-observations" => Some(Self::ReleaseTargetObservations),
+            "hold-fits" => Some(Self::HoldFits),
+            "release-fits" => Some(Self::ReleaseFits),
+            "hold-input" => Some(Self::HoldInput),
+            "release-input" => Some(Self::ReleaseInput),
+            "snapshot-bound-tab" => Some(Self::SnapshotBoundTab),
+            "apply-bound-tab-snapshot" => Some(Self::ApplyBoundTabSnapshot),
             _ => None,
         }
     }
@@ -359,8 +560,78 @@ pub fn diagnostic(command: DiagnosticCommand) -> bool {
         }),
         DiagnosticCommand::PanicWithClipboardRead => return clipboard_read_fails_with_the_engine(),
         DiagnosticCommand::PanicInSurfaceLost => wezterm_gui::renderfault::arm_surface_lost_panic(),
+        DiagnosticCommand::HoldTargetObservations => {
+            HELD_OBSERVATIONS.lock().unwrap().get_or_insert_default();
+        }
+        DiagnosticCommand::ReleaseTargetObservations => {
+            if HELD_OBSERVATIONS
+                .lock()
+                .unwrap()
+                .take()
+                .is_some_and(|held| !held.is_empty())
+            {
+                on_gui_thread(|| {
+                    observe_input_target();
+                });
+            }
+        }
+        DiagnosticCommand::HoldFits => {
+            HELD_FITS.lock().unwrap().get_or_insert_default();
+        }
+        DiagnosticCommand::ReleaseFits => {
+            let held = HELD_FITS.lock().unwrap().take().unwrap_or(0);
+            if held == 0 {
+                return false;
+            }
+            // Returns once the fit is queued: a GUI-thread task queued
+            // after this call runs after the fit's decision.
+            let (tx, rx) = channel();
+            on_gui_thread(move || {
+                log::info!("releasing {held} held fit(s)");
+                wezterm_gui::android::fit_bound_window();
+                tx.send(()).ok();
+            });
+            return rx.recv_timeout(DIAGNOSTIC_WAIT).is_ok();
+        }
+        DiagnosticCommand::HoldInput => {
+            HELD_INPUT.lock().unwrap().get_or_insert_default();
+        }
+        DiagnosticCommand::ReleaseInput => {
+            // On the GUI thread: input a drain holds before this task is
+            // released with it, input drained after it follows it.
+            let (tx, rx) = channel();
+            on_gui_thread(move || {
+                let held = HELD_INPUT.lock().unwrap().take().unwrap_or_default();
+                log::info!("releasing {} held input(s)", held.len());
+                tx.send(!held.is_empty()).ok();
+                if let Some(conn) = Connection::get() {
+                    for input in held {
+                        apply_input(&conn, input);
+                    }
+                }
+            });
+            return rx.recv_timeout(DIAGNOSTIC_WAIT).unwrap_or(false);
+        }
+        DiagnosticCommand::SnapshotBoundTab => on_gui_thread(|| {
+            if let Err(err) = diagnostic::snapshot_bound_tab() {
+                log::error!("diagnostic tab snapshot: {err:#}");
+            }
+        }),
+        DiagnosticCommand::ApplyBoundTabSnapshot => on_gui_thread(|| {
+            if let Err(err) = diagnostic::apply_bound_tab_snapshot() {
+                log::error!("diagnostic tab snapshot: {err:#}");
+            }
+        }),
     }
     true
+}
+
+/// The notifications whose input-target observation is held, as JSON;
+/// `None` when nothing is held.
+#[cfg(debug_assertions)]
+pub fn diagnostic_held_observations() -> Option<String> {
+    let held = HELD_OBSERVATIONS.lock().unwrap().clone()?;
+    Some(serde_json::to_string(&held).expect("strings serialize"))
 }
 
 /// The mux census as JSON, taken on the GUI thread; `None` when no GUI
@@ -376,6 +647,24 @@ pub fn diagnostic_mux() -> Option<String> {
     });
     let census = rx.recv_timeout(DIAGNOSTIC_WAIT).ok()?;
     Some(serde_json::to_string(&census).expect("MuxCensus serializes"))
+}
+
+/// The bound window's active pane as JSON, taken on the GUI thread; `None`
+/// when no GUI thread answers or no window is bound.
+#[cfg(debug_assertions)]
+pub fn diagnostic_active_pane() -> Option<String> {
+    if !matches!(engine_state(), EngineState::Running { .. }) {
+        return None;
+    }
+    let (tx, rx) = channel();
+    on_gui_thread(move || {
+        let pane = crate::sshmux::active_pane()
+            .map_err(|err| log::info!("no active pane: {err:#}"))
+            .ok();
+        tx.send(pane).ok();
+    });
+    let pane = rx.recv_timeout(DIAGNOSTIC_WAIT).ok()??;
+    Some(serde_json::to_string(&pane).expect("ActivePane serializes"))
 }
 
 #[cfg(debug_assertions)]

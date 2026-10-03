@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+use crate::input::Input;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
@@ -34,6 +35,9 @@ pub enum PlatformEvent<L> {
         /// The clipboard's text.
         text: Option<String>,
     },
+    /// Keyboard, IME or touch input for the bound window.  Accepted only
+    /// while the engine runs: input never waits for an engine to start.
+    Input(Input),
 }
 
 /// Which bootstrap step failed.
@@ -176,16 +180,20 @@ impl<L> EngineGate<L> {
 
     /// Queue `event`.  While the engine runs, `wake` tells the GUI thread
     /// to call [`Self::next`]; while it starts, the event waits for
-    /// [`Self::publish_running`].
+    /// [`Self::publish_running`], except input, which is refused.
     pub fn post(&self, event: PlatformEvent<L>, wake: impl FnOnce()) -> Result<(), NotAccepting> {
         let mut phase = self.phase.lock().unwrap();
         match &mut *phase {
-            Phase::Starting { pending } => pending.push_back(event),
+            Phase::Starting { pending } if !matches!(event, PlatformEvent::Input(_)) => {
+                pending.push_back(event)
+            }
             Phase::Running { pending, .. } => {
                 pending.push_back(event);
                 wake();
             }
-            Phase::NotStarted | Phase::Ended { .. } => return Err(NotAccepting(phase.state())),
+            Phase::NotStarted | Phase::Starting { .. } | Phase::Ended { .. } => {
+                return Err(NotAccepting(phase.state()));
+            }
         }
         self.changed.notify_all();
         Ok(())
@@ -246,7 +254,8 @@ impl<L> EngineGate<L> {
                 PlatformEvent::Surface(SurfaceEvent::Destroyed { ack, .. }) => acks.push(ack),
                 PlatformEvent::Surface(SurfaceEvent::Changed { .. })
                 | PlatformEvent::SelectWindow(_)
-                | PlatformEvent::ClipboardText { .. } => {}
+                | PlatformEvent::ClipboardText { .. }
+                | PlatformEvent::Input(_) => {}
             }
         }
         if released {
@@ -367,6 +376,7 @@ mod tests {
             }
             PlatformEvent::SelectWindow(id) => format!("select:{id}"),
             PlatformEvent::ClipboardText { request, .. } => format!("clipboard:{request}"),
+            PlatformEvent::Input(input) => format!("input:{input:?}"),
         }
     }
 
@@ -624,6 +634,49 @@ mod tests {
         );
         gate.await_retired();
         assert_eq!(*log.lock().unwrap(), ["released:early", "released:late"]);
+    }
+
+    #[test]
+    fn input_is_applied_in_order_while_running_and_never_waits_for_an_engine() {
+        let gate = EngineGate::<&str>::new();
+        let typed = |text: &str| {
+            PlatformEvent::Input(Input::Commit {
+                erase: None,
+                text: text.into(),
+                meta: 0,
+            })
+        };
+        assert!(gate.post(typed("before start"), || {}).is_err());
+        gate.begin().unwrap();
+        gate.post(PlatformEvent::SelectWindow(1), || {}).unwrap();
+        let refused = gate.post(typed("while starting"), || {}).unwrap_err();
+        assert_eq!(refused.0, EngineState::Starting { queued: 1 });
+
+        gate.publish_running("gui".into()).unwrap();
+        let wakes = std::cell::Cell::new(0);
+        gate.post(typed("a"), || wakes.set(wakes.get() + 1))
+            .unwrap();
+        gate.post(PlatformEvent::Input(Input::Paste("p".into())), || {
+            wakes.set(wakes.get() + 1)
+        })
+        .unwrap();
+        assert_eq!(wakes.get(), 2, "each input wakes the GUI thread");
+        assert_eq!(
+            drain(&gate).iter().map(name).collect::<Vec<_>>(),
+            [
+                "select:1",
+                "input:Commit(<redacted>)",
+                "input:Paste(<redacted>)"
+            ]
+        );
+
+        gate.post(typed("lost with the engine"), || {}).unwrap();
+        gate.shut(EngineEnd::Stopped, || true);
+        assert!(
+            gate.next().is_none(),
+            "queued input is dropped, not replayed"
+        );
+        assert!(gate.post(typed("after the end"), || {}).is_err());
     }
 
     #[test]

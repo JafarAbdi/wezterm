@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 use super::native_window::NativeWindowLease;
+use super::requests::{platform_requests, PlatformRequest};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -55,6 +56,43 @@ pub struct SurfaceSnapshot {
     pub clipboard_responses: u64,
     /// Times the message loop woke from `poll()`.
     pub loop_wakeups: u64,
+    /// The cursor cell the bound window last painted, in surface pixels:
+    /// its origin and the cell size.  All zero before it painted.
+    pub cursor_x: i64,
+    pub cursor_y: i64,
+    pub cell_width: u32,
+    pub cell_height: u32,
+    /// Platform input dispatched to the bound window, by kind.
+    pub input: InputCounts,
+    /// The local pane id the bound window's keyboard input reaches; `None`
+    /// while it shows no pane.
+    pub input_pane: Option<usize>,
+    /// Changes of `input_pane`, and of the bound window that may have
+    /// moved it away and back, since process start.  An IME edit that
+    /// erases text it typed carries the generation it typed under; the GUI
+    /// thread refuses it under any other, also when an earlier pane is
+    /// the target again.
+    pub input_generation: u64,
+}
+
+/// Platform input the GUI thread applied, by kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct InputCounts {
+    /// Composing-text updates; these stay on the phone.
+    pub preedits: u64,
+    /// IME commits.
+    pub commits: u64,
+    /// Key presses.
+    pub keys: u64,
+    /// Paste requests.
+    pub pastes: u64,
+    /// Touch gestures.
+    pub touches: u64,
+    /// Input that arrived while no window was bound, and was dropped.
+    pub dropped: u64,
+    /// IME edits refused because they would erase text in a pane that is
+    /// no longer the one they typed into.
+    pub refused: u64,
 }
 
 impl Default for SurfaceSnapshot {
@@ -76,6 +114,13 @@ impl Default for SurfaceSnapshot {
             clipboard_requests: 0,
             clipboard_responses: 0,
             loop_wakeups: 0,
+            cursor_x: 0,
+            cursor_y: 0,
+            cell_width: 0,
+            cell_height: 0,
+            input: InputCounts::default(),
+            input_pane: None,
+            input_generation: 0,
         }
     }
 }
@@ -100,6 +145,37 @@ impl SurfaceMonitor {
         f(&mut snapshot);
         snapshot.revision += 1;
         self.changed.notify_all();
+    }
+
+    /// Record the bound window's cursor cell; an unchanged cell wakes nobody.
+    pub(super) fn set_text_cursor(&self, x: i64, y: i64, width: u32, height: u32) {
+        let cell = (x, y, width, height);
+        let unchanged = {
+            let s = self.snapshot.lock().unwrap();
+            (s.cursor_x, s.cursor_y, s.cell_width, s.cell_height) == cell
+        };
+        if !unchanged {
+            self.update(|s| (s.cursor_x, s.cursor_y, s.cell_width, s.cell_height) = cell);
+        }
+    }
+
+    /// Record the pane the bound window's input reaches now and return its
+    /// generation.  Another pane, or a change that may have moved the
+    /// input away and back (`moved`), starts a new generation, and the
+    /// platform is told.
+    pub fn observe_input_pane(&self, pane: Option<usize>, moved: bool) -> u64 {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        if snapshot.input_pane == pane && !moved {
+            return snapshot.input_generation;
+        }
+        snapshot.input_pane = pane;
+        snapshot.input_generation += 1;
+        snapshot.revision += 1;
+        let generation = snapshot.input_generation;
+        drop(snapshot);
+        self.changed.notify_all();
+        platform_requests().push(PlatformRequest::WindowsChanged);
+        generation
     }
 
     pub fn snapshot(&self) -> SurfaceSnapshot {

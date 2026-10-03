@@ -54,13 +54,16 @@ object PlatformRequests {
         }
     }
 
+    /** The clipboard's text; null while the app has no input focus (Android 10+) or the clip holds no text. */
+    fun clipboardText(context: Context): String? =
+        context.getSystemService(ClipboardManager::class.java).primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(context)?.toString()
+
     private fun handle(app: Context, request: JSONObject) {
         val clipboard = app.getSystemService(ClipboardManager::class.java)
         when (request.getString("type")) {
             "clipboard_get" -> {
                 val id = request.getLong("request")
-                // Null while the app has no input focus (Android 10+) or the clip holds no text.
-                val text = clipboard.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(app)?.toString()
+                val text = clipboardText(app)
                 try {
                     NativeApp.nativeClipboardText(id, text)
                 } catch (e: RuntimeException) {

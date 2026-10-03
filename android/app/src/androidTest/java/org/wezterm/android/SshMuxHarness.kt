@@ -154,16 +154,24 @@ class SshMuxHarness(private val scenario: ActivityScenario<TerminalActivity>) {
         check(arrived == text) { "typed text did not arrive intact: ${arrived.length} of ${text.length} characters, same length differs=${arrived.length == text.length}" }
     }
 
+    /** Whether the window's insets leave no room for a soft keyboard: stable insets leave the keyboard out. */
+    @Suppress("DEPRECATION")
+    fun keyboardHidden(activity: TerminalActivity): Boolean =
+        activity.window.decorView.rootWindowInsets?.let { it.systemWindowInsetBottom == it.stableInsetBottom } ?: false
+
     /**
-     * Close the soft keyboard. An injected Escape would do it while the
-     * keyboard is up, but API 24 turns an unhandled Escape into Back.
+     * Close the soft keyboard and wait for the layout without it. Until that
+     * layout, views keep their places above the keyboard however long the
+     * accessibility stream has been idle, so a tap placed earlier lands on
+     * whatever moves there. An injected Escape would close the keyboard
+     * too, but API 24 turns an unhandled Escape into Back.
      */
-    private fun hideKeyboard() {
+    fun hideKeyboard() {
         onActivity { activity ->
             activity.getSystemService(InputMethodManager::class.java)
                 .hideSoftInputFromWindow(activity.window.decorView.windowToken, 0)
         }
-        instrumentation.waitForIdleSync()
+        awaitUi("the layout without the soft keyboard") { activity -> true.takeIf { keyboardHidden(activity) } }
     }
 
     /** Fill the form with the fixture endpoint and `remoteWezterm`, then tap Connect. */

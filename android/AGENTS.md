@@ -16,8 +16,8 @@ terminal engine.
 |---|---|---|
 | `wezterm-gui` (lib) | `Mux`, `ClientDomain`, `TermWindow`, fonts, glyph cache, renderer | Android lifecycle |
 | `window::os::android` | `Connection`/`Window` contracts, the GUI-thread message loop, the logical windows and which one is bound, the surface slot state machine, native-window leases, the request queue to Kotlin | pane state |
-| `wezterm-android` (cdylib) | JNI exports, GUI thread lifecycle, the platform event mailbox (`EngineGate`), app-private path publication, initialization report, the validated `Profile`, the connection phase and its pending prompt (`Connections`), the private SSH directory (`SshStore`) | a second terminal model |
-| Kotlin (`android/app`) | Activities, `SurfaceView`, IME, dialogs, the window selector, document picker, clipboard, the profile form's text (`SharedPreferences`) | pane cache, window list copy, wire protocol, connection state, prompt ownership |
+| `wezterm-android` (cdylib) | JNI exports, GUI thread lifecycle, the platform event mailbox (`EngineGate`), the translation of phone input into window events (`input`), app-private path publication, initialization report, the validated `Profile`, the connection phase and its pending prompt (`Connections`), the private SSH directory (`SshStore`) | a second terminal model |
+| Kotlin (`android/app`) | Activities, `SurfaceView` (`TerminalView`), the IME connection and its composing text, gesture classification, the key row, dialogs, the window selector, document picker, clipboard, the profile form's text (`SharedPreferences`) | pane cache, window list copy, wire protocol, connection state, prompt ownership, committed text |
 
 Unsafe code lives in `wezterm-android/src/ffi.rs` (JNI exports and
 `ANativeWindow_fromSurface`) and in one documented block of
@@ -170,7 +170,161 @@ file, not a Keystore key. The manifest disables backup and excludes every
 domain from cloud backup and device transfer. Release builds log at info
 level; SSH and attach errors at that level name the endpoint address.
 Prompt answers and key bytes are never logged. Debug builds log at debug
-level, which includes pane titles and working directories from the laptop.
+level, which includes pane titles and working directories from the laptop,
+but not typed, composed, pasted or shaped text: `TermWindow` logs window
+events as `WindowEvent::without_text` on Android, the client logs a
+PDU's name where upstream logs the PDU and a laptop's clipboard copy
+(OSC 52) as its selection and byte count, and the logger caps
+`wezterm_font::shaper` at info. One shaper record still holds text, at
+error level and so in release builds too: when loading or sizing a
+fallback font fails, `harfbuzz.rs` logs the error with the cluster it
+was shaping. Running out of fallback fonts is not such a failure.
+`debug_key_events` (default false) is upstream's explicit opt-in and
+still logs keys at info.
+
+## Input
+
+`TerminalView` turns every act into one typed JNI call
+(`nativeInputPreedit`, `nativeInputCommit`, `nativeInputKey`,
+`nativeInputPaste`, `nativeInputTouch`); it posts a
+`PlatformEvent::Input` to the `EngineGate` and returns. The gate refuses
+input unless the engine runs, and the GUI thread delivers each input to
+the bound window or drops it (`input.dropped`), so input never waits for
+an engine, a surface or a connection and is never replayed. Without a
+shown laptop pane the view is not focusable and opens no IME connection.
+
+`wezterm_android::input::window_events` (pure, host-tested) maps an input
+to the window events the desktop backends send, and `TermWindow` handles
+them unchanged:
+
+- composing text is `AdviseDeadKeyStatus(Composing)`: drawn at the
+  cursor, never sent;
+- a commit is its `Erase` as Backspace key events, then one
+  `KeyEvent(Char)` per character, then `AdviseDeadKeyStatus(None)`; `\n`
+  becomes Enter. Not a
+  composed write:
+  the mux server writes key presses, pastes and mouse reports through its
+  terminal's writer thread (`term` `ThreadedWriter`) but `WriteToPane`
+  straight to the pty, so a write right after a key press (an IME
+  deleting, then committing) can reach the program first;
+- a key press maps the Android key code, its character and the meta
+  state; Ctrl and Alt armed on the key row apply to the next key or single
+  committed character;
+- a paste carries the clipboard text Kotlin read on the UI thread (the
+  same read that answers `clipboard_get`) and is `DroppedString`, whose
+  handler `send_paste`s to the active pane at once, so it stays in order
+  with the keys after it and the server applies bracketed paste. A key
+  the key table binds to `PasteFrom` takes the same path: `TerminalView`
+  asks `nativeIsPasteKey`, which looks the key up in the real `InputMap`
+  on the calling thread (Android loads no config file, so these are the
+  defaults: Ctrl+Shift+V, Super+V, Shift+Insert, the Paste key).
+  `TermWindow`'s `PasteFrom` would read through the request queue and be
+  overtaken by the keys after it;
+- a tap is a left click, a long press then drag is a left-button drag
+  (`TermWindow` selects and copies on release through `set_clipboard`),
+  and a drag scrolls one wheel step per cell height crossed. The cell size
+  is what the bound window reports to `set_text_cursor_position` while it
+  paints.
+
+Each IME connection is a `TerminalInputConnection`. It keeps `sent`,
+what the laptop holds before its cursor because this connection typed it,
+and its `Editable` is that text with the IME's edits applied, committed or
+composing, so `getTextBeforeCursor`, `getExtractedText` and
+`updateSelection` describe what the edits apply to. When the IME's
+outermost batch ends, the laptop is brought to `remoteText` (pure,
+JVM-tested): the `Editable`'s text when nothing composes; while something
+composes, only committed text before the composition that extends `sent`.
+Any other change, an erase above all, waits for the composition to end,
+because a composition may stand for sent text the IME re-marked
+(`setComposingRegion`), and the laptop keeps that text until the
+recomposition is committed. The laptop erases the sent characters after
+the first difference (one Backspace per grapheme cluster, as bash's
+readline, zsh and vim erase a letter with its combining marks) and types
+what follows; a difference inside a cluster erases it and retypes what
+remains. Ranges that would split a surrogate pair are refused. Only the
+newest connection edits. A key, a paste or a tap first commits and sends
+the unsent text and forgets `sent`, as does a commit with a control
+character or an armed modifier and a new input target; an edit of sent
+text not on the laptop yet goes with it. Losing window or view focus drops
+unsent text, so nothing composed before Back, Home or a dialog is typed
+later.
+
+The input target is the bound window's active pane (local id) and a
+generation that counts its changes. Every write of a tab's active pane
+is announced in the same call, with mux state locked: `PaneFocused(pane)`
+by a focus change, `TabResized(tab)` by a resync
+(`Tab::sync_with_pane_tree` sets the pane silently, then resizes), and
+`WindowInvalidated`, `TabAddedToWindow` or `WindowRemoved` by a tab
+change. The mux subscriber only records these as `TargetChange`s
+(`wezterm_gui::android`), in order, into one queue; every GUI-thread
+observation (after a window selection, before each input, and one
+deferred per notification) drains it and moves the generation when the
+active pane differs or any recorded change resolves to the bound window
+(or no longer resolves), so a laptop focus A to B to A, or a resize of
+the shown tab, also moves it. The target is published in the surface
+status (`input_pane`, `input_generation`) with `WindowsChanged`;
+`TerminalActivity` hands it to the view, which forgets `sent` on a new
+one. A commit that erases carries the target it typed under, and the GUI
+thread refuses the whole commit (`input.refused`) under any other: the
+laptop may switch panes, and edit them, while the view has not yet learnt
+it. Commits that only add text, and keys, go to the current pane.
+
+Focus: on Android `SetFocusedPane` goes out only for a focus this client
+chose (a tap on a pane, showing a window). The server announces every
+focus change to every client, twice when it changed something;
+`wezterm-client`'s `FocusAdvice` adopts an announced or resynced focus
+without advising it back, and remembers the announced pane in place of
+the advised one when it replaced that pane in the same window, so a later
+paint has nothing to send. The adoption is taken under
+`cfg!(target_os = "android")` at its two call sites; desktop clients keep
+upstream's echo, so their server-side focus record (`list-clients`, the
+CLI's default pane) still follows what they show. The GUI frontend's
+deferred reconciliation of a `PaneFocused` notification (shared code)
+runs only while that pane is still its tab's active pane. Without either,
+two focus changes before the server answered (two taps, or the laptop
+moving twice) alternate between the phone and the server without end.
+
+Hardware keys: a character comes from the key's layout; right Alt alone
+is AltGr when the layout gives the key a character with it, any other Alt
+is sent as Alt; a dead key's accent waits (shown as composing text) and
+combines with the next character through `KeyCharacterMap.getDeadChar`,
+or is sent before it. Escape is taken in `onKeyPreIme`, before a shown
+soft keyboard would use it to close itself. System keys (Back, volume)
+and lone modifiers stay with the platform. `Input`'s `Debug` shows no
+text, key or character.
+
+The surface is what `systemWindowInsets` leaves free (with
+`adjustResize` they include the soft keyboard; observed on API 24 and 35)
+above the key row; `stateHidden` keeps the keyboard closed until a tap.
+Every resize reaches the laptop pane through `TermWindow`'s resize. A
+resync can apply a pane tree the laptop sent before the phone's last
+resize (its `ListPanes` answer crossed the `Resize`), which resizes the
+tab and the laptop's panes back; `TermWindow` would not notice, since
+its surface did not change. So every `TabResized` makes
+`fit_bound_window` post `TermWindowNotif::Apply`, and so does every
+surface event after which the bound window shows, and every change of the
+bound window, a selection or the bound window's close
+(`window::os::android::on_rebind`), if it shows
+(`Connection::presents`: bound, with a present surface), because a
+window shown again at the size it had gets a `Resized` that
+`TermWindow::resize` ignores. The closure decides when it runs: a
+window that does not present (after Home, with the screen off) changes
+nothing, so the laptop's resizes stand until the phone shows the window
+again; one that presents calls `apply_dimensions` with its own
+dimensions if a tab's rows or columns differ from
+`current_cell_dimensions()`. Its own `TabResized` notifications are
+ignored (a tab clamped to its split minimum never loops); a fitted tab
+triggers nothing. While shown, a tab keeps the phone's size against any
+other client; two phones showing it at different sizes resize it back
+and forth without end.
+
+`nativeSurfaceStatus` adds `input` (applied preedits, commits, keys,
+pastes, touches, dropped, refused), the input target and the painted
+cursor cell (`cursor_x`,
+`cursor_y`, `cell_width`, `cell_height`). Debug builds add
+`nativeDiagnosticActivePane`: the bound window's active pane with its
+laptop id, size, cursor and viewport rows (plus up to two viewports of
+scrollback).
 
 ## Stage status
 
@@ -204,13 +358,28 @@ described above. Debug builds drive them through `nativeDiagnosticGui`
 (`open-window`, `paste`, `panic-on-queued-destroy`,
 `panic-with-clipboard-read`, `panic-in-surface-lost`).
 
-ANDROID-04 (this checkout): the connection described above. A normal
+ANDROID-04: the connection described above. A normal
 launch shows the connection screen. `nativeDiagnosticMux` (debug) lists
 every mux domain and every pane with its local and laptop ids. Verified
 only against the owned fixtures of `ci/android-sshmux-fixture.sh`, reached
 through the host's own Tailscale address over `lo`: no private Tailscale
 flow, no laptop other than the build host and no phone has been exercised.
-Input other than the debug paste is ANDROID-05.
+
+ANDROID-05: the input described above. Debug builds hold and release
+the deferred input-target observations (`nativeDiagnosticGui`
+`hold-target-observations`, `release-target-observations`,
+`nativeDiagnosticHeldObservations`) and replay a kept pane tree through
+`Tab::sync_with_pane_tree` (`snapshot-bound-tab`,
+`apply-bound-tab-snapshot`), and hold the bound window's fits (`hold-fits`;
+`release-fits` runs one on the GUI thread and returns once its closure is
+queued, false if none was held), and hold platform input (`hold-input`;
+`release-input` applies it in one GUI-thread task, in arrival order;
+surface events are not held, so held input must not itself change the
+surface, as a tap that opens the soft keyboard does).
+Verified only on emulators against
+the owned fixtures over `lo`, with input generated by instrumentation
+(including touches on the installed soft keyboard's keys); no phone,
+hardware keyboard or human typing has been exercised.
 
 ## Build policy
 
@@ -278,7 +447,7 @@ Gradle and the script.
   `EngineFailureTest` method in its own process: a GUI-thread panic with a
   destroy queued, a panic right after a clipboard read started, a bootstrap
   failure before a `Connection` exists, and a `SurfaceLost` handler panic
-  on a surface destroy and inside the shutdown) and `sshmux`
+  on a surface destroy and inside the shutdown), `sshmux`
   (`SshMuxStartTest` and `SshMuxTest`, one method per process: Connect
   before the engine runs, the bounded key read, the connection screen,
   addresses outside the tailnet, host trust rejected, accepted, persisted,
@@ -286,11 +455,41 @@ Gradle and the script.
   restarts, key import through the system picker including documents of
   exactly 1 MiB and one byte more, attach with pane ids compared to the
   laptop's, passphrase and password prompts, a missing server, a codec
-  mismatch, an empty server). `sshmux` needs
-  `ci/android-sshmux-fixture.sh up <address>` first: an owned sshd bound to
-  loopback or the host's own Tailscale address, owned mux servers with
-  `HOME` and `XDG_RUNTIME_DIR` inside `target/android-sshmux-fixture`, and
-  generated keys. `down` also stops the server a desktop client without
+  mismatch, an empty server) and `input` (`InputTest`, one process, its
+  methods in name order on one connection: a command typed through the
+  `InputConnection`, composition, deletion around surrogates and combining
+  marks, hardware keys and the key row, paste (the IME's, the key row's
+  and the hardware paste keys, each followed by Enter in the same UI
+  turn), touch selection and scrolling, keyboard insets and rotation
+  against `stty size`, vim with mouse clicks, switching windows
+  mid-composition, Back with a pending composition, per-commit latency with
+  the idle-redraw check, recomposition of sent text, a rewrite refused
+  after the laptop moved its focus to another pane, and after it moved
+  away and back with the observations held, and a stale pane tree after
+  rotation fitted back to the surface, and a laptop resize that stands
+  while the phone shows nothing and is fitted when it shows again, with
+  the fits held around Home, two pane taps in one GUI-thread task (input
+  held) sent once and not echoed, and the window shown after the laptop
+  closed the shown one fitted to the surface, and a laptop OSC 52 copy
+  reaching the phone's clipboard; first, the
+  installed soft keyboard typing a command through real touches on its keys,
+  found in its own accessibility tree). `sshmux`
+  and `input` need `ci/android-sshmux-fixture.sh up <address>` first: an
+  owned sshd bound to loopback or the host's own Tailscale address, owned
+  mux servers with `HOME` and `XDG_RUNTIME_DIR` inside
+  `target/android-sshmux-fixture`, and generated keys. Its `input` server
+  has a bash pane in window 0, in window 1 a capture pane that prints the
+  hex of every byte it receives (bracketed paste on, six bytes per line)
+  and appends it to `capture.hex`, and in window 2 two such captures
+  stacked (`capture-a.hex`, `capture-b.hex`): the top one runs
+  `wezterm cli activate-pane` for the bottom one once it has read `abc`,
+  the bottom one activates the top one and then itself once it has read
+  `aba`. The shell's `PATH` has `laptop-resize <rows> <cols>`: the
+  `sshmux_resize_pane` example, a laptop client that sends the server
+  the `Resize` a laptop GUI sends for the shell's own pane, then
+  `stty size` on a cleared row, and `laptop-cli`, the laptop's own
+  `wezterm cli` on that server. `input` types into those
+  panes, so run it against a fresh `up`. `down` also stops the server a desktop client without
   `--no-auto-start` starts for the missing-server account, found through
   its own pid file in the fixture's runtime directory. The runner copies
   the fixture endpoint and keys to the device for the suite and removes

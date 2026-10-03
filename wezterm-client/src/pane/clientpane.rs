@@ -155,6 +155,15 @@ impl ClientPane {
                 ..
             }) => match self.clipboard.lock().as_ref() {
                 Some(clip) => {
+                    #[cfg(target_os = "android")]
+                    log::debug!(
+                        "Pdu::SetClipboard pane={} remote={} {:?} bytes={:?}",
+                        self.local_pane_id,
+                        self.remote_pane_id,
+                        selection,
+                        clipboard.as_deref().map(str::len)
+                    );
+                    #[cfg(not(target_os = "android"))]
                     log::debug!(
                         "Pdu::SetClipboard pane={} remote={} {:?} {:?}",
                         self.local_pane_id,
@@ -165,6 +174,15 @@ impl ClientPane {
                     clip.set_contents(selection, clipboard)?;
                 }
                 None => {
+                    #[cfg(target_os = "android")]
+                    log::error!(
+                        "ClientPane: Ignoring SetClipboard request pane={} remote={} {:?} bytes={:?}",
+                        self.local_pane_id,
+                        self.remote_pane_id,
+                        selection,
+                        clipboard.as_deref().map(str::len)
+                    );
+                    #[cfg(not(target_os = "android"))]
                     log::error!("ClientPane: Ignoring SetClipboard request {:?}", clipboard);
                 }
             },
@@ -223,14 +241,26 @@ impl ClientPane {
                 // The latter case is the important one: it is desirable
                 // for the focus change to be reflected locally after it
                 // has been changed on the server, so we work to apply
-                // it here.
+                // it here.  On Android without advising the server of it
+                // again (see `FocusAdvice`).
                 log::trace!("advised of remote pane focus: {pane_id}");
 
                 let mux = Mux::get();
-                if let Err(err) = mux.focus_pane_and_containing_tab(self.local_pane_id) {
+                let adoption = cfg!(target_os = "android").then(|| {
+                    let window = mux
+                        .resolve_pane_id(self.local_pane_id)
+                        .map(|(_, window, _)| window);
+                    self.client.adopt_server_focus(window)
+                });
+                let applied = mux.focus_pane_and_containing_tab(self.local_pane_id);
+                drop(adoption);
+                if let Err(err) = applied {
                     log::error!("Error reconciling remote PaneFocused notification: {err:#}");
                 }
             }
+            #[cfg(target_os = "android")]
+            _ => bail!("unhandled unilateral pdu: {}", pdu.pdu_name()),
+            #[cfg(not(target_os = "android"))]
             _ => bail!("unhandled unilateral pdu: {:?}", pdu),
         };
         Ok(())
@@ -577,9 +607,13 @@ impl Pane for ClientPane {
     }
 
     fn advise_focus(&self) {
-        let mut focused_pane = self.client.focused_remote_pane_id.lock().unwrap();
-        if *focused_pane != Some(self.remote_pane_id) {
-            focused_pane.replace(self.remote_pane_id);
+        if self
+            .client
+            .focus
+            .lock()
+            .unwrap()
+            .advise(self.remote_pane_id)
+        {
             let client = Arc::clone(&self.client);
             let remote_pane_id = self.remote_pane_id;
             promise::spawn::spawn(async move {

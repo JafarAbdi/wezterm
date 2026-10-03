@@ -27,7 +27,8 @@ pub enum PlatformRequest {
     ClipboardSet {
         text: String,
     },
-    /// A logical window appeared, went away, was renamed or was bound.
+    /// A logical window appeared, went away, was renamed or was bound, or
+    /// the bound window's input target changed.
     WindowsChanged,
     /// The connection phase or its pending prompt changed.
     ConnectionChanged,

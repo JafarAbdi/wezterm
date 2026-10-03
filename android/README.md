@@ -4,10 +4,11 @@ Native Android client that attaches to a laptop's WezTerm multiplexer over
 SSH through your own Tailscale network. Everything you type runs on the
 laptop.
 
-Current state: the app attaches to the laptop's mux server and renders its
-existing windows and panes with WezTerm's own renderer. Typing into a pane
-is not implemented yet. The connection has been exercised only against
-test servers on the build machine, not over a real tailnet or on a phone.
+Current state: the app attaches to the laptop's mux server, renders its
+existing windows and panes with WezTerm's own renderer, and types into
+them. It has been exercised only on emulators against test servers on the
+build machine, not over a real tailnet, on a phone or with a hardware
+keyboard.
 
 ## Connect
 
@@ -42,7 +43,43 @@ Terminal windows live as long as the app process. Rotating, pressing Back
 or Home, or switching apps only detaches the screen; reopening the app
 shows the same window. When the laptop has more than one window, a
 "Window 1 of 2" label appears in the top corner; tap it to pick the window
-to show.
+to show. If the laptop closes the window the phone shows, the phone shows
+its first window.
+
+## Type
+
+Tap the terminal to open the keyboard. What you type goes to the shown
+laptop pane once the keyboard commits it; text still being composed
+(for example pinyin before you pick the characters, or a word the
+keyboard reopened for correction) is shown in the terminal but not sent.
+Backspace deletes on the laptop. If the laptop switches to another pane
+while you type, even if it switches back, or the pane is resized, a
+keyboard correction of text you already sent is dropped, never applied.
+
+The row above the keyboard has Esc, Ctrl and Alt (each applies to the
+next key you type), Tab, the arrow keys and Paste. A hardware keyboard
+works too, with its layout's AltGr characters and accent keys; its Esc
+goes to the laptop even while the on-screen keyboard is open, and
+Ctrl+Shift+V or Shift+Insert pastes.
+
+Tapping a pane focuses it on the laptop too. A focus change made on the
+laptop is only shown, not taken over: a `wezterm cli` command on the
+laptop without `--pane-id`, run outside a pane (no `WEZTERM_PANE`), may
+act on the pane you last tapped rather than the one the phone shows.
+Pass `--pane-id`.
+
+Drag to scroll. Long-press and drag to select; lifting the finger copies
+the selection to the clipboard. Programs that use the mouse, such as vim
+with `set mouse=a`, get taps and selections as mouse clicks instead.
+
+The terminal's size is the size of the laptop pane. Opening the keyboard
+or rotating the phone resizes that pane on the laptop, for every client
+attached to it, including the laptop's own window. While the phone shows
+a pane, the pane keeps the phone's size: if another client resizes it,
+the phone resizes it back. While the phone shows nothing (another app in
+front, the screen off), the laptop's resizes stay; the pane takes the
+phone's size again when the phone shows it. Two phones showing the same
+pane at different sizes keep resizing it back and forth.
 
 ## Build
 
@@ -69,12 +106,14 @@ make android-test SERIAL=<serial> SUITE=surface       # renders, retires and res
 make android-test SERIAL=<serial> SUITE=lifecycle     # rotation, Back, window selector, clipboard, engine failure
 ci/android-sshmux-fixture.sh up "$(tailscale ip -4)"  # test sshd and mux servers on this machine, generated keys only
 make android-test SERIAL=<serial> SUITE=sshmux        # connection screen, host trust, key import, attach, failures
+make android-test SERIAL=<serial> SUITE=input         # typing, keys, paste, selection, resize; needs a fresh `up`
 ci/android-sshmux-fixture.sh down
 ```
 
-The `sshmux` suite reaches the test servers through this machine's own
-Tailscale address, which the kernel delivers over loopback. It tests the
-app and the protocol; it does not show that traffic crosses a tailnet.
+The `sshmux` and `input` suites reach the test servers through this
+machine's own Tailscale address, which the kernel delivers over loopback.
+They test the app and the protocol; they do not show that traffic crosses
+a tailnet.
 
 The launcher entry "WezTerm" opens the connection screen and logs
 `WezTermSurface` lines; `org.wezterm.android/.DiagnosticActivity` still shows

@@ -24,10 +24,19 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use wezterm_font::FontConfiguration;
 
 static DISPLAY_DPI: AtomicUsize = AtomicUsize::new(0);
+
+static ON_REBIND: OnceLock<fn()> = OnceLock::new();
+
+/// Run `hook` on the GUI thread each time another window, or none, became
+/// the bound one (a selection, or the bound window's close), once the new
+/// one was offered the surface.  The first call sets it.
+pub fn on_rebind(hook: fn()) {
+    let _ = ON_REBIND.set(hook);
+}
 
 /// Publish the density of the display that hosts terminals.  Must precede
 /// `Connection::init`; it becomes `default_dpi()`.
@@ -158,6 +167,9 @@ impl Connection {
         if let Some(id) = id {
             self.present_current_surface(id);
         }
+        if let Some(hook) = ON_REBIND.get() {
+            hook();
+        }
     }
 
     pub(super) fn window_by_id(&self, id: usize) -> Option<Rc<RefCell<WindowInner>>> {
@@ -227,8 +239,26 @@ impl Connection {
         self.bound.get().map(Window::new)
     }
 
+    /// Whether `window` is what the surface shows: it is bound and the
+    /// slot holds a sized surface.
+    pub fn presents(&self, window: Window) -> bool {
+        self.bound_window() == Some(window) && self.surface.borrow().is_present()
+    }
+
     fn bound_inner(&self) -> Option<Rc<RefCell<WindowInner>>> {
         self.bound.get().and_then(|id| self.window_by_id(id))
+    }
+
+    /// Deliver platform input to the bound window, in order.  False when no
+    /// window is bound: the input is dropped, never kept for later.
+    pub fn dispatch_input(&self, events: Vec<WindowEvent>) -> bool {
+        let Some(inner) = self.bound_inner() else {
+            return false;
+        };
+        for event in events {
+            inner.borrow_mut().events.dispatch(event);
+        }
+        true
     }
 
     fn dispatch_bound(&self, event: WindowEvent) {
