@@ -14,14 +14,17 @@ import android.widget.ScrollView
 import android.widget.TextView
 
 /**
- * The connection screen: the profile form, the attach progress, the
- * failure or empty state, and the dialog for the prompt the native
+ * The connection screen: the profile form, the attach progress with its
+ * Cancel button, the failure, empty, cancelled and disconnected states
+ * with Connect or Reconnect, and the dialog for the prompt the native
  * connection waits on.
  *
  * It renders [NativeApp.connectionStatus] and holds no connection state of
  * its own. A prompt belongs to the native side until it is answered with
  * its attempt and prompt ids; dismissing the dialog because the Activity
  * stops answers nothing, and the next [render] shows the prompt again.
+ * Cancel, Disconnect and Reconnect act on the attempt the last [render]
+ * showed; the native side refuses them for any other.
  */
 class ConnectionPanel(private val activity: Activity, private val pickIdentity: () -> Unit) {
     internal val host = field(R.string.connect_host, InputType.TYPE_TEXT_VARIATION_URI or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
@@ -43,7 +46,18 @@ class ConnectionPanel(private val activity: Activity, private val pickIdentity: 
         setText(R.string.connect_button)
         setOnClickListener { connect() }
     }
+    internal val cancel = Button(activity).apply {
+        setText(R.string.connect_cancel)
+        setOnClickListener { NativeApp.nativeCancelConnect(shownAttempt) }
+    }
+    internal val disconnect = Button(activity).apply {
+        setText(R.string.connection_disconnect)
+        setOnClickListener { NativeApp.nativeDisconnect(shownAttempt) }
+    }
     internal val message = TextView(activity).apply { setTextIsSelectable(true) }
+
+    /** The attempt the last [render] showed. */
+    private var shownAttempt = 0L
     internal var promptDialog: AlertDialog? = null
     internal var promptInput: EditText? = null
 
@@ -66,6 +80,8 @@ class ConnectionPanel(private val activity: Activity, private val pickIdentity: 
             setPadding(48, 48, 48, 48)
             addView(TextView(activity).apply { setText(R.string.connect_title); textSize = 20f }, LinearLayout.LayoutParams(fill, wrap))
             addView(message, LinearLayout.LayoutParams(fill, wrap))
+            addView(cancel, LinearLayout.LayoutParams(fill, wrap))
+            addView(disconnect, LinearLayout.LayoutParams(fill, wrap))
             addView(form, LinearLayout.LayoutParams(fill, wrap))
         }
         view = ScrollView(activity).apply {
@@ -111,17 +127,26 @@ class ConnectionPanel(private val activity: Activity, private val pickIdentity: 
 
     /** Show `status`. `terminalVisible` hides the panel: a window is bound, or this is the diagnostic applet. */
     fun render(status: ConnectionStatus, terminalVisible: Boolean) {
+        shownAttempt = status.attempt
         val attachedWithWindows = status.phase == "attached" && status.windows > 0
         view.visibility = if (terminalVisible || attachedWithWindows) View.GONE else View.VISIBLE
-        val editable = status.phase == "idle" || status.phase == "failed" || status.phase == "disconnected"
+        val editable = status.phase in listOf("idle", "failed", "cancelled", "disconnected")
         form.visibility = if (editable) View.VISIBLE else View.GONE
-        connect.isEnabled = status.ready
+        cancel.visibility = if (status.phase == "attaching") View.VISIBLE else View.GONE
+        disconnect.visibility = if (status.phase == "attached") View.VISIBLE else View.GONE
+        connect.setText(if (status.phase == "disconnected") R.string.connect_reconnect else R.string.connect_button)
+        connect.isEnabled = status.ready && !status.closing
         identity.setText(if (status.identity) R.string.identity_present else R.string.identity_absent)
         message.text = when (status.phase) {
             "attaching" -> activity.getString(R.string.connection_attaching, status.progress)
+            "cancelling" -> activity.getString(R.string.connection_cancelling)
+            "cancelled" -> activity.getString(R.string.connection_cancelled)
             "attached" -> activity.getString(R.string.connection_empty)
-            "disconnected" -> activity.getString(R.string.connection_disconnected)
-            "failed" -> activity.getString(failureHeading(status.failureKind)) + "\n\n" + status.failureMessage
+            "disconnecting" -> activity.getString(R.string.connection_disconnecting)
+            "disconnected" -> activity.getString(
+                if (status.cause == "user") R.string.connection_disconnected else R.string.connection_lost,
+            )
+            "failing", "failed" -> activity.getString(failureHeading(status.failureKind)) + "\n\n" + status.failureMessage
             else -> ""
         }
         showPrompt(status)
@@ -154,6 +179,7 @@ class ConnectionPanel(private val activity: Activity, private val pickIdentity: 
                 .setPositiveButton(R.string.prompt_trust) { _, _ -> NativeApp.nativeAnswerHostTrust(attempt, prompt.id, true) }
                 .setNegativeButton(R.string.prompt_reject) { _, _ -> NativeApp.nativeAnswerHostTrust(attempt, prompt.id, false) }
                 .setOnCancelListener { NativeApp.nativeAnswerHostTrust(attempt, prompt.id, false) }
+                .setNeutralButton(R.string.prompt_stop) { _, _ -> NativeApp.nativeCancelConnect(attempt) }
             is ConnectionPrompt.Secret -> textPrompt(builder, attempt, prompt.id, prompt.text, secret = true)
             is ConnectionPrompt.Text -> textPrompt(builder, attempt, prompt.id, prompt.text, secret = false)
         }
@@ -177,11 +203,19 @@ class ConnectionPanel(private val activity: Activity, private val pickIdentity: 
                 input.text.clear()
             }
             .setNegativeButton(R.string.prompt_cancel) { _, _ -> NativeApp.nativeAnswerText(attempt, id, null) }
+            .setNeutralButton(R.string.prompt_stop) { _, _ ->
+                input.text.clear()
+                NativeApp.nativeCancelConnect(attempt)
+            }
             .setOnCancelListener { NativeApp.nativeAnswerText(attempt, id, null) }
     }
 
-    /** Take the dialog down without answering; the prompt stays pending on the native side. */
+    /**
+     * Take the dialog down without answering and wipe what was typed into
+     * it; the prompt stays pending on the native side.
+     */
     fun dismissPrompt() {
+        promptInput?.text?.clear()
         promptDialog?.dismiss()
         promptDialog = null
         promptInput = null

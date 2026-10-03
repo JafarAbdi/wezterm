@@ -8,7 +8,7 @@
 #   ci/android.sh inspect               gate the built artifacts (ELF, symbols, alignment, APK, signature); nonzero on any failure
 #   ci/android.sh inspect-selftest      prove the gate rejects missing and malformed artifacts using fixture copies
 #   ci/android.sh install <serial>      install the APK matching the device ABI
-#   ci/android.sh test <serial> <suite> check the Rust crates for the device ABI, rebuild, and run serial-only instrumentation for <suite> (native-load, surface, lifecycle, sshmux, input; sshmux and input need ci/android-sshmux-fixture.sh up)
+#   ci/android.sh test <serial> <suite> check the Rust crates for the device ABI, rebuild, and run serial-only instrumentation for <suite> (native-load, surface, lifecycle, sshmux, input, reconnect; sshmux, input and reconnect need ci/android-sshmux-fixture.sh up)
 #
 # Machine-specific SDK/NDK locations come from the environment or from the
 # untracked ci/android.local.env written by `provision`.
@@ -43,6 +43,9 @@ REQUIRED_JNI_EXPORTS=(
   Java_org_wezterm_android_NativeApp_nativeAwaitConnectionChange
   Java_org_wezterm_android_NativeApp_nativeAnswerHostTrust
   Java_org_wezterm_android_NativeApp_nativeAnswerText
+  Java_org_wezterm_android_NativeApp_nativeCancelConnect
+  Java_org_wezterm_android_NativeApp_nativeDisconnect
+  Java_org_wezterm_android_NativeApp_nativeDiagnosticConnection
   Java_org_wezterm_android_NativeApp_nativeImportIdentity
   Java_org_wezterm_android_NativeApp_nativeDiagnosticMux
   Java_org_wezterm_android_NativeApp_nativeInputPreedit
@@ -54,7 +57,7 @@ REQUIRED_JNI_EXPORTS=(
   Java_org_wezterm_android_NativeApp_nativeDiagnosticActivePane
   Java_org_wezterm_android_NativeApp_nativeDiagnosticHeldObservations
 )
-# The sshmux and input suites talk to the owned fixture of ci/android-sshmux-fixture.sh.
+# The sshmux, input and reconnect suites talk to the owned fixture of ci/android-sshmux-fixture.sh.
 SSHMUX_FIXTURE=${WEZTERM_SSHMUX_FIXTURE_DIR:-target/android-sshmux-fixture}
 SSHMUX_DEVICE_DIR=/data/local/tmp/wezterm-sshmux
 SSHMUX_PICKER_DIR=/sdcard/Download/wezterm-fixture
@@ -404,7 +407,7 @@ cmd_test() (
   trap 'exit 130' INT
   trap 'exit 143' HUP TERM
   local fixture_suite=0
-  case "$suite" in sshmux|input) fixture_suite=1 ;; esac
+  case "$suite" in sshmux|input|reconnect) fixture_suite=1 ;; esac
   if [ "$fixture_suite" = 1 ]; then
     [ -f "$SSHMUX_FIXTURE/device/fixture.properties" ] || die "the $suite suite needs the owned fixture: ci/android-sshmux-fixture.sh up <address>"
   fi

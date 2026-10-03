@@ -755,6 +755,22 @@ impl Mux {
             .insert(domain.domain_name().to_string(), Arc::clone(domain));
     }
 
+    /// Unregister domain `id`.  Its by-name entry and the default domain
+    /// are cleared only while they are that same domain.
+    pub fn remove_domain(&self, id: DomainId) -> Option<Arc<dyn Domain>> {
+        let domain = self.domains.write().remove(&id)?;
+        let name = domain.domain_name();
+        let mut by_name = self.domains_by_name.write();
+        if by_name.get(name).is_some_and(|d| d.domain_id() == id) {
+            by_name.remove(name);
+        }
+        let mut default = self.default_domain.write();
+        if default.as_ref().is_some_and(|d| d.domain_id() == id) {
+            *default = None;
+        }
+        Some(domain)
+    }
+
     pub fn set_mux(mux: &Arc<Mux>) {
         MUX.lock().replace(Arc::clone(mux));
     }
@@ -1472,5 +1488,103 @@ impl wezterm_term::DownloadHandler for MuxDownloader {
                 data: Arc::new(data),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod remove_domain_tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    struct Named {
+        id: DomainId,
+        name: &'static str,
+    }
+
+    #[async_trait(?Send)]
+    impl Domain for Named {
+        async fn spawn_pane(
+            &self,
+            _size: TerminalSize,
+            _command: Option<CommandBuilder>,
+            _command_dir: Option<String>,
+        ) -> anyhow::Result<Arc<dyn Pane>> {
+            anyhow::bail!("spawns nothing")
+        }
+
+        fn detachable(&self) -> bool {
+            false
+        }
+
+        fn domain_id(&self) -> DomainId {
+            self.id
+        }
+
+        fn domain_name(&self) -> &str {
+            self.name
+        }
+
+        async fn attach(&self, _window_id: Option<WindowId>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn detach(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn state(&self) -> DomainState {
+            DomainState::Detached
+        }
+    }
+
+    fn named(name: &'static str) -> Arc<dyn Domain> {
+        Arc::new(Named {
+            id: domain::alloc_domain_id(),
+            name,
+        })
+    }
+
+    fn names(mux: &Mux) -> Vec<String> {
+        let mut names: Vec<String> = mux
+            .iter_domains()
+            .iter()
+            .map(|d| d.domain_name().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn removing_a_domain_clears_its_entries_and_only_its_own() {
+        let mux = Mux::new(None);
+        let first = named("laptop-1");
+        let other = named("other");
+        mux.add_domain(&first);
+        mux.add_domain(&other);
+        assert_eq!(mux.default_domain().domain_id(), first.domain_id());
+
+        let removed = mux.remove_domain(first.domain_id()).map(|d| d.domain_id());
+        assert_eq!(removed, Some(first.domain_id()));
+        assert_eq!(names(&mux), vec!["other".to_string()]);
+        assert!(mux.get_domain_by_name("laptop-1").is_none());
+        assert!(
+            mux.default_domain.read().is_none(),
+            "the default was that domain"
+        );
+        assert!(mux.remove_domain(first.domain_id()).is_none());
+        assert_eq!(Arc::strong_count(&first), 1, "the mux holds it no more");
+
+        let older = named("laptop-2");
+        let newer = named("laptop-2");
+        mux.add_domain(&older);
+        mux.add_domain(&newer);
+        mux.set_default_domain(&other);
+        assert!(mux.remove_domain(older.domain_id()).is_some());
+        assert_eq!(
+            mux.get_domain_by_name("laptop-2").map(|d| d.domain_id()),
+            Some(newer.domain_id()),
+            "a same-named newer domain keeps its name"
+        );
+        assert_eq!(mux.default_domain().domain_id(), other.domain_id());
     }
 }

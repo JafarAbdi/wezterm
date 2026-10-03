@@ -1,4 +1,5 @@
 use crate::auth::*;
+use crate::cancel::Cancel;
 use crate::config::{ConfigMap, ResolvedSshRoute};
 use crate::host::*;
 use crate::pty::*;
@@ -106,6 +107,24 @@ impl Session {
     pub fn connect_route(
         route: ResolvedSshRoute,
     ) -> anyhow::Result<(Self, Receiver<SessionEvent>)> {
+        Self::start(route, None)
+    }
+
+    /// [`Session::connect_route`] for an attempt that `cancel` can cancel:
+    /// the session thread counts as its worker, registers every TCP socket
+    /// it dials and fails as soon as the transport is shut down.  A
+    /// ProxyCommand transport is not registered.
+    pub fn connect_cancellable(
+        route: ResolvedSshRoute,
+        cancel: &Cancel,
+    ) -> anyhow::Result<(Self, Receiver<SessionEvent>)> {
+        Self::start(route, Some(cancel.clone()))
+    }
+
+    fn start(
+        route: ResolvedSshRoute,
+        cancel: Option<Cancel>,
+    ) -> anyhow::Result<(Self, Receiver<SessionEvent>)> {
         let config = route.target().clone();
         let (tx_event, rx_event) = bounded(8);
         let (tx_req, rx_req) = bounded(8);
@@ -144,6 +163,9 @@ impl Session {
             shown_accept_env_error: false,
             last_keep_alive: now,
             keep_alive,
+            registrations: vec![],
+            _worker: cancel.as_ref().map(Cancel::worker),
+            cancel,
         };
         std::thread::spawn(move || inner.run());
         Ok((Self { tx: session_sender }, rx_event))

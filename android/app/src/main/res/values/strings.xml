@@ -21,7 +21,16 @@
 
     <string name="connection_attaching">Connecting… %1$s</string>
     <string name="connection_empty">Connected. The laptop\'s mux server has no sessions. Nothing was started.</string>
-    <string name="connection_disconnected">Disconnected from the laptop.</string>
+    <string name="connection_cancelling">Cancelling…</string>
+    <string name="connection_cancelled">Connection cancelled. Nothing was attached.</string>
+    <string name="connection_disconnecting">Disconnecting… The laptop\'s sessions keep running.</string>
+    <string name="connection_disconnected">Disconnected. The laptop\'s sessions keep running; Reconnect shows them again.</string>
+    <string name="connection_lost">The connection to the laptop was lost. Its sessions keep running on the laptop; Reconnect shows them again. Nothing typed while disconnected is sent.</string>
+    <string name="connect_cancel">Cancel</string>
+    <string name="connect_reconnect">Reconnect</string>
+    <string name="connection_disconnect">Disconnect</string>
+    <string name="disconnect_title">Disconnect from the laptop?</string>
+    <string name="disconnect_message">The laptop\'s sessions keep running. Reconnect shows them again.</string>
     <string name="connection_busy">A connection is already in progress.</string>
 
     <string name="failure_unreachable">Could not reach the laptop over SSH.</string>
@@ -41,6 +50,7 @@
     <string name="prompt_secret_title">SSH authentication</string>
     <string name="prompt_ok">OK</string>
     <string name="prompt_cancel">Cancel</string>
+    <string name="prompt_stop">Stop connecting</string>
 
     <string name="key_escape">Esc</string>
     <string name="key_escape_description">Escape</string>
@@ -60,4 +70,6 @@
     <string name="key_right_description">Right arrow</string>
     <string name="key_paste">Paste</string>
     <string name="key_paste_description">Paste the clipboard</string>
+    <string name="key_connection">…</string>
+    <string name="key_connection_description">Connection: disconnect from the laptop</string>
 </resources>

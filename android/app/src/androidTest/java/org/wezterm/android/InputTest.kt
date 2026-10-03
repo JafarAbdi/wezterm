@@ -240,6 +240,22 @@ class InputTest {
         return NativeApp.surfaceStatus()
     }
 
+    /**
+     * The bound pane and the settled status whose cursor cell its window
+     * painted from that pane: the pane is read after [settle] and kept only
+     * when no frame followed the read. A pane read earlier may predate
+     * output the settled frame already shows, such as a shell's prompt.
+     */
+    private fun settledPane(): Pair<Pane, SurfaceStatus> {
+        while (true) {
+            val status = settle()
+            val pane = checkNotNull(activePane()) { "the bound window shows no pane" }
+            if (!NativeApp.nativeAwaitSurfaceFrames(status.generation, status.framesPresented + 1, SETTLE_WINDOW_MS)) {
+                return pane to status
+            }
+        }
+    }
+
     private fun receipt(phase: String, note: String = "") {
         val status = NativeApp.surfaceStatus()
         Log.i(TAG, "receipt phase=$phase children=${childProcesses().size} input=${status.input} surface=${status.width}x${status.height} cell=${status.cellWidth}x${status.cellHeight} $note")
@@ -375,11 +391,12 @@ class InputTest {
 
     private fun touchesDelivered(since: Long) = awaitStatus("touch delivered") { it.input.touches > since }
 
-    /** Centre of viewport cell `row`, `col` of the bound pane, from the cursor cell its settled window painted. */
+    /** Centre of viewport cell `row`, `col` of the bound `pane`, from the cursor cell its settled window painted. */
     private fun cellCentre(pane: Pane, row: Int, col: Int): Pair<Float, Float> {
-        val s = settle()
-        val left = s.cursorX - pane.cursorCol * s.cellWidth
-        val top = s.cursorY - pane.cursorRow * s.cellHeight
+        val (shown, s) = settledPane()
+        assertEquals("the bound pane", pane.remote, shown.remote)
+        val left = s.cursorX - shown.cursorCol * s.cellWidth
+        val top = s.cursorY - shown.cursorRow * s.cellHeight
         return (left + (col + 0.5f) * s.cellWidth) to (top + (row + 0.5f) * s.cellHeight)
     }
 
@@ -773,10 +790,16 @@ class InputTest {
         x >= 0 && x < 2 * s.cellWidth && y >= 0 && y < 2 * s.cellHeight
     }
 
+    /** `pane`, which the bound window shows, uses its surface: geometry from the settled frame and the pane it painted. */
     private fun assertGeometry(state: String, pane: Pane) {
-        val s = settle()
-        val (unusedX, unusedY) = unused(pane, s)
-        Log.i(TAG, "receipt geometry state=$state surface=${s.width}x${s.height} cell=${s.cellWidth}x${s.cellHeight} cells=${pane.cols}x${pane.rows} unused=${unusedX}x$unusedY")
+        val (shown, s) = settledPane()
+        assertEquals("$state: the bound pane and its cells", "${pane.remote} ${pane.cols}x${pane.rows}", "${shown.remote} ${shown.cols}x${shown.rows}")
+        val (unusedX, unusedY) = unused(shown, s)
+        Log.i(
+            TAG,
+            "receipt geometry state=$state surface=${s.width}x${s.height} cell=${s.cellWidth}x${s.cellHeight} cells=${shown.cols}x${shown.rows} " +
+                "cursor=${shown.cursorCol},${shown.cursorRow} given_cursor=${pane.cursorCol},${pane.cursorRow} painted=${s.cursorX},${s.cursorY} unused=${unusedX}x$unusedY",
+        )
         assertTrue("$state: columns fit and use the width ($unusedX px left)", unusedX >= 0 && unusedX < 2 * s.cellWidth)
         assertTrue("$state: rows fit and use the height ($unusedY px left)", unusedY >= 0 && unusedY < 2 * s.cellHeight)
     }

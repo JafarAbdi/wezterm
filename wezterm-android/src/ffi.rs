@@ -516,7 +516,7 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeAwaitRenderFailu
 /// profile and start attaching to the laptop mux.  Returns JSON:
 /// `{"status":"started","attempt":n}`,
 /// `{"status":"invalid_profile","field":…,"message":…}`, or
-/// `{"status":"busy"|"storage"|"starting","message":…}`.
+/// `{"status":"busy"|"unavailable"|"storage"|"starting","message":…}`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeConnect<'caller>(
     mut unowned_env: EnvUnowned<'caller>,
@@ -526,6 +526,7 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeConnect<'caller>
     user: JString<'caller>,
     remote_wezterm: JString<'caller>,
 ) -> JString<'caller> {
+    use crate::connection::Refused;
     use crate::sshmux::ConnectRefused;
     unowned_env
         .with_env(|env| -> jni::errors::Result<_> {
@@ -542,8 +543,11 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeConnect<'caller>
                     "field": err.field(),
                     "message": err.to_string(),
                 }),
-                Err(err @ ConnectRefused::Busy(_)) => {
+                Err(err @ ConnectRefused::Refused(Refused::Busy)) => {
                     serde_json::json!({"status": "busy", "message": err.to_string()})
+                }
+                Err(err @ ConnectRefused::Refused(Refused::Uncancellable(_))) => {
+                    serde_json::json!({"status": "unavailable", "message": err.to_string()})
                 }
                 Err(err @ ConnectRefused::Storage) => {
                     serde_json::json!({"status": "storage", "message": err.to_string()})
@@ -590,7 +594,43 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeAwaitConnectionC
         .resolve::<ThrowRuntimeExAndDefault>()
 }
 
-fn accepted(outcome: Result<(), crate::connection::AnswerRefused>, what: &str) -> jboolean {
+/// `NativeApp.nativeCancelConnect(attempt)`: cancel that attempt while it
+/// attaches; false when it is not attaching or already published its panes.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeCancelConnect<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    attempt: jlong,
+) -> jboolean {
+    unowned_env
+        .with_env(|_env| -> jni::errors::Result<jboolean> {
+            Ok(accepted(
+                sshmux::cancel(u64::try_from(attempt).unwrap_or(0)),
+                "cancel",
+            ))
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeDisconnect(attempt)`: disconnect that attached attempt;
+/// false when it is not attached.  The laptop's panes keep running.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeDisconnect<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    attempt: jlong,
+) -> jboolean {
+    unowned_env
+        .with_env(|_env| -> jni::errors::Result<jboolean> {
+            Ok(accepted(
+                sshmux::disconnect(u64::try_from(attempt).unwrap_or(0)),
+                "disconnect",
+            ))
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+fn accepted(outcome: Result<(), impl std::fmt::Display>, what: &str) -> jboolean {
     match outcome {
         Ok(()) => JNI_TRUE,
         Err(err) => {
@@ -731,6 +771,36 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeDiagnosticMux<'c
                 Some(census) => JString::from_str(env, census),
                 None => Ok(JString::null()),
             }
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeDiagnosticConnection(command)`: debug-only.
+/// `interrupt-transport` shuts the latest attempt's transport down as a
+/// failing network would and returns `true`, or `false` when its threads
+/// already ended; `hold-next-input` arms [`sshmux::hold_next_input`] and
+/// returns `true`; `census` returns JSON [`sshmux::ProcessCensus`].  Null
+/// for an unknown command.  Runs on the calling thread.
+#[cfg(debug_assertions)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeDiagnosticConnection<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    command: JString<'caller>,
+) -> JString<'caller> {
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<_> {
+            let reply = match command.to_string().as_str() {
+                "interrupt-transport" => sshmux::interrupt_transport().to_string(),
+                "hold-next-input" => {
+                    sshmux::hold_next_input();
+                    "true".to_string()
+                }
+                "census" => serde_json::to_string(&sshmux::process_census())
+                    .expect("ProcessCensus serializes"),
+                _ => return Ok(JString::null()),
+            };
+            JString::from_str(env, reply)
         })
         .resolve::<ThrowRuntimeExAndDefault>()
 }

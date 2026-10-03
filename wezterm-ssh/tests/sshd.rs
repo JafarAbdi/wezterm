@@ -306,8 +306,17 @@ impl Sshd {
 
         let sshd_log_file = tmp.child("sshd.log");
 
+        // Tests run in parallel: two fixtures that allocated the same port
+        // would both pass the readiness check against one sshd.  Spawn one
+        // at a time, so a port is taken by its sshd before the next is
+        // allocated.
+        static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let spawning = SPAWN
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (child, port) = Self::try_spawn_next(sshd_config_file.path(), sshd_log_file.path())
             .expect("No open port available for sshd");
+        drop(spawning);
 
         Ok(Self {
             child,

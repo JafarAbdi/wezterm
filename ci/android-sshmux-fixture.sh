@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Owned laptop-side fixtures for `ci/android.sh test <serial> sshmux` and `... input`.
+# Owned laptop-side fixtures for `ci/android.sh test <serial> sshmux`, `... input` and `... reconnect`.
 #
 #   ci/android-sshmux-fixture.sh up <address>   start an owned sshd and owned mux servers; <address> is 127.0.0.1 or this host's own Tailscale address
 #   ci/android-sshmux-fixture.sh census <name>  write the pane lists of the owned mux servers to $FIXTURE/census-<name>.json
@@ -20,6 +20,7 @@ WEZTERM=$ROOT/target/debug/wezterm
 MUX_SERVER=$ROOT/target/debug/wezterm-mux-server
 MISMATCH=$ROOT/target/debug/examples/sshmux_codec_mismatch
 RESIZE=$ROOT/target/debug/examples/sshmux_resize_pane
+STALL=$ROOT/target/debug/examples/sshmux_stall
 PANE_TEXT=("FIXTURE PANE ALPHA" "FIXTURE PANE BRAVO" "FIXTURE PANE CHARLIE")
 
 die() { echo "android-sshmux-fixture.sh: $*" >&2; exit 1; }
@@ -71,11 +72,11 @@ cmd_up() {
   route=$(own_address "$address") || true
   [ -n "$route" ] || die "'$address' is neither 127.0.0.1 nor this host's own Tailscale address; the fixture binds nothing else"
   local pidfile
-  for pidfile in sshd.pid populated.pid empty.pid input.pid run/wezterm/pid; do
+  for pidfile in sshd.pid populated.pid empty.pid input.pid reconnect.pid lastpane.pid stall.pid run/wezterm/pid; do
     [ ! -e "$FIXTURE/$pidfile" ] || die "$FIXTURE/$pidfile exists; run down first"
   done
-  for bin in "$WEZTERM" "$MUX_SERVER" "$MISMATCH" "$RESIZE"; do
-    [ -x "$bin" ] || die "missing $bin; run: cargo build --locked -p wezterm -p wezterm-mux-server && cargo build --locked -p wezterm-android --example sshmux_codec_mismatch --example sshmux_resize_pane"
+  for bin in "$WEZTERM" "$MUX_SERVER" "$MISMATCH" "$RESIZE" "$STALL"; do
+    [ -x "$bin" ] || die "missing $bin; run: cargo build --locked -p wezterm -p wezterm-mux-server && cargo build --locked -p wezterm-android --example sshmux_codec_mismatch --example sshmux_resize_pane --example sshmux_stall"
   done
   rm -rf "$FIXTURE"
   mkdir -p -m 700 "$FIXTURE" "$FIXTURE/home" "$FIXTURE/run" "$FIXTURE/bin" "$FIXTURE/device"
@@ -156,11 +157,23 @@ SCRIPT
   printf 'focus_from=%s\nfocus_to=%s\n' "$focus_from" "$focus_to" > "$FIXTURE/input-focus"
   cli input activate-pane --pane-id "$focus_from"
 
+  # The reconnect suite's laptop: one window whose capture pane outlives
+  # every phone connection, and a server whose only pane the phone has the
+  # laptop's own CLI close (lastpane-cli), the deliberate last-pane exit.
+  start_mux reconnect "{ '/bin/sh', '$FIXTURE/bin/capture', '$FIXTURE/capture-reconnect.hex' }"
+  printf '#!/bin/sh\nWEZTERM_UNIX_SOCKET=%q exec %q --skip-config cli --no-auto-start "$@"\n' "$FIXTURE/lastpane.sock" "$WEZTERM" > "$FIXTURE/bin/lastpane-cli"
+  chmod 700 "$FIXTURE/bin/lastpane-cli"
+  start_mux lastpane "{ '/usr/bin/env', 'LANG=C.UTF-8', 'PS1=$ ', 'PATH=/usr/bin:/bin:$FIXTURE/bin', 'HISTFILE=/dev/null', '/bin/bash', '--noprofile', '--norc', '-i' }"
+
   remote_wezterm wezterm-populated "WEZTERM_UNIX_SOCKET=$FIXTURE/populated.sock" "$WEZTERM" --skip-config '"$@"'
   remote_wezterm wezterm-input "WEZTERM_UNIX_SOCKET=$FIXTURE/input.sock" "$WEZTERM" --skip-config '"$@"'
   remote_wezterm wezterm-empty "WEZTERM_UNIX_SOCKET=$FIXTURE/empty.sock" "$WEZTERM" --skip-config '"$@"'
   remote_wezterm wezterm-missing "WEZTERM_UNIX_SOCKET=$FIXTURE/missing.sock" "$WEZTERM" --skip-config '"$@"'
   remote_wezterm wezterm-mismatch "$MISMATCH"
+  remote_wezterm wezterm-reconnect "WEZTERM_UNIX_SOCKET=$FIXTURE/reconnect.sock" "$WEZTERM" --skip-config '"$@"'
+  remote_wezterm wezterm-lastpane "WEZTERM_UNIX_SOCKET=$FIXTURE/lastpane.sock" "$WEZTERM" --skip-config '"$@"'
+  remote_wezterm wezterm-stall-version "$STALL" version "$FIXTURE/stall-version.log"
+  remote_wezterm wezterm-stall-list "$STALL" list "$FIXTURE/stall-list.log"
 
   local port=${WEZTERM_SSHMUX_FIXTURE_PORT:-22422}
   # Password login stays offered so the client shows its secret prompt, but
@@ -184,6 +197,13 @@ PermitUserEnvironment no
 SetEnv WEZTERM_UNIX_SOCKET=$FIXTURE/missing.sock
 LogLevel VERBOSE
 CONFIG
+  # A listener on the same address whose full accept queue holds every
+  # TCP connect to it in progress.
+  local stall_port=${WEZTERM_SSHMUX_FIXTURE_STALL_PORT:-22423}
+  setsid "$STALL" listen "$address" "$stall_port" > "$FIXTURE/stall.log" 2>&1 < /dev/null &
+  echo $! > "$FIXTURE/stall.pid"
+  await_ready "$(cat "$FIXTURE/stall.pid")" "stall listener" "$FIXTURE/stall.log" grep -q '^listening ' "$FIXTURE/stall.log"
+
   "$SSHD" -t -f "$FIXTURE/sshd_config"
   setsid "$SSHD" -D -e -f "$FIXTURE/sshd_config" > "$FIXTURE/sshd.log" 2>&1 < /dev/null &
   echo $! > "$FIXTURE/sshd.pid"
@@ -201,7 +221,10 @@ CONFIG
     echo "other_host_key=$(cut -d' ' -f1,2 "$FIXTURE/host_key_other.pub")"
     echo "other_type_host_key=$(cut -d' ' -f1,2 "$FIXTURE/host_key_other_type.pub")"
     echo "passphrase=$(cat "$FIXTURE/passphrase")"
-    for key in populated empty missing mismatch input; do echo "wezterm_$key=$FIXTURE/bin/wezterm-$key"; done
+    for key in populated empty missing mismatch input reconnect lastpane stall-version stall-list; do echo "wezterm_${key//-/_}=$FIXTURE/bin/wezterm-$key"; done
+    echo "stall_port=$stall_port"
+    echo "reconnect_panes=$(cli reconnect list --format json | tr -d '\n ')"
+    echo "lastpane_panes=$(cli lastpane list --format json | tr -d '\n ')"
     echo "populated_panes=$(cli populated list --format json | tr -d '\n ')"
     echo "input_panes=$(cli input list --format json | tr -d '\n ')"
     echo "input_focus_from=$focus_from"
@@ -230,7 +253,7 @@ cmd_census() {
   local name=${1:?name} server
   [ -e "$FIXTURE/sshd.pid" ] || die "no fixture is up in $FIXTURE"
   {
-    for server in populated empty missing input; do
+    for server in populated empty missing input reconnect lastpane; do
       if [ -S "$FIXTURE/$server.sock" ] && cli "$server" list --format json > "$FIXTURE/census.tmp" 2>/dev/null; then
         echo "{\"server\": \"$server\", \"listening\": true, \"panes\": $(cat "$FIXTURE/census.tmp")}"
       else
@@ -247,18 +270,19 @@ cmd_down() {
   # run/wezterm/pid: the server a client without --no-auto-start (the
   # desktop default) starts for the missing-server account; its pid file
   # lock admits one per fixture.
-  for pidfile in "$FIXTURE"/sshd.pid "$FIXTURE"/populated.pid "$FIXTURE"/empty.pid "$FIXTURE"/input.pid "$FIXTURE"/run/wezterm/pid; do
+  for pidfile in "$FIXTURE"/sshd.pid "$FIXTURE"/populated.pid "$FIXTURE"/empty.pid "$FIXTURE"/input.pid "$FIXTURE"/reconnect.pid "$FIXTURE"/lastpane.pid "$FIXTURE"/stall.pid "$FIXTURE"/run/wezterm/pid; do
     [ -f "$pidfile" ] || continue
     pid=$(cat "$pidfile")
     # Match the owned executable and its exact config, not just a path substring.
     local command
     command=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || command=
     case "$command" in
-      "$MUX_SERVER --config-file $FIXTURE/populated.lua "|"$MUX_SERVER --config-file $FIXTURE/empty.lua "|"$MUX_SERVER --config-file $FIXTURE/input.lua "|"$MUX_SERVER --pid-file-fd "*)
+      "$MUX_SERVER --config-file $FIXTURE/populated.lua "|"$MUX_SERVER --config-file $FIXTURE/empty.lua "|"$MUX_SERVER --config-file $FIXTURE/input.lua "|"$MUX_SERVER --config-file $FIXTURE/reconnect.lua "|"$MUX_SERVER --config-file $FIXTURE/lastpane.lua "|"$MUX_SERVER --pid-file-fd "*)
         if [ "$(tr '\0' '\n' < "/proc/$pid/environ" | grep -cxF -e "HOME=$FIXTURE/home" -e "XDG_RUNTIME_DIR=$FIXTURE/run")" = 2 ]; then
           kill "$pid"
         fi ;;
       "sshd: $SSHD -D -e -f $FIXTURE/sshd_config "*) kill "$pid" ;;
+      "$STALL listen "*) kill "$pid" ;;
     esac
     rm -f "$pidfile"
   done

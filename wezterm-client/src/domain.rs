@@ -1061,20 +1061,28 @@ impl ClientDomain {
             let ui = ui.clone();
             async move {
                 let mut cloned_ui = ui.clone();
-                let client = spawn_into_new_thread(move || match &config {
-                    ClientDomainConfig::Unix(unix) => {
-                        let initial = true;
-                        let no_auto_start = false;
-                        Client::new_unix_domain(
-                            Some(domain_id),
-                            unix,
-                            initial,
-                            &mut cloned_ui,
-                            no_auto_start,
-                        )
+                let worker = ui.worker();
+                let client = spawn_into_new_thread(move || {
+                    let _worker = worker;
+                    match &config {
+                        ClientDomainConfig::Unix(unix) => {
+                            let initial = true;
+                            let no_auto_start = false;
+                            Client::new_unix_domain(
+                                Some(domain_id),
+                                unix,
+                                initial,
+                                &mut cloned_ui,
+                                no_auto_start,
+                            )
+                        }
+                        ClientDomainConfig::Tls(tls) => {
+                            Client::new_tls(domain_id, tls, &mut cloned_ui)
+                        }
+                        ClientDomainConfig::Ssh(ssh) => {
+                            Client::new_ssh(domain_id, ssh, &mut cloned_ui)
+                        }
                     }
-                    ClientDomainConfig::Tls(tls) => Client::new_tls(domain_id, tls, &mut cloned_ui),
-                    ClientDomainConfig::Ssh(ssh) => Client::new_ssh(domain_id, ssh, &mut cloned_ui),
                 })
                 .await?;
 
@@ -1087,6 +1095,11 @@ impl ClientDomain {
                     "Server has {} tabs.  Attaching to local UI...\n",
                     panes.tabs.len()
                 ));
+                // The one point after which a cancel is refused: nothing
+                // of a cancelled attempt is ever published.
+                if ui.cancel().is_some_and(|cancel| !cancel.commit()) {
+                    return Err(wezterm_ssh::Cancelled.into());
+                }
                 ClientDomain::finish_attach(domain_id, client, panes, window_id)
             }
         })

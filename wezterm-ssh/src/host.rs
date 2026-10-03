@@ -67,6 +67,7 @@ impl crate::sessioninner::SessionInner {
                 if !trusted {
                     anyhow::bail!("user declined to trust host");
                 }
+                self.refuse_if_cancelled()?;
 
                 Ok(sess.update_known_hosts_file()?)
             }
@@ -187,6 +188,7 @@ impl crate::sessioninner::SessionInner {
                     if !trusted {
                         anyhow::bail!("user declined to trust host");
                     }
+                    self.refuse_if_cancelled()?;
 
                     let host_and_port = if port != 22 {
                         format!("[{}]:{}", remote_host_name, port)

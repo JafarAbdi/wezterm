@@ -16,7 +16,7 @@ terminal engine.
 |---|---|---|
 | `wezterm-gui` (lib) | `Mux`, `ClientDomain`, `TermWindow`, fonts, glyph cache, renderer | Android lifecycle |
 | `window::os::android` | `Connection`/`Window` contracts, the GUI-thread message loop, the logical windows and which one is bound, the surface slot state machine, native-window leases, the request queue to Kotlin | pane state |
-| `wezterm-android` (cdylib) | JNI exports, GUI thread lifecycle, the platform event mailbox (`EngineGate`), the translation of phone input into window events (`input`), app-private path publication, initialization report, the validated `Profile`, the connection phase and its pending prompt (`Connections`), the private SSH directory (`SshStore`) | a second terminal model |
+| `wezterm-android` (cdylib) | JNI exports, GUI thread lifecycle, the platform event mailbox (`EngineGate`), the translation of phone input into window events (`input`), app-private path publication, initialization report, the validated `Profile`, the connection phase, its pending prompt and its attempt's cancellation (`Connections`), the private SSH directory (`SshStore`) | a second terminal model |
 | Kotlin (`android/app`) | Activities, `SurfaceView` (`TerminalView`), the IME connection and its composing text, gesture classification, the key row, dialogs, the window selector, document picker, clipboard, the profile form's text (`SharedPreferences`) | pane cache, window list copy, wire protocol, connection state, prompt ownership, committed text |
 
 Unsafe code lives in `wezterm-android/src/ffi.rs` (JNI exports and
@@ -119,8 +119,8 @@ window, so the laptop's windows map to mux windows and an empty laptop mux
 creates nothing. No `LocalDomain`, server publisher, Lua startup hook or
 spawn-if-empty exists on this path. The proxy command is derived as
 `<quoted remote wezterm> cli --prefer-mux --no-auto-start proxy`; the user
-cannot enter one. Each attempt registers its own domain (`laptop-<attempt>`);
-a failed attempt leaves a detached, clientless domain behind.
+cannot enter one. Each attempt registers its own domain (`laptop-<attempt>`)
+and unregisters it when it closes (below).
 
 SSH options come only from the profile: `wezterm_ssh::Config`
 reads no configuration file on Android, `userknownhostsfile` and
@@ -137,8 +137,10 @@ check are the native libssh and `wezterm-client` code, unchanged.
 `mux::connui::ConnectionUI::with_consumer` hands the attach's UI requests to
 the thread `wezterm-connect-ui`. Progress text, `Input` (echo off is a
 secret) and the typed `HostTrust` request become state in
-`connection::Connections`: phase `idle`, `attaching`, `attached`, `failed`
-or `disconnected`, an attempt id and at most one prompt with a one-use id.
+`connection::Connections`: phase `idle`, `attaching` or `attached`, or for
+an ended attempt `cancelling`, `failing` or `disconnecting` while it is
+closing and then `cancelled`, `failed` or `disconnected`; an attempt id and
+at most one prompt with a one-use id.
 The prompt's promise moves into that state before Kotlin is told
 (`PlatformRequest::ConnectionChanged`). It leaves through one answer or
 cancellation carrying both ids, the end of its attempt, or the end of the
@@ -155,11 +157,67 @@ type than the one presented (libssh `KnownHosts::Other`) reaches it as
 `host_key_changed` without a prompt or a `known_hosts` write; the desktop
 text stays the libssh error.
 
-There is no transport cancel: an attempt without a pending prompt runs
-until SSH or the version check ends it. A lost connection becomes
-`disconnected` when the mux removes the domain's panes; a lost connection
-to an empty laptop mux is not noticed. Reconnect, cancellation of an
-in-flight transport and their convergence are ANDROID-06.
+Each attempt owns one `wezterm_ssh::Cancel`, which `Connections::begin`
+creates and keeps. It moves once, from active to committed or to
+cancelled, and counts the attempt's workers: the caller of `begin` until
+it hands off, the `wezterm-connect-ui` consumer, the connect thread of
+`attach_with_ui`, the SSH session thread, the proxy's stderr reader and
+child waiter, and the client thread. `ConnectionUI::with_consumer(cancel)`
+carries it through the unchanged desktop call chain; every desktop
+`ConnectionUI` has none, so desktop connections behave as before. The
+attempt's owners are those workers and its mux domain. An ended attempt
+is closing until every owner is gone, and ended only then:
+
+- Cancel (`cancel_attempt`, from the calling thread, no GUI task): the
+  prompt ends as cancelled, the transport shuts down, the phase is
+  `cancelling` until the owners are gone and then `cancelled`. It is refused
+  once `attach_with_ui` committed, which it does right before
+  `finish_attach`, so nothing of a cancelled attempt is published and a
+  late completion changes nothing.
+- Shutdown wakes a TCP connect in progress (nonblocking connect polled with
+  the cancel's wake socket), shuts the receiving side of the dialed socket
+  (every libssh or libssh2 wait for the server reads end of file) and
+  wakes the session's request loop, which then ends. The sending side
+  stays open: libssh closes its socket when a write fails and then polls
+  that closed socket without end. A trust answer after the shutdown writes
+  no `known_hosts`. `getaddrinfo` cannot be interrupted; a cancel during a
+  name lookup is seen when it returns, and nothing is dialed. The lookup
+  is bounded only by the resolver's own timeouts.
+- Disconnect (`disconnect`): `disconnecting`, then a GUI task detaches the
+  domain, which removes its panes without a `KillPane` because a detached
+  domain's `ClientPane::kill` sends none, then shuts the transport down;
+  `disconnected` (cause `user`) when the owners are gone.
+- A failed attach (`finish` with an error) shuts the transport down too, so
+  a client the attach had already started ends; `failing`, then `failed`.
+- The workers of an attached connection ending on their own make it
+  `disconnecting` and then `disconnected` (cause `lost`), whether or not
+  the laptop had panes.
+- When the workers have ended and the domain is still registered,
+  `Connections` calls its `retire` hook. One GUI task detaches the domain
+  (removing its panes while it is still registered and detached, so no
+  `KillPane`), unregisters exactly that domain id (`Mux::remove_domain`;
+  the by-name entry and the default domain only if they are the same
+  domain) and reports `retired`. An attached connection keeps its domain,
+  also while the laptop has no panes.
+- The engine's end shuts the transport down, and a registered domain
+  becomes `stranded`: no GUI task can reach it any more, so it is reported
+  as such, not counted as gone, and no longer holds the attempt. The
+  `wezterm-connect-ui` consumer stops on the engine's end too, because an
+  attach task stranded with the GUI thread keeps its `ConnectionUI`.
+  Every request carries a `connui::Respond`, which answers
+  `BrokenPromise` when it is dropped unanswered, so a request the
+  consumer had not yet registered, or one still queued when it drops its
+  receiver, resumes the thread that asked; a request sent after that
+  fails at once.
+- No new attempt starts while the previous one has an owner (`closing`).
+  Reconnect is a new attempt: a new `laptop-<attempt>` domain, a new client
+  and a new pane list. Nothing reconnects by itself, and input never
+  waits for a connection.
+
+The engine sets `quit_when_all_windows_are_closed=false` as a config
+override: a disconnect or the laptop's last pane exiting empties the mux,
+which must not end the engine. A process started again after Android stopped it is
+`idle` until the user connects.
 
 The identity is imported through `ACTION_OPEN_DOCUMENT`, read with a
 bounded loop that works from API 24 (at most 1 MiB plus one byte; a
@@ -381,6 +439,15 @@ the owned fixtures over `lo`, with input generated by instrumentation
 (including touches on the installed soft keyboard's keys); no phone,
 hardware keyboard or human typing has been exercised.
 
+ANDROID-06: the cancellation, disconnect and reconnect described above.
+`ConnectionPanel` shows Cancel while attaching, "Stop connecting" in its
+prompt dialogs, Disconnect in the empty state and Reconnect after a
+disconnect; the key row's "…" key asks before disconnecting. Debug builds
+add `nativeDiagnosticConnection`: `interrupt-transport` shuts the latest
+attempt's transport down as a failing network would, `census` lists the
+process's threads and descriptors and the attempt's workers. Verified only
+on emulators against the owned fixtures over `lo`.
+
 ## Build policy
 
 Single runner: `ci/android.sh`, wrapped by `make android-*`. Policy values
@@ -473,8 +540,25 @@ Gradle and the script.
   closed the shown one fitted to the surface, and a laptop OSC 52 copy
   reaching the phone's clipboard; first, the
   installed soft keyboard typing a command through real touches on its keys,
-  found in its own accessibility tree). `sshmux`
-  and `input` need `ci/android-sshmux-fixture.sh up <address>` first: an
+  found in its own accessibility tree) and `reconnect` (`ReconnectTest`,
+  one method per process: cancel during the TCP connect (twice, then no
+  new thread or socket inode), host trust, authentication, the version
+  check and the pane list; a lost connection, input queued across it and
+  sent while disconnected dropped, an explicit reconnect to the same laptop
+  pane ids through a fresh mapping, and a user disconnect; an attach the
+  end of its instrumentation force-stops, then a relaunch that reattaches
+  the same panes; the deliberate exit of the laptop's last pane; a network
+  loss with a host-trust answer after it and Home, then a loss while Back
+  hid the surface; three rounds of a cancelled connect and a user
+  disconnect, after each of which no worker, prompt or mux domain remains,
+  and after the third no thread or socket beyond the first round's; a GUI
+  engine failure while an attempt waits for the version answer, after which
+  its threads, the connection UI thread among them, end and its domain is
+  reported stranded; the same failure while a debug hold keeps the
+  password request unregistered and unanswered, after which the session
+  thread that asked still resumes and every thread ends).
+  `sshmux`, `input` and `reconnect` need
+  `ci/android-sshmux-fixture.sh up <address>` first: an
   owned sshd bound to loopback or the host's own Tailscale address, owned
   mux servers with `HOME` and `XDG_RUNTIME_DIR` inside
   `target/android-sshmux-fixture`, and generated keys. Its `input` server
@@ -489,7 +573,14 @@ Gradle and the script.
   the `Resize` a laptop GUI sends for the shell's own pane, then
   `stty size` on a cleared row, and `laptop-cli`, the laptop's own
   `wezterm cli` on that server. `input` types into those
-  panes, so run it against a fresh `up`. `down` also stops the server a desktop client without
+  panes, so run it against a fresh `up`. For `reconnect` the fixture adds a
+  listener whose full accept queue holds every TCP connect in progress
+  (`sshmux_stall listen`), proxies that never answer the version or the
+  pane list (`sshmux_stall version|list`, logging what they wait on), a
+  `reconnect` server whose one window is a capture pane
+  (`capture-reconnect.hex`), and a `lastpane` server whose one bash pane
+  the phone closes by typing `lastpane-cli kill-pane`, the laptop's own
+  CLI; `reconnect` types into them, so it too needs a fresh `up`. `down` also stops the server a desktop client without
   `--no-auto-start` starts for the missing-server account, found through
   its own pid file in the fixture's runtime directory. The runner copies
   the fixture endpoint and keys to the device for the suite and removes

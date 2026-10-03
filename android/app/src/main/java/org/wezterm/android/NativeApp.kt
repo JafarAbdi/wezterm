@@ -157,6 +157,25 @@ object NativeApp {
     @JvmStatic
     external fun nativeAnswerText(attempt: Long, prompt: Long, text: String?): Boolean
 
+    /** Cancels that attempt while it attaches. False when it is not attaching or already attached its panes. */
+    @JvmStatic
+    external fun nativeCancelConnect(attempt: Long): Boolean
+
+    /** Disconnects that attached attempt; the laptop's sessions keep running. False when it is not attached. */
+    @JvmStatic
+    external fun nativeDisconnect(attempt: Long): Boolean
+
+    /**
+     * Debug builds only, on the calling thread: `interrupt-transport` shuts
+     * the latest attempt's transport down as a failing network would
+     * (`true`, or `false` when its threads already ended); `hold-next-input`
+     * makes the next input request of an attempt wait unanswered for the
+     * engine's end (`true`); `census` is JSON listing the process's threads
+     * and descriptors. Null for an unknown command.
+     */
+    @JvmStatic
+    external fun nativeDiagnosticConnection(command: String): String?
+
     /** Stores a picked private key in app-private storage. Empty on success, else `<code>: <message>`. */
     @JvmStatic
     external fun nativeImportIdentity(key: ByteArray): String
@@ -275,7 +294,7 @@ sealed interface ConnectionPrompt {
 /** Mirror of the Rust `sshmux::Status`. The native side owns this state; nothing here is cached. */
 data class ConnectionStatus(
     val revision: Long,
-    /** `idle`, `attaching`, `attached`, `failed` or `disconnected`. */
+    /** `idle`, `attaching`, `attached`, or for an ended attempt `cancelling`, `failing` or `disconnecting` while a thread or its domain remains, then `cancelled`, `failed` or `disconnected`. */
     val phase: String,
     val attempt: Long,
     val progress: String,
@@ -284,6 +303,14 @@ data class ConnectionStatus(
     val windows: Int,
     val failureKind: String,
     val failureMessage: String,
+    /** Why a `disconnecting` or `disconnected` connection ended: `lost` or `user`. */
+    val cause: String,
+    /** Threads of the latest attempt that have not ended. */
+    val workers: Int,
+    /** The latest attempt's mux domain: `none`, `registered`, or `stranded` once the engine ended with it registered. */
+    val domain: String,
+    /** A thread or the domain of the latest attempt remains, so Connect is refused. */
+    val closing: Boolean,
     val identity: Boolean,
     /** The engine runs, so Connect can start an attempt. */
     val ready: Boolean,
@@ -310,6 +337,10 @@ data class ConnectionStatus(
                 windows = root.optInt("windows"),
                 failureKind = failure?.getString("kind") ?: "",
                 failureMessage = failure?.getString("message") ?: "",
+                cause = root.optString("cause"),
+                workers = root.getInt("workers"),
+                domain = root.getString("domain"),
+                closing = root.getBoolean("closing"),
                 identity = root.getBoolean("identity"),
                 ready = root.getBoolean("ready"),
             )

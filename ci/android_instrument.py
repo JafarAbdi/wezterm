@@ -69,11 +69,30 @@ EXPECTED = {
             "t19_aLaptopOsc52CopyReachesThePhoneClipboard",
         ],
     },
+    # One process per method; forceStopWhileAttached2 runs in the process
+    # that follows the end of forceStopWhileAttached1 and needs it first.
+    "reconnect": {
+        "ReconnectTest": [
+            "aCancelDuringTheTcpConnectEndsEveryThreadOfTheAttempt",
+            "aCancelDuringHostVerificationEndsThePromptAndTrustsNothing",
+            "aCancelDuringAuthenticationWipesTheSecretPromptAndAttachesNothing",
+            "aCancelDuringTheVersionCheckPublishesNothing",
+            "aCancelDuringThePaneListPublishesNoPaneMapping",
+            "aLostConnectionIsDisconnectedAndAnExplicitReconnectShowsTheSamePanesWithoutReplay",
+            "forceStopWhileAttached1AttachesAndRecordsTheLaptopPanes",
+            "forceStopWhileAttached2RelaunchAttachesTheSamePanesAgain",
+            "closingTheLastLaptopPaneLeavesAnEmptyConnectionThatReconnectsNothing",
+            "networkLossSurfaceLossAndALateAnswerAreRefusedWithoutDeadlockOrKill",
+            "repeatedCancelsDisconnectsAndReconnectsLeaveNothingBehind",
+            "anEngineFailureDuringAnAttemptEndsItsThreadsAndStrandsItsDomain",
+            "anEngineFailureWithAnUnregisteredInputRequestStillEndsEveryThread",
+        ],
+    },
 }
 
 
 def entries(suite: str) -> list[str]:
-    isolated = {"EngineFailureTest", "SshMuxStartTest", "SshMuxTest"}
+    isolated = {"EngineFailureTest", "ReconnectTest", "SshMuxStartTest", "SshMuxTest"}
     return [
         entry
         for class_name, methods in EXPECTED[suite].items()

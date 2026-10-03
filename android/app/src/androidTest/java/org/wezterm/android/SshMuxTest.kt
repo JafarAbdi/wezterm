@@ -375,7 +375,7 @@ class SshMuxTest {
     @Test
     fun aMissingMuxServerIsAVisibleFailureAndNothingIsStarted() {
         importFixtureKey("wezterm-fixture-key")
-        val failed = ui.connectTrusting(fixture("wezterm_missing"), "the missing-server failure") { it.phase != "attaching" }
+        val failed = ui.connectTrusting(fixture("wezterm_missing"), "the missing-server failure") { it.phase !in listOf("attaching", "failing") }
         assertEquals("failed", failed.phase)
         assertEquals("server_unavailable", failed.failureKind)
         ui.awaitMessage(R.string.failure_server_unavailable)
@@ -386,7 +386,7 @@ class SshMuxTest {
     @Test
     fun aCodecMismatchIsADistinctFailureAndAttachesNoPanes() {
         importFixtureKey("wezterm-fixture-key")
-        val failed = ui.connectTrusting(fixture("wezterm_mismatch"), "the version failure") { it.phase != "attaching" }
+        val failed = ui.connectTrusting(fixture("wezterm_mismatch"), "the version failure") { it.phase !in listOf("attaching", "failing") }
         assertEquals("failed", failed.phase)
         assertEquals("incompatible_version", failed.failureKind)
         ui.awaitMessage(R.string.failure_incompatible_version)

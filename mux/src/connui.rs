@@ -3,7 +3,7 @@ use anyhow::{anyhow, bail, Context as _};
 use crossbeam::channel::{unbounded, Receiver, Sender};
 use finl_unicode::grapheme_clusters::Graphemes;
 use promise::spawn::block_on;
-use promise::Promise;
+use promise::{BrokenPromise, Promise};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use termwiz::cell::{unicode_column_width, CellAttributes};
@@ -37,6 +37,38 @@ impl LineEditorHost for PasswordPromptHost {
     }
 }
 
+/// The answer to one request.  Answering consumes it.  Dropping it
+/// unanswered answers [`BrokenPromise`], because a dropped `Promise` never
+/// wakes the asker that blocks on its future; that covers a consumer that
+/// ends early and a request still queued when the last receiver goes.
+pub struct Respond<T>(Option<Promise<T>>);
+
+impl<T> Respond<T> {
+    fn new() -> (Self, promise::Future<T>) {
+        let mut promise = Promise::new();
+        let future = promise.get_future().unwrap();
+        (Self(Some(promise)), future)
+    }
+
+    pub fn result(mut self, result: anyhow::Result<T>) {
+        if let Some(mut promise) = self.0.take() {
+            promise.result(result);
+        }
+    }
+
+    pub fn ok(self, value: T) {
+        self.result(Ok(value));
+    }
+}
+
+impl<T> Drop for Respond<T> {
+    fn drop(&mut self) {
+        if let Some(mut promise) = self.0.take() {
+            promise.err(BrokenPromise {}.into());
+        }
+    }
+}
+
 pub enum UIRequest {
     /// Display something
     Output(Vec<Change>),
@@ -44,13 +76,13 @@ pub enum UIRequest {
     Input {
         prompt: String,
         echo: bool,
-        respond: Promise<String>,
+        respond: Respond<String>,
     },
     /// Sleep with a progress bar
     Sleep {
         reason: String,
         duration: Duration,
-        respond: Promise<()>,
+        respond: Respond<()>,
     },
     Close,
     /// Ask whether to trust a host whose key is not known yet.
@@ -60,7 +92,7 @@ pub enum UIRequest {
         /// `host:port` of the server.
         remote_address: String,
         fingerprint: String,
-        respond: Promise<bool>,
+        respond: Respond<bool>,
     },
 }
 
@@ -84,28 +116,26 @@ impl ConnectionUIImpl {
                 Ok(UIRequest::Input {
                     prompt,
                     echo: true,
-                    mut respond,
+                    respond,
                 }) => {
                     respond.result(self.input_prompt(&prompt));
                 }
                 Ok(UIRequest::Input {
                     prompt,
                     echo: false,
-                    mut respond,
+                    respond,
                 }) => {
                     respond.result(self.password_prompt(&prompt));
                 }
                 Ok(UIRequest::Sleep {
                     reason,
                     duration,
-                    mut respond,
+                    respond,
                 }) => {
                     respond.result(self.sleep(&reason, duration));
                 }
                 Ok(UIRequest::HostTrust {
-                    message,
-                    mut respond,
-                    ..
+                    message, respond, ..
                 }) => {
                     let message = format!("{}\n", message).replace("\n", "\r\n");
                     self.term.render(&[Change::Text(message)])?;
@@ -236,11 +266,11 @@ impl HeadlessImpl {
                 Ok(UIRequest::Output(changes)) => {
                     log::trace!("Output: {:?}", changes);
                 }
-                Ok(UIRequest::Input { mut respond, .. }) => {
+                Ok(UIRequest::Input { respond, .. }) => {
                     respond.result(Err(anyhow!("Input requested from headless context")));
                 }
                 Ok(UIRequest::Sleep {
-                    mut respond,
+                    respond,
                     reason,
                     duration,
                 }) => {
@@ -248,7 +278,7 @@ impl HeadlessImpl {
                     std::thread::sleep(duration);
                     respond.result(Ok(()));
                 }
-                Ok(UIRequest::HostTrust { mut respond, .. }) => {
+                Ok(UIRequest::HostTrust { respond, .. }) => {
                     respond.ok(false);
                 }
                 Err(err) if err.is_timeout() => {}
@@ -270,6 +300,8 @@ pub struct ConnectionUIParams {
 #[derive(Clone)]
 pub struct ConnectionUI {
     tx: Sender<UIRequest>,
+    /// The attempt this UI serves, when the caller can cancel it.
+    cancel: Option<wezterm_ssh::Cancel>,
 }
 
 impl ConnectionUI {
@@ -301,7 +333,7 @@ impl ConnectionUI {
             None,
         ))
         .detach();
-        Self { tx }
+        Self { tx, cancel: None }
     }
 
     pub fn new_with_no_close_delay() -> Self {
@@ -317,15 +349,35 @@ impl ConnectionUI {
             let mut ui = HeadlessImpl { rx };
             ui.run()
         });
-        Self { tx }
+        Self { tx, cancel: None }
     }
 
     /// A UI whose requests the caller consumes, in order, until every
-    /// clone of the UI is dropped.  The consumer owns each `respond`
-    /// promise from the moment it takes the request.
-    pub fn with_consumer() -> (Self, impl Iterator<Item = UIRequest> + Send) {
+    /// clone of the UI is dropped.  The consumer owns each `respond` from
+    /// the moment it takes the request; a request it drops, or that is
+    /// still queued when it drops the receiver, answers its asker with
+    /// [`BrokenPromise`].  `cancel` cancels the
+    /// attempt: the threads it starts count as its workers and nothing is
+    /// published once it was cancelled.
+    pub fn with_consumer(cancel: wezterm_ssh::Cancel) -> (Self, Receiver<UIRequest>) {
         let (tx, rx) = unbounded();
-        (Self { tx }, rx.into_iter())
+        (
+            Self {
+                tx,
+                cancel: Some(cancel),
+            },
+            rx,
+        )
+    }
+
+    /// The cancellation of the attempt this UI serves, if it has one.
+    pub fn cancel(&self) -> Option<&wezterm_ssh::Cancel> {
+        self.cancel.as_ref()
+    }
+
+    /// Count a thread that serves this UI's attempt until the guard drops.
+    pub fn worker(&self) -> Option<wezterm_ssh::Worker> {
+        self.cancel.as_ref().map(wezterm_ssh::Cancel::worker)
     }
 
     /// Ask the user whether to trust a host whose key is not known.  A UI
@@ -336,13 +388,12 @@ impl ConnectionUI {
         remote_address: &str,
         fingerprint: &str,
     ) -> bool {
-        let mut promise = Promise::new();
-        let future = promise.get_future().unwrap();
+        let (respond, future) = Respond::new();
         let sent = self.tx.send(UIRequest::HostTrust {
             message: message.to_string(),
             remote_address: remote_address.to_string(),
             fingerprint: fingerprint.to_string(),
-            respond: promise,
+            respond,
         });
         sent.is_ok() && block_on(future).unwrap_or(false)
     }
@@ -392,14 +443,13 @@ impl ConnectionUI {
     /// Sleep (blocking!) for the specified duration, but updates
     /// the UI with the reason and a count down during that time.
     pub fn sleep_with_reason(&self, reason: &str, duration: Duration) -> anyhow::Result<()> {
-        let mut promise = Promise::new();
-        let future = promise.get_future().unwrap();
+        let (respond, future) = Respond::new();
 
         self.tx
             .send(UIRequest::Sleep {
                 reason: reason.to_string(),
                 duration,
-                respond: promise,
+                respond,
             })
             .context("send to ConnectionUI failed")?;
 
@@ -422,8 +472,7 @@ impl ConnectionUI {
     }
 
     pub fn input(&self, prompt: &str) -> anyhow::Result<String> {
-        let mut promise = Promise::new();
-        let future = promise.get_future().unwrap();
+        let (respond, future) = Respond::new();
 
         let (preamble, prompt) = Self::split_multi_line_prompt(prompt);
         if let Some(preamble) = preamble {
@@ -434,7 +483,7 @@ impl ConnectionUI {
             .send(UIRequest::Input {
                 prompt,
                 echo: true,
-                respond: promise,
+                respond,
             })
             .context("send to ConnectionUI failed")?;
 
@@ -442,8 +491,7 @@ impl ConnectionUI {
     }
 
     pub fn password(&self, prompt: &str) -> anyhow::Result<String> {
-        let mut promise = Promise::new();
-        let future = promise.get_future().unwrap();
+        let (respond, future) = Respond::new();
 
         let (preamble, prompt) = Self::split_multi_line_prompt(prompt);
         if let Some(preamble) = preamble {
@@ -454,7 +502,7 @@ impl ConnectionUI {
             .send(UIRequest::Input {
                 prompt,
                 echo: false,
-                respond: promise,
+                respond,
             })
             .context("send to ConnectionUI failed")?;
 
@@ -503,4 +551,57 @@ pub fn show_configuration_error_message(err: &str) {
     let mut wrapped = textwrap::fill(&err, 78);
     wrapped.push_str("\n");
     ui.output_str(&wrapped);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam::channel::Select;
+
+    fn consumer() -> (ConnectionUI, Receiver<UIRequest>) {
+        ConnectionUI::with_consumer(wezterm_ssh::Cancel::new(|| {}).unwrap())
+    }
+
+    /// Block until a request is queued, without taking it.
+    fn await_queued(requests: &Receiver<UIRequest>) {
+        let mut select = Select::new();
+        select.recv(requests);
+        select.ready();
+    }
+
+    #[test]
+    fn a_request_the_consumer_drops_unanswered_resumes_its_asker() {
+        let (ui, requests) = consumer();
+        let asker =
+            std::thread::spawn(move || ui.password("Password: ").map_err(|e| e.to_string()));
+        await_queued(&requests);
+        drop(requests);
+        assert_eq!(
+            asker.join().unwrap(),
+            Err("Promise was dropped before completion".to_string()),
+            "queued when the consumer ended"
+        );
+
+        let (ui, requests) = consumer();
+        let asker =
+            std::thread::spawn(move || ui.confirm_host_trust("message", "host:22", "SHA256:x"));
+        let request = requests.recv().unwrap();
+        assert!(matches!(request, UIRequest::HostTrust { .. }));
+        drop(request);
+        assert!(
+            !asker.join().unwrap(),
+            "taken, then dropped by the consumer"
+        );
+    }
+
+    #[test]
+    fn a_request_after_the_consumer_ended_fails_without_waiting() {
+        let (ui, requests) = consumer();
+        drop(requests);
+        assert_eq!(
+            ui.password("Password: ").unwrap_err().to_string(),
+            "send to ConnectionUI failed"
+        );
+        assert!(!ui.confirm_host_trust("message", "host:22", "SHA256:x"));
+    }
 }

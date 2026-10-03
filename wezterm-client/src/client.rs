@@ -714,7 +714,9 @@ impl Reconnectable {
         let exec = smol::block_on(sess.exec(&cmd, None))?;
 
         let mut stderr = exec.stderr;
+        let worker = ui.worker();
         std::thread::spawn(move || {
+            let _worker = worker;
             let mut buf = [0u8; 1024];
             while let Ok(len) = stderr.read(&mut buf) {
                 if len == 0 {
@@ -730,10 +732,14 @@ impl Reconnectable {
         // the proxy, and prevents us from hanging forever after the process
         // has died
         let mut child = exec.child;
-        std::thread::spawn(move || match child.wait() {
-            Err(err) => log::error!("waiting on {} failed: {:#}", cmd, err),
-            Ok(status) if !status.success() => log::error!("{}: {}", cmd, status),
-            _ => {}
+        let worker = ui.worker();
+        std::thread::spawn(move || {
+            let _worker = worker;
+            match child.wait() {
+                Err(err) => log::error!("waiting on {} failed: {:#}", cmd, err),
+                Ok(status) if !status.success() => log::error!("{}: {}", cmd, status),
+                _ => {}
+            }
         });
 
         let stream: Box<dyn AsyncReadAndWrite> = Box::new(Async::new(SshStream {
@@ -1054,7 +1060,12 @@ impl Reconnectable {
 }
 
 impl Client {
-    fn new(local_domain_id: Option<DomainId>, mut reconnectable: Reconnectable) -> Self {
+    /// `worker` counts the client thread for the attempt that connected.
+    fn new(
+        local_domain_id: Option<DomainId>,
+        mut reconnectable: Reconnectable,
+        worker: Option<wezterm_ssh::Worker>,
+    ) -> Self {
         let client_domain_config = reconnectable.config.clone();
         let is_reconnectable = reconnectable.reconnectable();
         let is_local = reconnectable.is_local();
@@ -1062,6 +1073,7 @@ impl Client {
         let client_id = ClientId::new();
 
         thread::spawn(move || {
+            let _worker = worker;
             const BASE_INTERVAL: Duration = Duration::from_secs(1);
             const MAX_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -1291,7 +1303,7 @@ impl Client {
         let mut reconnectable =
             Reconnectable::new(ClientDomainConfig::Unix(unix_dom.clone()), None);
         reconnectable.connect(initial, ui, no_auto_start)?;
-        Ok(Self::new(local_domain_id, reconnectable))
+        Ok(Self::new(local_domain_id, reconnectable, ui.worker()))
     }
 
     pub fn new_tls(
@@ -1303,7 +1315,7 @@ impl Client {
             Reconnectable::new(ClientDomainConfig::Tls(tls_client.clone()), None);
         let no_auto_start = true;
         reconnectable.connect(true, ui, no_auto_start)?;
-        Ok(Self::new(Some(local_domain_id), reconnectable))
+        Ok(Self::new(Some(local_domain_id), reconnectable, ui.worker()))
     }
 
     pub fn new_ssh(
@@ -1314,7 +1326,7 @@ impl Client {
         let mut reconnectable = Reconnectable::new(ClientDomainConfig::Ssh(ssh_dom.clone()), None);
         let no_auto_start = true;
         reconnectable.connect(true, ui, no_auto_start)?;
-        Ok(Self::new(Some(local_domain_id), reconnectable))
+        Ok(Self::new(Some(local_domain_id), reconnectable, ui.worker()))
     }
 
     pub async fn send_pdu(&self, pdu: Pdu) -> anyhow::Result<Pdu> {
