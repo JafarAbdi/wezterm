@@ -60,6 +60,44 @@ object NativeApp {
     @JvmStatic
     external fun nativeClipboardText(request: Long, text: String?)
 
+    /**
+     * The IME's composing text, shown in the terminal and never sent. This
+     * and the other `nativeInput*` calls queue for the GUI thread, which
+     * delivers to the bound window or drops; they return false, and drop
+     * the input, when the engine does not run.
+     */
+    @JvmStatic
+    external fun nativeInputPreedit(text: String): Boolean
+
+    /**
+     * The IME's committed text changed: Backspace `erase` characters on the
+     * laptop, then type `text`; `meta` holds the armed Ctrl/Alt `KeyEvent`
+     * meta bits. The characters were typed under the input target `pane`
+     * (-1 for none) and `generation`; the GUI thread refuses the whole edit
+     * when `erase` is not 0 and input now reaches another target.
+     */
+    @JvmStatic
+    external fun nativeInputCommit(erase: Int, pane: Long, generation: Long, text: String, meta: Int): Boolean
+
+    /** A key press: `KeyEvent` key code, its character without Ctrl/Alt/Meta (0 for none) and meta state. */
+    @JvmStatic
+    external fun nativeInputKey(code: Int, unicode: Int, meta: Int): Boolean
+
+    /**
+     * Whether WezTerm's key table makes this key press (as for
+     * [nativeInputKey]) a paste. Answered on the calling thread.
+     */
+    @JvmStatic
+    external fun nativeIsPasteKey(code: Int, unicode: Int, meta: Int): Boolean
+
+    /** Paste `text`, read from the clipboard, into the active pane. */
+    @JvmStatic
+    external fun nativeInputPaste(text: String): Boolean
+
+    /** A [TerminalView] gesture code at surface pixels; `from` and `to` are scroll offsets. */
+    @JvmStatic
+    external fun nativeInputTouch(gesture: Int, x: Float, y: Float, from: Float, to: Float): Boolean
+
     /** Blocks until the status revision differs from `since`, or `timeoutMs` elapsed; returns the current revision. */
     @JvmStatic
     external fun nativeAwaitSurfaceChange(since: Long, timeoutMs: Long): Long
@@ -90,8 +128,11 @@ object NativeApp {
 
     /**
      * Debug builds only. Runs `open-window`, `paste`,
-     * `panic-on-queued-destroy` or `panic-with-clipboard-read` on the GUI
-     * thread, or arms `panic-in-surface-lost`; false when the command is
+     * `panic-on-queued-destroy`, `panic-with-clipboard-read`,
+     * `snapshot-bound-tab` or `apply-bound-tab-snapshot` on the GUI
+     * thread, arms `panic-in-surface-lost`, or holds and releases
+     * input-target observations (`hold-target-observations`,
+     * `release-target-observations`); false when the command is
      * unknown or no GUI thread accepts work. `panic-with-clipboard-read`
      * blocks until the read resolves and is also false when it did not fail.
      */
@@ -123,6 +164,22 @@ object NativeApp {
     /** Debug builds only: JSON census of mux domains and panes; null when no GUI thread answers. */
     @JvmStatic
     external fun nativeDiagnosticMux(): String?
+
+    /**
+     * Debug builds only: JSON of the bound window's active pane (local and
+     * laptop id, rows, cols, viewport text); null when no window is bound
+     * or no GUI thread answers.
+     */
+    @JvmStatic
+    external fun nativeDiagnosticActivePane(): String?
+
+    /**
+     * Debug builds only: the mux notifications (ids only) whose input-target
+     * observation `nativeDiagnosticGui("hold-target-observations")` holds,
+     * as a JSON list; null when nothing is held.
+     */
+    @JvmStatic
+    external fun nativeDiagnosticHeldObservations(): String?
 
     /** Render stage codes shared by [nativeDiagnosticFault] and [nativeAwaitRenderFailures]. */
     const val STAGE_GPU_CREATION = 2
@@ -282,6 +339,15 @@ data class SurfaceStatus(
     val clipboardRequests: Long,
     val clipboardResponses: Long,
     val loopWakeups: Long,
+    /** The cursor cell the bound window last painted, in surface pixels; 0 before it painted. */
+    val cursorX: Int,
+    val cursorY: Int,
+    val cellWidth: Int,
+    val cellHeight: Int,
+    /** Input the GUI thread delivered to the bound window, and dropped without one. */
+    val input: InputCounts,
+    /** The pane the bound window's keyboard input reaches. */
+    val inputTarget: InputTarget,
     val gpuCreationFailures: Long,
     val drawFailures: Long,
     val rawJson: String,
@@ -293,6 +359,7 @@ data class SurfaceStatus(
             val render = root.getJSONObject("render")
             val engine = root.getJSONObject("engine")
             val windows = surface.getJSONArray("windows")
+            val input = surface.getJSONObject("input")
             return SurfaceStatus(
                 engine = engine.getString("status"),
                 engineMessage = engine.optString("message"),
@@ -315,6 +382,23 @@ data class SurfaceStatus(
                 clipboardRequests = surface.getLong("clipboard_requests"),
                 clipboardResponses = surface.getLong("clipboard_responses"),
                 loopWakeups = surface.getLong("loop_wakeups"),
+                cursorX = surface.getInt("cursor_x"),
+                cursorY = surface.getInt("cursor_y"),
+                cellWidth = surface.getInt("cell_width"),
+                cellHeight = surface.getInt("cell_height"),
+                input = InputCounts(
+                    preedits = input.getLong("preedits"),
+                    commits = input.getLong("commits"),
+                    keys = input.getLong("keys"),
+                    pastes = input.getLong("pastes"),
+                    touches = input.getLong("touches"),
+                    dropped = input.getLong("dropped"),
+                    refused = input.getLong("refused"),
+                ),
+                inputTarget = InputTarget(
+                    pane = if (surface.isNull("input_pane")) -1 else surface.getLong("input_pane"),
+                    generation = surface.getLong("input_generation"),
+                ),
                 gpuCreationFailures = render.getLong("gpu_creation"),
                 drawFailures = render.getLong("draw"),
                 rawJson = json,
@@ -322,6 +406,12 @@ data class SurfaceStatus(
         }
     }
 }
+
+/** Mirror of the Rust `InputCounts`. */
+data class InputCounts(val preedits: Long, val commits: Long, val keys: Long, val pastes: Long, val touches: Long, val dropped: Long, val refused: Long)
+
+/** The local pane id the bound window's keyboard input reaches (-1 for none) and the generation of that assignment. */
+data class InputTarget(val pane: Long, val generation: Long)
 
 /** One logical window as the native side lists it. */
 data class WindowSummary(val id: Long, val title: String)

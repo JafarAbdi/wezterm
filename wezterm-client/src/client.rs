@@ -153,6 +153,13 @@ async fn process_unilateral_inner_async(
     let local_pane_id = match client_domain.remote_to_local_pane_id(pane_id) {
         Some(p) => p,
         None => {
+            // The PDU's name only: its payload can hold the pane's screen lines.
+            #[cfg(target_os = "android")]
+            log::debug!(
+                "got {} for remote pane {pane_id}, pane not found locally, resync",
+                decoded.pdu.pdu_name()
+            );
+            #[cfg(not(target_os = "android"))]
             log::debug!("got {decoded:?}, pane not found locally, resync");
             client_domain.resync().await?;
             client_domain
@@ -166,6 +173,9 @@ async fn process_unilateral_inner_async(
     let pane = match mux.get_pane(local_pane_id) {
         Some(p) => p,
         None => {
+            #[cfg(target_os = "android")]
+            log::debug!("got {} for remote pane {pane_id}, but local pane {local_pane_id} no longer exists; resync", decoded.pdu.pdu_name());
+            #[cfg(not(target_os = "android"))]
             log::debug!("got {decoded:?}, but local pane {local_pane_id} no longer exists; resync");
             client_domain.resync().await?;
 

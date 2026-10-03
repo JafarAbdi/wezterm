@@ -41,4 +41,23 @@
     <string name="prompt_secret_title">SSH authentication</string>
     <string name="prompt_ok">OK</string>
     <string name="prompt_cancel">Cancel</string>
+
+    <string name="key_escape">Esc</string>
+    <string name="key_escape_description">Escape</string>
+    <string name="key_ctrl">Ctrl</string>
+    <string name="key_ctrl_description">Control for the next key</string>
+    <string name="key_alt">Alt</string>
+    <string name="key_alt_description">Alt for the next key</string>
+    <string name="key_tab">Tab</string>
+    <string name="key_tab_description">Tab</string>
+    <string name="key_left">←</string>
+    <string name="key_left_description">Left arrow</string>
+    <string name="key_down">↓</string>
+    <string name="key_down_description">Down arrow</string>
+    <string name="key_up">↑</string>
+    <string name="key_up_description">Up arrow</string>
+    <string name="key_right">→</string>
+    <string name="key_right_description">Right arrow</string>
+    <string name="key_paste">Paste</string>
+    <string name="key_paste_description">Paste the clipboard</string>
 </resources>

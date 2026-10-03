@@ -45,6 +45,30 @@ EXPECTED = {
             "anEmptyMuxServerShowsTheEmptyStateAndSpawnsNothing",
         ],
     },
+    "input": {
+        "InputTest": [
+            "t00_theInstalledSoftKeyboardTypesACommandWithRealKeyTaps",
+            "t01_aCommandTypedOnThePhoneRunsOnTheLaptopAndShowsInThatPane",
+            "t02_composingTextStaysLocalAndItsCommitArrivesOnce",
+            "t03_deletionAroundSurrogatesAndCombiningMarksMatchesTheirRanges",
+            "t04_controlAltEscapeArrowsAndAHardwareKeyboardSendTheirSequencesOnce",
+            "t05_pastePreservesTheTextAndTheServersBracketedPaste",
+            "t06_touchSelectionCopiesTheLiteralTextAndScrollingTypesNothing",
+            "t07_keyboardInsetsAndRotationResizeTheSharedPaneToTheUsableSurface",
+            "t08_aLaptopEditorTakesTextKeysAndMouseClicks",
+            "t09_onlyTheSelectedLaptopPaneReceivesInputAcrossSwitches",
+            "t10_backAndBackgroundReplayNothingAndCloseNoPane",
+            "t11_commitsAreSentOnceWithMeasuredLatencyAndNoIdleRedraw",
+            "t12_recomposingSentTextChangesTheLaptopOnlyWhenItCommits",
+            "t13_aRewriteForAPaneTheLaptopFocusedAwayFromIsRefused",
+            "t14_aRewriteAfterTheLaptopFocusedAwayAndBackIsRefused",
+            "t15_aStalePaneTreeAfterRotationIsFittedToTheSurfaceAgain",
+            "t16_aLaptopResizeStandsWhileThePhoneShowsNothingAndFitsWhenItShowsAgain",
+            "t17_twoQuickPaneFocusChangesAreSentOnceAndNotEchoed",
+            "t18_theWindowShownAfterTheLaptopClosedTheShownOneFitsItsPanes",
+            "t19_aLaptopOsc52CopyReachesThePhoneClipboard",
+        ],
+    },
 }
 
 

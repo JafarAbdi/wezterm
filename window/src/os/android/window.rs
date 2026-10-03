@@ -7,8 +7,8 @@ use super::requests::{platform_requests, PlatformRequest};
 use super::{unsupported, Unsupported};
 use crate::connection::ConnectionOps;
 use crate::{
-    Clipboard, CursorIcon, RequestedWindowGeometry, SurfaceLease, WindowEvent, WindowEventSender,
-    WindowOps,
+    Clipboard, CursorIcon, Rect, RequestedWindowGeometry, SurfaceLease, WindowEvent,
+    WindowEventSender, WindowOps,
 };
 use async_trait::async_trait;
 use config::ConfigHandle;
@@ -140,6 +140,21 @@ impl WindowOps for Window {
     }
 
     fn set_inner_size(&self, _width: usize, _height: usize) {}
+
+    /// The painting window reports its cursor cell; its size is the cell
+    /// size that touch scrolling steps by.
+    fn set_text_cursor_position(&self, cursor: Rect) {
+        if Connection::get().and_then(|conn| conn.bound_window()) != Some(*self) {
+            return;
+        }
+        let size = |pixels: isize| pixels.max(0) as u32;
+        surface_monitor().set_text_cursor(
+            cursor.origin.x as i64,
+            cursor.origin.y as i64,
+            size(cursor.size.width),
+            size(cursor.size.height),
+        );
+    }
 
     /// Android has one clipboard; both kinds read it.
     fn get_clipboard(&self, _clipboard: Clipboard) -> Future<String> {

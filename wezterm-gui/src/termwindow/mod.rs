@@ -1006,6 +1006,10 @@ impl TermWindow {
         event: WindowEvent,
         window: &Window,
     ) -> anyhow::Result<bool> {
+        // A debug APK's logcat must not record what the user types or pastes.
+        #[cfg(target_os = "android")]
+        log::debug!("{}", event.without_text());
+        #[cfg(not(target_os = "android"))]
         log::debug!("{event:?}");
         match event {
             WindowEvent::Destroyed => {

@@ -15,8 +15,8 @@ mod native_window;
 mod requests;
 mod window;
 
-pub use connection::{set_display_dpi, Connection};
-pub use monitor::{surface_monitor, SurfaceMonitor, SurfaceSnapshot, WindowSummary};
+pub use connection::{on_rebind, set_display_dpi, Connection};
+pub use monitor::{surface_monitor, InputCounts, SurfaceMonitor, SurfaceSnapshot, WindowSummary};
 pub use native_window::NativeWindowLease;
 pub use requests::{platform_requests, ClipboardUnavailable, PlatformRequest, PlatformRequests};
 pub use window::Window;

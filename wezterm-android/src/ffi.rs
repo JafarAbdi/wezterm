@@ -23,13 +23,14 @@
 
 #![allow(unsafe_code)]
 
+use crate::input::{Erase, Gesture, Input, InputTarget};
 use crate::profile::ProfileFields;
 use crate::terminal::{self, RetireOutcome, StartRequest, SurfaceBridgeError};
 use crate::{InitRequest, sshmux};
 use jni::EnvUnowned;
 use jni::errors::ThrowRuntimeExAndDefault;
 use jni::objects::{JByteArray, JClass, JObject, JString};
-use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jfloat, jint, jlong};
 use ndk::native_window::NativeWindow;
 use std::path::PathBuf;
 use std::sync::Once;
@@ -46,6 +47,14 @@ fn install_logger(verbose: bool) {
         android_logger::init_once(
             android_logger::Config::default()
                 .with_max_level(level)
+                // The shaper's debug records hold the text it shapes: the
+                // user's composition and the terminal's screen.
+                .with_filter(
+                    android_logger::FilterBuilder::new()
+                        .filter_level(level)
+                        .filter_module("wezterm_font::shaper", log::LevelFilter::Info)
+                        .build(),
+                )
                 .with_tag("wezterm"),
         );
     });
@@ -225,6 +234,144 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeSelectWindow<'ca
 ) {
     unowned_env
         .with_env(|_env| -> Result<(), Fault> { Ok(terminal::select_window(id)?) })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+fn deliver(input: Option<Input>) -> jboolean {
+    if input.is_some_and(terminal::input) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// `NativeApp.nativeInputPreedit(text)`: the IME's composing text.  This
+/// and the other `nativeInput*` exports return false when the engine does
+/// not run; the input is then dropped.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeInputPreedit<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    text: JString<'caller>,
+) -> jboolean {
+    unowned_env
+        .with_env(|_env| -> jni::errors::Result<jboolean> {
+            Ok(deliver(Some(Input::Preedit(text.to_string()))))
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeInputCommit(erase, pane, generation, text, meta)`:
+/// the IME's committed text changed; `erase` characters typed under the
+/// input target `pane` (negative for none) and `generation`.  A negative
+/// `erase` or `generation` is a Java caller bug and delivers nothing.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeInputCommit<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    erase: jint,
+    pane: jlong,
+    generation: jlong,
+    text: JString<'caller>,
+    meta: jint,
+) -> jboolean {
+    unowned_env
+        .with_env(|_env| -> jni::errors::Result<jboolean> {
+            let text = text.to_string();
+            let commit = u32::try_from(erase)
+                .ok()
+                .zip(u64::try_from(generation).ok())
+                .map(|(erase, generation)| Input::Commit {
+                    erase: Erase::new(
+                        erase,
+                        InputTarget {
+                            pane: usize::try_from(pane).ok(),
+                            generation,
+                        },
+                    ),
+                    text,
+                    meta,
+                });
+            Ok(deliver(commit))
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeIsPasteKey(code, unicode, meta)`: whether the key
+/// table makes this key press a paste.  Answered on the caller's thread;
+/// the GUI thread takes no part.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeIsPasteKey<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    code: jint,
+    unicode: jint,
+    meta: jint,
+) -> jboolean {
+    unowned_env
+        .with_env(|_env| -> jni::errors::Result<jboolean> {
+            let pastes = crate::input::pressed_key(code, unicode as u32, meta)
+                .is_some_and(|key| wezterm_gui::android::is_paste_key(&key));
+            Ok(if pastes { JNI_TRUE } else { JNI_FALSE })
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeInputKey(code, unicode, meta)`: a key press.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeInputKey<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    code: jint,
+    unicode: jint,
+    meta: jint,
+) -> jboolean {
+    unowned_env
+        .with_env(|_env| -> jni::errors::Result<jboolean> {
+            Ok(deliver(Some(Input::Key {
+                code,
+                unicode: unicode as u32,
+                meta,
+            })))
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeInputPaste(text)`: paste the clipboard text Kotlin read.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeInputPaste<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    text: JString<'caller>,
+) -> jboolean {
+    unowned_env
+        .with_env(|_env| -> jni::errors::Result<jboolean> {
+            Ok(deliver(Some(Input::Paste(text.to_string()))))
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeInputTouch(gesture, x, y, from, to)`: a touch gesture;
+/// false also for an unknown gesture code.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeInputTouch<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    gesture: jint,
+    x: jfloat,
+    y: jfloat,
+    from: jfloat,
+    to: jfloat,
+) -> jboolean {
+    unowned_env
+        .with_env(|_env| -> jni::errors::Result<jboolean> {
+            let gesture = Gesture::from_code(gesture, from, to);
+            Ok(deliver(gesture.map(|gesture| Input::Touch {
+                x,
+                y,
+                gesture,
+            })))
+        })
         .resolve::<ThrowRuntimeExAndDefault>()
 }
 
@@ -529,6 +676,46 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeImportIdentity<'
         .resolve::<ThrowRuntimeExAndDefault>()
 }
 
+/// `NativeApp.nativeDiagnosticActivePane()`: debug-only JSON
+/// [`sshmux::ActivePane`] of the bound window, taken on the GUI thread;
+/// null when no window is bound or no GUI thread answers.
+#[cfg(debug_assertions)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeDiagnosticActivePane<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+) -> JString<'caller> {
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<_> {
+            match terminal::diagnostic_active_pane() {
+                Some(pane) => JString::from_str(env, pane),
+                None => Ok(JString::null()),
+            }
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `NativeApp.nativeDiagnosticHeldObservations()`: debug-only JSON list of
+/// the mux notifications whose input-target observation
+/// `hold-target-observations` holds; null when nothing is held.
+#[cfg(debug_assertions)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeDiagnosticHeldObservations<
+    'caller,
+>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+) -> JString<'caller> {
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<_> {
+            match terminal::diagnostic_held_observations() {
+                Some(held) => JString::from_str(env, held),
+                None => Ok(JString::null()),
+            }
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
 /// `NativeApp.nativeDiagnosticMux()`: debug-only JSON
 /// [`sshmux::MuxCensus`] taken on the GUI thread; null when no GUI thread
 /// answers.
@@ -584,10 +771,13 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeDiagnosticFault<
 }
 
 /// `NativeApp.nativeDiagnosticGui(command)`: debug-only.  Runs
-/// `open-window`, `paste`, `panic-on-queued-destroy` or
-/// `panic-with-clipboard-read` on the GUI thread, or arms
-/// `panic-in-surface-lost`; false when the command is unknown or no GUI
-/// thread accepts work.  `panic-with-clipboard-read` blocks until the read
+/// `open-window`, `paste`, `panic-on-queued-destroy`,
+/// `panic-with-clipboard-read`, `snapshot-bound-tab` or
+/// `apply-bound-tab-snapshot` on the GUI thread, arms
+/// `panic-in-surface-lost`, or holds and releases input-target
+/// observations (`hold-target-observations`,
+/// `release-target-observations`); false when the command is unknown or no
+/// GUI thread accepts work.  `panic-with-clipboard-read` blocks until the read
 /// resolves and is also false when the read did not fail.
 #[cfg(debug_assertions)]
 #[unsafe(no_mangle)]

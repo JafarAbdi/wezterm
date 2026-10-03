@@ -8,8 +8,10 @@ use crate::termwindow::TermWindowNotif;
 use ::window::{Connection, ConnectionOps, WindowOps};
 use anyhow::Context;
 use config::keyassignment::{ClipboardPasteSource, KeyAssignment};
+use mux::tab::{PaneNode, TabId};
 use mux::termwiztermtab::TermWizTerminal;
 use mux::Mux;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use termwiz::cell::{AttributeChange, CellAttributes, Intensity, Underline};
 use termwiz::color::{AnsiColor, ColorAttribute};
@@ -56,22 +58,51 @@ pub fn open_window() {
 /// Paste the clipboard into the active pane of the window bound to the
 /// surface, through the same key assignment a paste shortcut performs.
 pub fn paste_into_bound_window() -> anyhow::Result<()> {
-    let bound = Connection::get()
-        .and_then(|conn| conn.bound_window())
-        .context("no window is bound")?;
-    let gui_window = crate::frontend::front_end()
-        .gui_windows()
-        .into_iter()
-        .find(|gui_window| gui_window.window == bound)
-        .context("the bound window has no terminal window")?;
-    let pane = Mux::get()
-        .get_active_tab_for_window(gui_window.mux_window_id)
-        .and_then(|tab| tab.get_active_pane())
-        .context("the bound window has no active pane")?;
+    let (bound, pane) = super::bound_pane()?;
     bound.notify(TermWindowNotif::PerformAssignment {
         pane_id: pane.pane_id(),
         assignment: KeyAssignment::PasteFrom(ClipboardPasteSource::Clipboard),
         tx: None,
+    });
+    Ok(())
+}
+
+thread_local! {
+    /// The pane tree `snapshot_bound_tab` kept, with its tab.
+    static TAB_SNAPSHOT: RefCell<Option<(TabId, PaneNode)>> = const { RefCell::new(None) };
+}
+
+/// Keep the pane tree, with its sizes, of the bound window's active tab.
+pub fn snapshot_bound_tab() -> anyhow::Result<()> {
+    let (_, pane) = super::bound_pane()?;
+    let mux = Mux::get();
+    let (_, _, tab_id) = mux
+        .resolve_pane_id(pane.pane_id())
+        .context("the bound pane is in no tab")?;
+    let tab = mux.get_tab(tab_id).context("no such tab")?;
+    TAB_SNAPSHOT.set(Some((tab_id, tab.codec_pane_tree())));
+    Ok(())
+}
+
+/// Apply the kept pane tree to its tab through `Tab::sync_with_pane_tree`,
+/// as a client resync applies a pane tree the laptop sent: panes and tab
+/// take the tree's sizes, and the panes tell the laptop.
+pub fn apply_bound_tab_snapshot() -> anyhow::Result<()> {
+    let (tab_id, tree) = TAB_SNAPSHOT.take().context("no tab snapshot")?;
+    let mux = Mux::get();
+    let tab = mux.get_tab(tab_id).context("the snapshot's tab is gone")?;
+    let size = tree.root_size().context("an empty pane tree")?;
+    let panes: Vec<_> = tab
+        .iter_panes_ignoring_zoom()
+        .into_iter()
+        .map(|p| p.pane)
+        .collect();
+    tab.sync_with_pane_tree(size, tree, |entry| {
+        panes
+            .iter()
+            .find(|pane| pane.pane_id() == entry.pane_id)
+            .cloned()
+            .expect("the snapshot names the tab's panes")
     });
     Ok(())
 }

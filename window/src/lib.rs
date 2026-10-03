@@ -225,6 +225,42 @@ pub enum WindowEvent {
     AdviseModifiersLedStatus(Modifiers, KeyboardLedStatus),
 }
 
+impl WindowEvent {
+    /// The event as a log line that holds no typed, composed or dropped
+    /// text, path, URL or key assignment: keys keep only whether they
+    /// went down, the others their variant.
+    pub fn without_text(&self) -> String {
+        match self {
+            Self::KeyEvent(event) => format!("KeyEvent {{ key_is_down: {} }}", event.key_is_down),
+            Self::RawKeyEvent(event) => {
+                format!("RawKeyEvent {{ key_is_down: {} }}", event.key_is_down)
+            }
+            Self::AdviseDeadKeyStatus(DeadKeyStatus::Composing(_)) => {
+                "AdviseDeadKeyStatus(Composing)".to_string()
+            }
+            Self::DraggedFile(paths) => format!("DraggedFile({} paths)", paths.len()),
+            Self::DroppedFile(paths) => format!("DroppedFile({} paths)", paths.len()),
+            Self::DroppedUrl(urls) => format!("DroppedUrl({} urls)", urls.len()),
+            Self::DroppedString(_) => "DroppedString".to_string(),
+            Self::PerformKeyAssignment(_) => "PerformKeyAssignment".to_string(),
+            Self::AdviseDeadKeyStatus(DeadKeyStatus::None)
+            | Self::CloseRequested
+            | Self::Destroyed
+            | Self::SurfaceAvailable { .. }
+            | Self::SurfaceLost
+            | Self::Resized { .. }
+            | Self::SetInnerSizeCompleted
+            | Self::NeedRepaint
+            | Self::FocusChanged(_)
+            | Self::MouseEvent(_)
+            | Self::MouseLeave
+            | Self::AppearanceChanged(_)
+            | Self::Notification(_)
+            | Self::AdviseModifiersLedStatus(..) => format!("{self:?}"),
+        }
+    }
+}
+
 pub struct WindowEventSender {
     handler: Box<dyn FnMut(WindowEvent, &Window)>,
     window: Option<Window>,
@@ -425,5 +461,98 @@ impl ResizeIncrement {
             base_width: 0,
             base_height: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw(key: KeyCode) -> RawKeyEvent {
+        RawKeyEvent {
+            key,
+            modifiers: Modifiers::NONE,
+            leds: KeyboardLedStatus::empty(),
+            phys_code: None,
+            raw_code: 0x34,
+            #[cfg(windows)]
+            scan_code: 0,
+            repeat_count: 1,
+            key_is_down: true,
+            handled: Handled::new(),
+        }
+    }
+
+    #[test]
+    fn events_carrying_text_log_without_it() {
+        let key = KeyEvent {
+            key: KeyCode::Char('S'),
+            modifiers: Modifiers::SHIFT,
+            leds: KeyboardLedStatus::empty(),
+            repeat_count: 1,
+            key_is_down: true,
+            raw: Some(raw(KeyCode::Char('S'))),
+            #[cfg(windows)]
+            win32_uni_char: None,
+        };
+        let logged = [
+            WindowEvent::KeyEvent(key),
+            WindowEvent::KeyEvent(KeyEvent {
+                key: KeyCode::Composed("e\u{301}".to_string()),
+                modifiers: Modifiers::NONE,
+                leds: KeyboardLedStatus::empty(),
+                repeat_count: 1,
+                key_is_down: false,
+                raw: None,
+                #[cfg(windows)]
+                win32_uni_char: None,
+            }),
+            WindowEvent::RawKeyEvent(raw(KeyCode::Char('x'))),
+            WindowEvent::AdviseDeadKeyStatus(DeadKeyStatus::Composing("nihao".to_string())),
+            WindowEvent::DroppedString("hunter2\n".to_string()),
+            WindowEvent::DroppedFile(vec![PathBuf::from("/home/secret.txt")]),
+            WindowEvent::DraggedFile(vec![PathBuf::from("a"), PathBuf::from("b")]),
+            WindowEvent::DroppedUrl(vec![Url::parse("https://example.com/?token=x").unwrap()]),
+            WindowEvent::PerformKeyAssignment(config::keyassignment::KeyAssignment::SendString(
+                "hunter2".to_string(),
+            )),
+        ]
+        .iter()
+        .map(WindowEvent::without_text)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            logged,
+            [
+                "KeyEvent { key_is_down: true }",
+                "KeyEvent { key_is_down: false }",
+                "RawKeyEvent { key_is_down: true }",
+                "AdviseDeadKeyStatus(Composing)",
+                "DroppedString",
+                "DroppedFile(1 paths)",
+                "DraggedFile(2 paths)",
+                "DroppedUrl(1 urls)",
+                "PerformKeyAssignment",
+            ]
+        );
+    }
+
+    #[test]
+    fn events_without_text_log_their_debug_form() {
+        let logged = [
+            WindowEvent::FocusChanged(true),
+            WindowEvent::AdviseDeadKeyStatus(DeadKeyStatus::None),
+            WindowEvent::SurfaceLost,
+        ]
+        .iter()
+        .map(WindowEvent::without_text)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            logged,
+            [
+                "FocusChanged(true)",
+                "AdviseDeadKeyStatus(None)",
+                "SurfaceLost"
+            ]
+        );
     }
 }

@@ -43,4 +43,5 @@ promise.workspace = true
 wezterm-client.workspace = true
 
 [dev-dependencies]
+mux.workspace = true
 tempfile.workspace = true

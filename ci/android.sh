@@ -3,12 +3,12 @@
 #
 #   ci/android.sh provision             install the pinned Rust toolchain and targets, cargo-ndk and JDK into $WEZTERM_ANDROID_TOOLCHAIN
 #   ci/android.sh native [abi]          cross-build libwezterm_android.so into jniLibs; Gradle runs this before packaging
-#   ci/android.sh build                 assemble the debug APK of every ABI, rebuilding the native libraries first
+#   ci/android.sh build                 assemble the debug APK of every ABI (rebuilding the native libraries first), lint it and run the JVM unit tests
 #   ci/android.sh check [abi]           cargo check + clippy (-D warnings) + rustdoc for the Android crates
 #   ci/android.sh inspect               gate the built artifacts (ELF, symbols, alignment, APK, signature); nonzero on any failure
 #   ci/android.sh inspect-selftest      prove the gate rejects missing and malformed artifacts using fixture copies
 #   ci/android.sh install <serial>      install the APK matching the device ABI
-#   ci/android.sh test <serial> <suite> check the Rust crates for the device ABI, rebuild, and run serial-only instrumentation for <suite> (native-load, surface, lifecycle, sshmux; sshmux needs ci/android-sshmux-fixture.sh up)
+#   ci/android.sh test <serial> <suite> check the Rust crates for the device ABI, rebuild, and run serial-only instrumentation for <suite> (native-load, surface, lifecycle, sshmux, input; sshmux and input need ci/android-sshmux-fixture.sh up)
 #
 # Machine-specific SDK/NDK locations come from the environment or from the
 # untracked ci/android.local.env written by `provision`.
@@ -45,8 +45,16 @@ REQUIRED_JNI_EXPORTS=(
   Java_org_wezterm_android_NativeApp_nativeAnswerText
   Java_org_wezterm_android_NativeApp_nativeImportIdentity
   Java_org_wezterm_android_NativeApp_nativeDiagnosticMux
+  Java_org_wezterm_android_NativeApp_nativeInputPreedit
+  Java_org_wezterm_android_NativeApp_nativeInputCommit
+  Java_org_wezterm_android_NativeApp_nativeIsPasteKey
+  Java_org_wezterm_android_NativeApp_nativeInputKey
+  Java_org_wezterm_android_NativeApp_nativeInputPaste
+  Java_org_wezterm_android_NativeApp_nativeInputTouch
+  Java_org_wezterm_android_NativeApp_nativeDiagnosticActivePane
+  Java_org_wezterm_android_NativeApp_nativeDiagnosticHeldObservations
 )
-# The sshmux suite talks to the owned fixture of ci/android-sshmux-fixture.sh.
+# The sshmux and input suites talk to the owned fixture of ci/android-sshmux-fixture.sh.
 SSHMUX_FIXTURE=${WEZTERM_SSHMUX_FIXTURE_DIR:-target/android-sshmux-fixture}
 SSHMUX_DEVICE_DIR=/data/local/tmp/wezterm-sshmux
 SSHMUX_PICKER_DIR=/sdcard/Download/wezterm-fixture
@@ -139,7 +147,7 @@ gradle() { ./android/gradlew -p android --console=plain "$@"; }
 
 cmd_build() {
   # lintDebug fails on any error, including a framework call above minSdk (NewApi).
-  gradle :app:assembleDebug :app:lintDebug
+  gradle :app:assembleDebug :app:lintDebug :app:testDebugUnitTest
   ls -l "$APK_DIR"/*.apk
 }
 
@@ -395,8 +403,12 @@ cmd_test() (
   trap cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' HUP TERM
+  local fixture_suite=0
+  case "$suite" in sshmux|input) fixture_suite=1 ;; esac
+  if [ "$fixture_suite" = 1 ]; then
+    [ -f "$SSHMUX_FIXTURE/device/fixture.properties" ] || die "the $suite suite needs the owned fixture: ci/android-sshmux-fixture.sh up <address>"
+  fi
   if [ "$suite" = sshmux ]; then
-    [ -f "$SSHMUX_FIXTURE/device/fixture.properties" ] || die "the sshmux suite needs the owned fixture: ci/android-sshmux-fixture.sh up <address>"
     if grep -qx 'empty=blocked' "$SSHMUX_FIXTURE/device/fixture.properties"; then
       echo "BLOCKED: required empty mux fixture unavailable; no method omitted" > "$results/BLOCKED-empty.txt"
       die "required empty mux fixture unavailable"
@@ -407,7 +419,7 @@ cmd_test() (
   gradle :app:assembleDebug :app:assembleDebugAndroidTest
   cmd_install "$serial"
   adb -s "$serial" install -r android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
-  if [ "$suite" = sshmux ]; then
+  if [ "$fixture_suite" = 1 ]; then
     fixture_files=1
     adb -s "$serial" shell "rm -rf $SSHMUX_DEVICE_DIR $SSHMUX_PICKER_DIR && mkdir -p $SSHMUX_DEVICE_DIR $SSHMUX_PICKER_DIR"
     adb -s "$serial" push "$SSHMUX_FIXTURE/device/fixture.properties" "$SSHMUX_DEVICE_DIR/" > /dev/null
@@ -421,7 +433,7 @@ cmd_test() (
       org.wezterm.android.test/androidx.test.runner.AndroidJUnitRunner)
     printf '%q ' "${command[@]}" > "$receipt.command"
     printf '\n' >> "$receipt.command"
-    (exec adb -s "$serial" logcat -v time 'wezterm:V' 'WezTermSurface:V' 'WezTermSshMuxTest:V' 'TestRunner:V' 'AndroidRuntime:E' '*:S') > "$receipt.logcat" 2>&1 &
+    (exec adb -s "$serial" logcat -v time 'wezterm:V' 'WezTermSurface:V' 'WezTermSshMuxTest:V' 'WezTermInputTest:V' 'TestRunner:V' 'AndroidRuntime:E' '*:S') > "$receipt.logcat" 2>&1 &
     logcat_pid=$!
     printf '%s\n' "$logcat_pid" > "$receipt.logcat.pid"
     logcat_exit=$receipt.logcat.exit

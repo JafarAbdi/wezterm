@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Owned laptop-side fixtures for `ci/android.sh test <serial> sshmux`.
+# Owned laptop-side fixtures for `ci/android.sh test <serial> sshmux` and `... input`.
 #
 #   ci/android-sshmux-fixture.sh up <address>   start an owned sshd and owned mux servers; <address> is 127.0.0.1 or this host's own Tailscale address
 #   ci/android-sshmux-fixture.sh census <name>  write the pane lists of the owned mux servers to $FIXTURE/census-<name>.json
@@ -19,6 +19,7 @@ SSHD=${SSHD:-/usr/sbin/sshd}
 WEZTERM=$ROOT/target/debug/wezterm
 MUX_SERVER=$ROOT/target/debug/wezterm-mux-server
 MISMATCH=$ROOT/target/debug/examples/sshmux_codec_mismatch
+RESIZE=$ROOT/target/debug/examples/sshmux_resize_pane
 PANE_TEXT=("FIXTURE PANE ALPHA" "FIXTURE PANE BRAVO" "FIXTURE PANE CHARLIE")
 
 die() { echo "android-sshmux-fixture.sh: $*" >&2; exit 1; }
@@ -42,12 +43,14 @@ await_ready() {
   done
 }
 
+# start_mux <name> [<default_prog as a Lua list>]
 start_mux() {
-  local name=$1
+  local name=$1 program=${2:-}
+  [ -n "$program" ] || program="{ '/bin/sh', '-c', 'printf \"${PANE_TEXT[0]}\\\\n\"; exec cat' }"
   cat > "$FIXTURE/$name.lua" <<LUA
 return {
   unix_domains = { { name = 'unix', socket_path = '$FIXTURE/$name.sock' } },
-  default_prog = { '/bin/sh', '-c', 'printf "${PANE_TEXT[0]}\\\\n"; exec cat' },
+  default_prog = $program,
 }
 LUA
   env -i PATH=/usr/bin:/bin HOME="$FIXTURE/home" XDG_RUNTIME_DIR="$FIXTURE/run" \
@@ -68,11 +71,11 @@ cmd_up() {
   route=$(own_address "$address") || true
   [ -n "$route" ] || die "'$address' is neither 127.0.0.1 nor this host's own Tailscale address; the fixture binds nothing else"
   local pidfile
-  for pidfile in sshd.pid populated.pid empty.pid run/wezterm/pid; do
+  for pidfile in sshd.pid populated.pid empty.pid input.pid run/wezterm/pid; do
     [ ! -e "$FIXTURE/$pidfile" ] || die "$FIXTURE/$pidfile exists; run down first"
   done
-  for bin in "$WEZTERM" "$MUX_SERVER" "$MISMATCH"; do
-    [ -x "$bin" ] || die "missing $bin; run: cargo build --locked -p wezterm -p wezterm-mux-server && cargo build --locked -p wezterm-android --example sshmux_codec_mismatch"
+  for bin in "$WEZTERM" "$MUX_SERVER" "$MISMATCH" "$RESIZE"; do
+    [ -x "$bin" ] || die "missing $bin; run: cargo build --locked -p wezterm -p wezterm-mux-server && cargo build --locked -p wezterm-android --example sshmux_codec_mismatch --example sshmux_resize_pane"
   done
   rm -rf "$FIXTURE"
   mkdir -p -m 700 "$FIXTURE" "$FIXTURE/home" "$FIXTURE/run" "$FIXTURE/bin" "$FIXTURE/device"
@@ -102,7 +105,59 @@ cmd_up() {
     empty=blocked
   fi
 
+  # The input suite's laptop panes: an interactive shell in window 0 and,
+  # in window 1, a capture that prints the hex of every byte it receives,
+  # with bracketed paste enabled.  Lines end after a carriage return or six
+  # bytes, so they never wrap on a phone-sized pane; every byte is also
+  # appended to capture.hex.  Window 2 holds two captures, one above the
+  # other so each is as wide as a phone's window; once the top one has read
+  # "abc" it has this laptop focus the bottom one, as a laptop user would,
+  # and once the bottom one has read "aba" it has the laptop focus the top
+  # one and then the bottom one again.  The shell finds laptop-resize,
+  # which resizes the shell's own pane as a laptop GUI attached to this
+  # server does, then prints the pane's size, and laptop-cli, this laptop's
+  # `wezterm cli` on the input server.  All run on this machine only.
+  cat > "$FIXTURE/bin/capture" <<'CAPTURE'
+# capture <hex log> [<trigger hex> <command...>]: run the command once the input ends with the trigger.
+log=$1 trigger=${2:-} seen=
+shift; [ $# = 0 ] || shift
+printf '\033[?2004hCAPTURE READY\n'
+stty raw -echo opost onlcr
+n=0
+while byte=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n'); [ -n "$byte" ]; do
+  printf ' %s' "$byte"
+  echo "$byte" >> "$log"
+  n=$((n + 1))
+  if [ "$byte" = 0d ] || [ "$n" = 6 ]; then printf '\n'; n=0; fi
+  if [ -n "$trigger" ]; then
+    seen=$seen$byte
+    case $seen in *"$trigger") trigger=; "$@" > /dev/null 2>&1 ;; esac
+  fi
+done
+CAPTURE
+  # The server's reflow can leave the cursor on the command's row; the size
+  # is printed on a cleared row.
+  printf '#!/bin/sh\nWEZTERM_UNIX_SOCKET=%q %q "$@" && printf "\\r\\033[K" && stty size\n' "$FIXTURE/input.sock" "$RESIZE" > "$FIXTURE/bin/laptop-resize"
+  chmod 700 "$FIXTURE/bin/laptop-resize"
+  printf '#!/bin/sh\nWEZTERM_UNIX_SOCKET=%q exec %q --skip-config cli --no-auto-start "$@"\n' "$FIXTURE/input.sock" "$WEZTERM" > "$FIXTURE/bin/laptop-cli"
+  chmod 700 "$FIXTURE/bin/laptop-cli"
+  start_mux input "{ '/usr/bin/env', 'LANG=C.UTF-8', 'PS1=$ ', 'PATH=/usr/bin:/bin:$FIXTURE/bin', 'HISTFILE=/dev/null', '/bin/bash', '--noprofile', '--norc', '-i' }"
+  cli input spawn --new-window -- /bin/sh "$FIXTURE/bin/capture" "$FIXTURE/capture.hex" > /dev/null
+  cat > "$FIXTURE/bin/focus-away-and-back" <<SCRIPT
+. "$FIXTURE/input-focus"
+cli() { /usr/bin/env WEZTERM_UNIX_SOCKET="$FIXTURE/input.sock" "$WEZTERM" --skip-config cli --no-auto-start "\$@"; }
+cli activate-pane --pane-id "\$focus_from" && cli activate-pane --pane-id "\$focus_to"
+SCRIPT
+  local focus_to focus_from
+  focus_to=$(cli input spawn --new-window -- /bin/sh "$FIXTURE/bin/capture" "$FIXTURE/capture-b.hex" 616261 \
+    /bin/sh "$FIXTURE/bin/focus-away-and-back")
+  focus_from=$(cli input split-pane --pane-id "$focus_to" --top -- /bin/sh "$FIXTURE/bin/capture" "$FIXTURE/capture-a.hex" 616263 \
+    /usr/bin/env WEZTERM_UNIX_SOCKET="$FIXTURE/input.sock" "$WEZTERM" --skip-config cli --no-auto-start activate-pane --pane-id "$focus_to")
+  printf 'focus_from=%s\nfocus_to=%s\n' "$focus_from" "$focus_to" > "$FIXTURE/input-focus"
+  cli input activate-pane --pane-id "$focus_from"
+
   remote_wezterm wezterm-populated "WEZTERM_UNIX_SOCKET=$FIXTURE/populated.sock" "$WEZTERM" --skip-config '"$@"'
+  remote_wezterm wezterm-input "WEZTERM_UNIX_SOCKET=$FIXTURE/input.sock" "$WEZTERM" --skip-config '"$@"'
   remote_wezterm wezterm-empty "WEZTERM_UNIX_SOCKET=$FIXTURE/empty.sock" "$WEZTERM" --skip-config '"$@"'
   remote_wezterm wezterm-missing "WEZTERM_UNIX_SOCKET=$FIXTURE/missing.sock" "$WEZTERM" --skip-config '"$@"'
   remote_wezterm wezterm-mismatch "$MISMATCH"
@@ -146,8 +201,11 @@ CONFIG
     echo "other_host_key=$(cut -d' ' -f1,2 "$FIXTURE/host_key_other.pub")"
     echo "other_type_host_key=$(cut -d' ' -f1,2 "$FIXTURE/host_key_other_type.pub")"
     echo "passphrase=$(cat "$FIXTURE/passphrase")"
-    for key in populated empty missing mismatch; do echo "wezterm_$key=$FIXTURE/bin/wezterm-$key"; done
+    for key in populated empty missing mismatch input; do echo "wezterm_$key=$FIXTURE/bin/wezterm-$key"; done
     echo "populated_panes=$(cli populated list --format json | tr -d '\n ')"
+    echo "input_panes=$(cli input list --format json | tr -d '\n ')"
+    echo "input_focus_from=$focus_from"
+    echo "input_focus_to=$focus_to"
   } > "$FIXTURE/device/fixture.properties"
   cp "$FIXTURE/client_key" "$FIXTURE/device/wezterm-fixture-key"
   cp "$FIXTURE/client_key_encrypted" "$FIXTURE/device/wezterm-fixture-key-encrypted"
@@ -172,7 +230,7 @@ cmd_census() {
   local name=${1:?name} server
   [ -e "$FIXTURE/sshd.pid" ] || die "no fixture is up in $FIXTURE"
   {
-    for server in populated empty missing; do
+    for server in populated empty missing input; do
       if [ -S "$FIXTURE/$server.sock" ] && cli "$server" list --format json > "$FIXTURE/census.tmp" 2>/dev/null; then
         echo "{\"server\": \"$server\", \"listening\": true, \"panes\": $(cat "$FIXTURE/census.tmp")}"
       else
@@ -189,14 +247,14 @@ cmd_down() {
   # run/wezterm/pid: the server a client without --no-auto-start (the
   # desktop default) starts for the missing-server account; its pid file
   # lock admits one per fixture.
-  for pidfile in "$FIXTURE"/sshd.pid "$FIXTURE"/populated.pid "$FIXTURE"/empty.pid "$FIXTURE"/run/wezterm/pid; do
+  for pidfile in "$FIXTURE"/sshd.pid "$FIXTURE"/populated.pid "$FIXTURE"/empty.pid "$FIXTURE"/input.pid "$FIXTURE"/run/wezterm/pid; do
     [ -f "$pidfile" ] || continue
     pid=$(cat "$pidfile")
     # Match the owned executable and its exact config, not just a path substring.
     local command
     command=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || command=
     case "$command" in
-      "$MUX_SERVER --config-file $FIXTURE/populated.lua "|"$MUX_SERVER --config-file $FIXTURE/empty.lua "|"$MUX_SERVER --pid-file-fd "*)
+      "$MUX_SERVER --config-file $FIXTURE/populated.lua "|"$MUX_SERVER --config-file $FIXTURE/empty.lua "|"$MUX_SERVER --config-file $FIXTURE/input.lua "|"$MUX_SERVER --pid-file-fd "*)
         if [ "$(tr '\0' '\n' < "/proc/$pid/environ" | grep -cxF -e "HOME=$FIXTURE/home" -e "XDG_RUNTIME_DIR=$FIXTURE/run")" = 2 ]; then
           kill "$pid"
         fi ;;
