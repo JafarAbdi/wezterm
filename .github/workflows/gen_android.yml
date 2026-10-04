@@ -28,6 +28,7 @@ jobs:
         shell: bash
         run: |
           sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.0.13004108'
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.0.13004108"
           make android-provision
       - name: "Host dependencies"
         shell: bash
@@ -62,6 +63,7 @@ jobs:
         shell: bash
         run: |
           sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.0.13004108'
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.0.13004108"
           make android-provision
       - name: "Create throwaway CI signing identity"
         shell: bash
@@ -110,6 +112,7 @@ jobs:
         shell: bash
         run: |
           sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.0.13004108'
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.0.13004108"
           make android-provision
       - name: "Create throwaway CI signing identity"
         shell: bash
@@ -120,9 +123,9 @@ jobs:
           "$HOME/.local/share/wezterm-android-toolchain/jdk-17.0.20.1+1/bin/keytool" -genkeypair -storetype PKCS12 -keystore "$keydir/ci.p12" -alias ci -storepass:file "$keydir/password" -keypass:file "$keydir/password" -keyalg RSA -keysize 3072 -validity 30 -dname 'CN=Throwaway Android CI,OU=Not release authority'
           chmod 600 "$keydir/ci.p12"
           printf 'WEZTERM_ANDROID_KEYSTORE=%s\nWEZTERM_ANDROID_KEY_ALIAS=ci\nWEZTERM_ANDROID_STORE_PASSWORD_FILE=%s\nWEZTERM_ANDROID_KEY_PASSWORD_FILE=%s\n' "$keydir/ci.p12" "$keydir/password" "$keydir/password" >> "$GITHUB_ENV"
-      - name: "Enable KVM"
+      - name: "Emulator host dependencies and KVM"
         shell: bash
-        run: "sudo chmod 666 /dev/kvm"
+        run: "sudo apt-get update && sudo apt-get install -y --no-install-recommends libpulse0 && sudo chmod 666 /dev/kvm"
       - name: "Assemble and test an explicit emulator"
         env:
           WEZTERM_ANDROID_CONFIG_OVERRIDES: 'webgpu_preferred_adapter={name="Android Emulator OpenGL ES Translator (Google SwiftShader)",backend="Gl",device_type="Cpu"}'
@@ -225,6 +228,7 @@ jobs:
         shell: bash
         run: |
           sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.0.13004108'
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.0.13004108"
           make android-provision
       - name: "Create throwaway CI signing identity"
         shell: bash
@@ -235,9 +239,9 @@ jobs:
           "$HOME/.local/share/wezterm-android-toolchain/jdk-17.0.20.1+1/bin/keytool" -genkeypair -storetype PKCS12 -keystore "$keydir/ci.p12" -alias ci -storepass:file "$keydir/password" -keypass:file "$keydir/password" -keyalg RSA -keysize 3072 -validity 30 -dname 'CN=Throwaway Android CI,OU=Not release authority'
           chmod 600 "$keydir/ci.p12"
           printf 'WEZTERM_ANDROID_KEYSTORE=%s\nWEZTERM_ANDROID_KEY_ALIAS=ci\nWEZTERM_ANDROID_STORE_PASSWORD_FILE=%s\nWEZTERM_ANDROID_KEY_PASSWORD_FILE=%s\n' "$keydir/ci.p12" "$keydir/password" "$keydir/password" >> "$GITHUB_ENV"
-      - name: "Enable KVM"
+      - name: "Emulator host dependencies and KVM"
         shell: bash
-        run: "sudo chmod 666 /dev/kvm"
+        run: "sudo apt-get update && sudo apt-get install -y --no-install-recommends libpulse0 && sudo chmod 666 /dev/kvm"
       - name: "Assemble and test an explicit emulator"
         env:
           WEZTERM_ANDROID_CONFIG_OVERRIDES: 'webgpu_preferred_adapter={name="Android Emulator OpenGL ES Translator (Google SwiftShader)",backend="Gl",device_type="Cpu"}'

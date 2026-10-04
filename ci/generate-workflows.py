@@ -1169,6 +1169,7 @@ def android_actions():
         ActionStep("Set up uv", "astral-sh/setup-uv@v6"),
         ActionStep("Set up Android SDK", "android-actions/setup-android@v3", params={"packages": "platform-tools"}),
         RunStep("Provision pinned Android inputs", f"""sdkmanager 'platforms;android-{policy['wezterm.compileSdk']}' 'build-tools;{policy['wezterm.buildToolsVersion']}' 'ndk;{policy['wezterm.ndkVersion']}'
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/{policy['wezterm.ndkVersion']}"
 make android-provision"""),
     ]
     signing = RunStep("Create throwaway CI signing identity", """umask 077
@@ -1194,7 +1195,7 @@ printf 'WEZTERM_ANDROID_KEYSTORE=%s\\nWEZTERM_ANDROID_KEY_ALIAS=ci\\nWEZTERM_AND
         serial = f"emulator-{port}"
         suites = "native-load" if api == 24 else "native-load surface lifecycle"
         jobs[f"api{api}"] = setup + [signing,
-            RunStep("Enable KVM", "sudo chmod 666 /dev/kvm"),
+            RunStep("Emulator host dependencies and KVM", "sudo apt-get update && sudo apt-get install -y --no-install-recommends libpulse0 && sudo chmod 666 /dev/kvm"),
             RunStep("Assemble and test an explicit emulator", f"""set -euo pipefail
 diag="$RUNNER_TEMP/wezterm-emu/diagnostics"
 export ANDROID_AVD_HOME="$RUNNER_TEMP/wezterm-emu/avd"
