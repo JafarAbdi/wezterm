@@ -22,6 +22,8 @@ jobs:
         uses: astral-sh/setup-uv@v6
       - name: "Set up Android SDK"
         uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools"
       - name: "Provision pinned Android inputs"
         shell: bash
         run: |
@@ -54,6 +56,8 @@ jobs:
         uses: astral-sh/setup-uv@v6
       - name: "Set up Android SDK"
         uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools"
       - name: "Provision pinned Android inputs"
         shell: bash
         run: |
@@ -97,6 +101,8 @@ jobs:
         uses: astral-sh/setup-uv@v6
       - name: "Set up Android SDK"
         uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools"
       - name: "Provision pinned Android inputs"
         shell: bash
         run: |
@@ -158,6 +164,8 @@ jobs:
         uses: astral-sh/setup-uv@v6
       - name: "Set up Android SDK"
         uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools"
       - name: "Provision pinned Android inputs"
         shell: bash
         run: |

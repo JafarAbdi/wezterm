@@ -1167,7 +1167,7 @@ def android_actions():
     setup = [
         checkout,
         ActionStep("Set up uv", "astral-sh/setup-uv@v6"),
-        ActionStep("Set up Android SDK", "android-actions/setup-android@v3"),
+        ActionStep("Set up Android SDK", "android-actions/setup-android@v3", params={"packages": "platform-tools"}),
         RunStep("Provision pinned Android inputs", f"""sdkmanager 'platforms;android-{policy['wezterm.compileSdk']}' 'build-tools;{policy['wezterm.buildToolsVersion']}' 'ndk;{policy['wezterm.ndkVersion']}'
 make android-provision"""),
     ]
