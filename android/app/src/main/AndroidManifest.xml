@@ -21,9 +21,5 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <activity
-            android:name=".DiagnosticActivity"
-            android:exported="true"
-            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden" />
     </application>
 </manifest>

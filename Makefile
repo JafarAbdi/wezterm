@@ -1,4 +1,4 @@
-.PHONY: all fmt build check test docs servedocs android-provision android-native android-build android-check android-inspect android-inspect-selftest android-install android-test
+.PHONY: all fmt build check test docs servedocs android-provision android-native android-build android-check android-inspect android-inspect-selftest android-install android-test android-release android-release-inspect
 
 all: build
 
@@ -29,28 +29,35 @@ servedocs:
 	ci/build-docs.sh serve
 
 ABI ?=
+VARIANT ?= debug
 SUITE ?= native-load
 
 android-provision:
 	ci/android.sh provision
 
 android-native:
-	ci/android.sh native $(ABI)
+	ci/android.sh native "$(ABI)" "$(VARIANT)"
 
 android-build:
 	ci/android.sh build
 
+android-release:
+	ci/android.sh release
+
+android-release-inspect:
+	ci/android.sh inspect release
+
 android-check:
-	ci/android.sh check $(ABI)
+	ci/android.sh check "$(ABI)" "$(VARIANT)"
 
 android-inspect:
-	ci/android.sh inspect
+	ci/android.sh inspect "$(VARIANT)"
 
 android-inspect-selftest:
-	ci/android.sh inspect-selftest
+	ci/android.sh inspect-selftest "$(VARIANT)"
 
 android-install:
-	ci/android.sh install $(SERIAL)
+	ci/android.sh install $(SERIAL) "$(VARIANT)"
 
 android-test:
 	ci/android.sh test $(SERIAL) $(SUITE)

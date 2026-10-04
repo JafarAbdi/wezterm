@@ -29,6 +29,7 @@ pub use probe::{FontReport, GpuAdapter, NativeVersions, ShapingProbe};
 
 /// Parse debug config overrides: one `key=value` per line, values being
 /// Lua expressions.  Blank lines are skipped.
+#[cfg(any(test, debug_assertions))]
 pub fn parse_config_overrides(text: &str) -> Result<Vec<(String, String)>, String> {
     text.lines()
         .map(str::trim)

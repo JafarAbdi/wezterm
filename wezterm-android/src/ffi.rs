@@ -67,6 +67,7 @@ enum Fault {
     Surface(#[from] SurfaceBridgeError),
     #[error(transparent)]
     NotAccepting(#[from] crate::engine::NotAccepting),
+    #[cfg(debug_assertions)]
     #[error("{0}")]
     Overrides(String),
     #[error(transparent)]
@@ -79,7 +80,7 @@ fn init_request(
     dpi: jint,
     verbose_logging: jboolean,
 ) -> InitRequest {
-    let verbose = verbose_logging == JNI_TRUE;
+    let verbose = cfg!(debug_assertions) && verbose_logging == JNI_TRUE;
     install_logger(verbose);
     InitRequest {
         files_dir: PathBuf::from(files_dir.to_string()),
@@ -139,11 +140,16 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeTerminalStart<'c
     unowned_env
         .with_env(|env| -> Result<_, Fault> {
             let init = init_request(&files_dir, &cache_dir, dpi, verbose_logging);
+            #[cfg(debug_assertions)]
             let config_overrides = crate::parse_config_overrides(&config_overrides.to_string())
                 .map_err(Fault::Overrides)?;
+            #[cfg(not(debug_assertions))]
+            let _ = (diagnostic_applet, config_overrides);
             let state = terminal::start(StartRequest {
                 init,
+                #[cfg(debug_assertions)]
                 diagnostic_applet: diagnostic_applet == JNI_TRUE,
+                #[cfg(debug_assertions)]
                 config_overrides,
             });
             log::info!("nativeTerminalStart -> {state:?}");
@@ -416,6 +422,7 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeClipboardText<'c
 
 /// `NativeApp.nativeAwaitSurfaceChange(since, timeoutMs)`: block until the
 /// status revision differs from `since`; returns the current revision.
+#[cfg(debug_assertions)]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeAwaitSurfaceChange<'caller>(
     mut unowned_env: EnvUnowned<'caller>,
@@ -447,6 +454,7 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeSurfaceStatus<'c
 }
 
 /// `NativeApp.nativeAwaitSurfaceFrames(generation, minFrames, timeoutMs)`.
+#[cfg(debug_assertions)]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeAwaitSurfaceFrames<'caller>(
     mut unowned_env: EnvUnowned<'caller>,
@@ -469,6 +477,7 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeAwaitSurfaceFram
 }
 
 /// `NativeApp.nativeAwaitSurfaceState(state, generation, timeoutMs)`.
+#[cfg(debug_assertions)]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeAwaitSurfaceState<'caller>(
     mut unowned_env: EnvUnowned<'caller>,
@@ -491,6 +500,7 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeAwaitSurfaceStat
 }
 
 /// `NativeApp.nativeAwaitRenderFailures(stage, minFailures, timeoutMs)`.
+#[cfg(debug_assertions)]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeAwaitRenderFailures<'caller>(
     mut unowned_env: EnvUnowned<'caller>,
@@ -580,6 +590,7 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeConnectionStatus
 
 /// `NativeApp.nativeAwaitConnectionChange(since, timeoutMs)`: block until
 /// the connection revision differs from `since`; returns the current one.
+#[cfg(debug_assertions)]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeAwaitConnectionChange<'caller>(
     mut unowned_env: EnvUnowned<'caller>,
@@ -806,7 +817,7 @@ pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeDiagnosticConnec
 }
 
 /// Error raised on purpose by [`Java_org_wezterm_android_NativeApp_nativeDiagnosticFault`].
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, not(doc)))]
 #[derive(Debug, thiserror::Error)]
 enum DiagnosticFault {
     #[error("diagnostic error {0} requested from Java")]
@@ -819,7 +830,7 @@ enum DiagnosticFault {
 /// `kind == 0` panics and `kind >= 4` returns an error, both surfacing in
 /// Java as `RuntimeException`; `2` and `3` arm a one-shot GPU creation or
 /// draw failure on the GUI thread and return the armed stage.
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, not(doc)))]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wezterm_android_NativeApp_nativeDiagnosticFault<'caller>(
     mut unowned_env: EnvUnowned<'caller>,

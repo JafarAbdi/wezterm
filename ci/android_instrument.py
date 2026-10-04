@@ -6,6 +6,13 @@ import xml.etree.ElementTree as element_tree
 
 
 EXPECTED = {
+    "release-load": {"NativeLoadReleaseTest": [
+        "closureLoadsAndInitializesOnce",
+        "publicLaunchRefusesForeignAddressesAndOpensTheDocumentPicker",
+    ]},
+    "release-sshmux": {"ReleaseSshMuxTest": [
+        "productionPickerTrustAttachInputDisconnectAndReconnect",
+    ]},
     "native-load": {"NativeLoadTest": [
         "closureLoadsAndInitializesOnce",
         "rustPanicIsContainedAsRuntimeException",

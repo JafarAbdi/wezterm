@@ -2,13 +2,14 @@
 # Shared runner for every Android task, locally and in CI.
 #
 #   ci/android.sh provision             install the pinned Rust toolchain and targets, cargo-ndk and JDK into $WEZTERM_ANDROID_TOOLCHAIN
-#   ci/android.sh native [abi]          cross-build libwezterm_android.so into jniLibs; Gradle runs this before packaging
+#   ci/android.sh native [abi] [variant] cross-build debug (default) or release JNI and separate symbols
 #   ci/android.sh build                 assemble the debug APK of every ABI (rebuilding the native libraries first), lint it and run the JVM unit tests
-#   ci/android.sh check [abi]           cargo check + clippy (-D warnings) + rustdoc for the Android crates
-#   ci/android.sh inspect               gate the built artifacts (ELF, symbols, alignment, APK, signature); nonzero on any failure
-#   ci/android.sh inspect-selftest      prove the gate rejects missing and malformed artifacts using fixture copies
+#   ci/android.sh release              assemble, lint, inspect, and record a signed release; private signing files required
+#   ci/android.sh check [abi] [variant] cargo check + clippy (-D warnings) + rustdoc for the Android crates
+#   ci/android.sh inspect [variant]     gate actual ELF, DEX, manifest, notices, APK, symbols, and signatures
+#   ci/android.sh inspect-selftest [variant] prove rejection of missing, stale, and malformed artifacts
 #   ci/android.sh install <serial>      install the APK matching the device ABI
-#   ci/android.sh test <serial> <suite> check the Rust crates for the device ABI, rebuild, and run serial-only instrumentation for <suite> (native-load, surface, lifecycle, sshmux, input, reconnect; sshmux, input and reconnect need ci/android-sshmux-fixture.sh up)
+#   ci/android.sh test <serial> <suite> check, rebuild, and run serial-only instrumentation (native-load, surface, lifecycle, sshmux, input, reconnect; signed release-load/release-sshmux; all sshmux/input/reconnect suites need the owned fixture)
 #
 # Machine-specific SDK/NDK locations come from the environment or from the
 # untracked ci/android.local.env written by `provision`.
@@ -57,7 +58,7 @@ REQUIRED_JNI_EXPORTS=(
   Java_org_wezterm_android_NativeApp_nativeDiagnosticActivePane
   Java_org_wezterm_android_NativeApp_nativeDiagnosticHeldObservations
 )
-# The sshmux, input and reconnect suites talk to the owned fixture of ci/android-sshmux-fixture.sh.
+# sshmux, input, reconnect and release-sshmux use the existing owned fixture.
 SSHMUX_FIXTURE=${WEZTERM_SSHMUX_FIXTURE_DIR:-target/android-sshmux-fixture}
 SSHMUX_DEVICE_DIR=/data/local/tmp/wezterm-sshmux
 SSHMUX_PICKER_DIR=/sdcard/Download/wezterm-fixture
@@ -133,11 +134,36 @@ cargo_ndk() {
   cargo ndk -t "$abi" --platform "$ANDROID_MIN_API" "$@"
 }
 
+set_variant() {
+  VARIANT=${1:-debug}
+  case "$VARIANT" in debug|release) ;; *) die "unknown build variant '$VARIANT'" ;; esac
+  if [ "$VARIANT" = release ]; then
+    JNI_LIBS=target/android-release/jniLibs
+    SYMBOLS_DIR=target/android-release/symbols
+    INSPECT_DIR=target/android-release/inspect
+  else
+    JNI_LIBS=android/app/src/main/jniLibs
+    SYMBOLS_DIR=target/android-symbols
+    INSPECT_DIR=target/android-inspect
+  fi
+  APK_DIR=android/app/build/outputs/apk/$VARIANT
+}
+VARIANT=debug
+
 cmd_native() {
   local abi
-  for abi in $(abis_or_all "$@"); do
-    cargo_ndk "$abi" build --locked -p wezterm-android
-    local built=target/${RUST_TARGET[$abi]}/debug/$LIB
+  set_variant "${2:-debug}"
+  local flags=()
+  if [ "$VARIANT" = release ]; then flags=(--release); fi
+  local selection=()
+  if [ -n "${1:-}" ]; then selection=("$1"); fi
+  for abi in $(abis_or_all "${selection[@]}"); do
+    if [ "$VARIANT" = release ]; then
+      CARGO_PROFILE_RELEASE_DEBUG=2 cargo_ndk "$abi" build --locked -p wezterm-android "${flags[@]}"
+    else
+      cargo_ndk "$abi" build --locked -p wezterm-android
+    fi
+    local built=target/${RUST_TARGET[$abi]}/$VARIANT/$LIB
     mkdir -p "$SYMBOLS_DIR/$abi" "$JNI_LIBS/$abi"
     cp "$built" "$SYMBOLS_DIR/$abi/$LIB"
     # Gradle copies the jniLibs input several times; DWARF stays only in
@@ -154,12 +180,54 @@ cmd_build() {
   ls -l "$APK_DIR"/*.apk
 }
 
+signing_certificate() {
+  : "${WEZTERM_ANDROID_KEYSTORE:?release keystore required}"
+  : "${WEZTERM_ANDROID_KEY_ALIAS:?release alias required}"
+  : "${WEZTERM_ANDROID_STORE_PASSWORD_FILE:?release store password file required}"
+  : "${WEZTERM_ANDROID_KEY_PASSWORD_FILE:?release key password file required}"
+  "$JAVA_HOME/bin/keytool" -exportcert -keystore "$WEZTERM_ANDROID_KEYSTORE" \
+    -alias "$WEZTERM_ANDROID_KEY_ALIAS" -storepass:file "$WEZTERM_ANDROID_STORE_PASSWORD_FILE" | sha256sum | cut -d' ' -f1
+}
+
+cmd_release() {
+  set_variant release
+  signing_certificate > /dev/null
+  gradle :app:assembleRelease :app:lintRelease :app:testReleaseUnitTest
+  cmd_inspect release
+  local receipts=target/android-release/receipts
+  mkdir -p "$receipts"
+  git rev-parse HEAD > "$receipts/parent.txt"
+  git diff --binary > "$receipts/source.diff"
+  git submodule status --recursive > "$receipts/submodules.txt"
+  while IFS= read -r -d '' file; do
+    if [ -f "$file" ]; then sha256sum "$file"; fi
+  done < <(git ls-files --cached --others --exclude-standard -z) > "$receipts/source.sha256"
+  {
+    rustc -vV
+    cargo ndk --version
+    "$JAVA_HOME/bin/java" -version 2>&1
+    gradle --version
+    cat "$ANDROID_NDK_HOME/source.properties"
+    cat android/gradle.properties android/gradle/wrapper/gradle-wrapper.properties
+    printf 'native profile: release; opt-level=3; debug=2; locked Cargo resolution\n'
+  } > "$receipts/tools.txt"
+  find "$GRADLE_USER_HOME/caches/modules-2/files-2.1" -type f -print0 | sort -z | xargs -0 sha256sum > "$receipts/gradle-inputs.sha256"
+  find "$APK_DIR" "$SYMBOLS_DIR" target/android-notices/assets -type f -print0 | sort -z | xargs -0 sha256sum > "$receipts/artifacts.sha256"
+  signing_certificate > "$receipts/certificate.sha256"
+}
+
 cmd_check() {
-  local abi
-  for abi in $(abis_or_all "$@"); do
-    cargo_ndk "$abi" check --locked -p wezterm-android -p window
-    cargo_ndk "$abi" clippy --locked -p wezterm-android --all-targets --no-deps -- -D warnings
-    RUSTDOCFLAGS="-D warnings" cargo_ndk "$abi" doc --locked -p wezterm-android --no-deps
+  local abi selection=() flags=()
+  set_variant "${2:-debug}"
+  if [ -n "${1:-}" ]; then selection=("$1"); fi
+  if [ "$VARIANT" = release ]; then
+    flags=(--release)
+    export CARGO_PROFILE_RELEASE_DEBUG=2
+  fi
+  for abi in $(abis_or_all "${selection[@]}"); do
+    cargo_ndk "$abi" check --locked -p wezterm-android -p window "${flags[@]}"
+    cargo_ndk "$abi" clippy --locked -p wezterm-android --all-targets --no-deps "${flags[@]}" -- -D warnings
+    RUSTDOCFLAGS="-D warnings" cargo_ndk "$abi" doc --locked -p wezterm-android --no-deps "${flags[@]}"
   done
 }
 
@@ -217,8 +285,17 @@ inspect_so() {
   "$NDK_BIN/llvm-nm" -D --defined-only "$so" 2>/dev/null | awk '$2=="T" && $3 ~ /^Java_/ {print $3}' | sort > "$out_dir/$abi.jni-exports"
   local export
   for export in "${REQUIRED_JNI_EXPORTS[@]}"; do
+    if [ "$VARIANT" = release ]; then
+      case "$export" in *nativeDiagnostic*|*nativeAwait*)
+        assert_eq "$abi excludes $export" "$(grep -cx "$export" "$out_dir/$abi.jni-exports" || true)" "0"
+        continue ;;
+      esac
+    fi
     if grep -qx "$export" "$out_dir/$abi.jni-exports"; then ok "$abi exports $export"; else fail "$abi does not export $export"; fi
   done
+  if [ "$VARIANT" = release ]; then
+    assert_eq "$abi release diagnostic or wait-only JNI exports" "$(grep -cE 'nativeDiagnostic|nativeAwait' "$out_dir/$abi.jni-exports" || true)" "0"
+  fi
   "$NDK_BIN/llvm-nm" -D --undefined-only "$so" 2>/dev/null | awk '{print $(NF-1) " " $NF}' | sed 's/@.*//' | sort -u -k2 > "$out_dir/$abi.undefined"
   sysroot_exports "$triple" "$so" > "$out_dir/$abi.sysroot"
   awk -v exports="$out_dir/$abi.sysroot" 'BEGIN { while ((getline line < exports) > 0) have[line]=1 } !($2 in have)' "$out_dir/$abi.undefined" > "$out_dir/$abi.unresolved"
@@ -255,6 +332,26 @@ inspect_apk() {
   assert_eq "$abi APK Signature Scheme v2" "$(grep -o 'Verified using v2 scheme (APK Signature Scheme v2): [a-z]*' <<< "$verify")" "Verified using v2 scheme (APK Signature Scheme v2): true"
   grep -E 'DN:|SHA-256 digest' <<< "$verify" | sed 's/^/  /' >> "$OUT"
   grep -o 'certificate SHA-256 digest: [0-9a-f]*' <<< "$verify" | head -1 >> "$out_dir/cert-digests"
+  if [ "$VARIANT" = release ]; then
+    local expected_certificate
+    expected_certificate=$(signing_certificate)
+    assert_eq "$abi release signing identity" "$(grep -o 'certificate SHA-256 digest: [0-9a-f]*' <<< "$verify" | head -1 | cut -d' ' -f4)" "$expected_certificate"
+    printf '%s\n' "$manifest" > "$out_dir/$abi.manifest.txt"
+    assert_eq "$abi release diagnostic Activity" "$(grep -c DiagnosticActivity <<< "$manifest" || true)" "0"
+    assert_eq "$abi release debuggable" "$(grep -cE 'debuggable.*=(true|0xffffffff)' <<< "$manifest" || true)" "0"
+    local dex=$out_dir/$abi.dex.txt
+    : > "$dex"
+    local entry
+    while IFS= read -r entry; do
+      unzip -p "$apk" "$entry" | strings >> "$dex"
+    done < <(unzip -Z1 "$apk" | grep -E '^classes[0-9]*\.dex$')
+    assert_eq "$abi release DEX diagnostic entries and config bypass" "$(grep -cE 'DiagnosticActivity|nativeDiagnostic|nativeAwait|DIAGNOSTIC_APPLET|CONFIG_OVERRIDES' "$dex" || true)" "0"
+    local notice
+    while IFS= read -r notice; do
+      assert_eq "$abi bundled notice $notice" "$(unzip -p "$apk" "assets/notices/$notice" | sha256sum | cut -d' ' -f1)" "$(sha256sum "target/android-notices/assets/notices/$notice" | cut -d' ' -f1)"
+    done < <(find target/android-notices/assets/notices -type f -printf '%P\n' | sort)
+    assert_file "$abi notice index" target/android-notices/assets/notices/index.json
+  fi
   if "$BUILD_TOOLS/zipalign" -c -P 16 -v 4 "$apk" > "$out_dir/$abi.zipalign" 2>&1; then ok "$abi APK zipalign 4-byte, .so on 16 KiB pages"; else fail "$abi APK zipalign (see $out_dir/$abi.zipalign)"; fi
 }
 
@@ -271,7 +368,7 @@ inspect_tree() {
   local abi
   for abi in "${ABIS[@]}"; do
     echo "## $abi" >> "$OUT"
-    local so=$jni/$abi/$LIB apk=$apks/app-$abi-debug.apk
+    local so=$jni/$abi/$LIB apk=$apks/app-$abi-$VARIANT.apk
     assert_file "$abi native library" "$so"
     [ -f "$so" ] && inspect_so "$abi" "$so" "$symbols/$abi/$LIB" "$out_dir"
     assert_file "$abi APK" "$apk"
@@ -283,6 +380,7 @@ inspect_tree() {
 }
 
 cmd_inspect() {
+  set_variant "${1:-debug}"
   local status=0
   inspect_tree "$JNI_LIBS" "$SYMBOLS_DIR" "$APK_DIR" "$INSPECT_DIR" || status=$?
   local abi
@@ -312,12 +410,13 @@ expect_reject() {
 }
 
 cmd_inspect_selftest() {
+  set_variant "${1:-debug}"
   local dir
   dir=$(fixture accepts-shipping-tree)
   inspect_tree "$dir/jniLibs" "$dir/symbols" "$dir/apk" "$dir/out" || die "selftest: gate rejects the shipping tree (see $dir/out/inspect.txt)"
   echo "selftest accepts-shipping-tree: accepted"
 
-  dir=$(fixture missing-apk); rm "$dir/apk/app-arm64-v8a-debug.apk"
+  dir=$(fixture missing-apk); rm "$dir/apk/app-arm64-v8a-$VARIANT.apk"
   expect_reject missing-apk "arm64-v8a APK missing"
 
   dir=$(fixture missing-symbols); rm "$dir/symbols/x86_64/$LIB"
@@ -337,7 +436,7 @@ cmd_inspect_selftest() {
   expect_reject truncated-library "arm64-v8a LOAD segment alignment"
 
   dir=$(fixture stale-package); rm "$dir/jniLibs/x86_64/$LIB" "$dir/symbols/x86_64/$LIB"
-  unzip -p "$APK_DIR/app-x86_64-debug.apk" "lib/x86_64/$LIB" > "$dir/jniLibs/x86_64/$LIB"
+  unzip -p "$APK_DIR/app-x86_64-$VARIANT.apk" "lib/x86_64/$LIB" > "$dir/jniLibs/x86_64/$LIB"
   local text_off; text_off=$("$NDK_BIN/llvm-readelf" -S "$dir/jniLibs/x86_64/$LIB" | awk '{ for (i = 1; i <= NF; i++) if ($i == ".text") print $(i + 3) }')
   printf 'stale' | dd of="$dir/jniLibs/x86_64/$LIB" bs=1 seek="$(( 16#$text_off + 64 ))" conv=notrunc status=none
   cp "$dir/jniLibs/x86_64/$LIB" "$dir/symbols/x86_64/$LIB"
@@ -365,8 +464,9 @@ device_abi() { adb -s "$1" shell getprop ro.product.cpu.abi | tr -d '\r'; }
 
 cmd_install() {
   local serial=${1:?serial}
+  set_variant "${2:-debug}"
   local abi; abi=$(device_abi "$serial"); require_abi "$abi"
-  local apk=$APK_DIR/app-$abi-debug.apk
+  local apk=$APK_DIR/app-$abi-$VARIANT.apk
   [ -f "$apk" ] || die "no APK for $abi at $apk; run build first"
   adb -s "$serial" install -r "$apk"
 }
@@ -399,6 +499,10 @@ cmd_test() (
     local status=$?
     stop_logcat
     if [ "$fixture_files" = 1 ]; then
+      if [ "$suite" = release-sshmux ]; then
+        adb -s "$serial" pull "$SSHMUX_DEVICE_DIR/release-shots" "$results/" > "$results/screenshots-pull.txt" 2>&1 || true
+        adb -s "$serial" shell rm -rf "$SSHMUX_DEVICE_DIR/release-shots" || status=1
+      fi
       adb -s "$serial" shell rm -rf "$SSHMUX_PICKER_DIR" "$SSHMUX_DEVICE_DIR/fixture.properties" || status=1
     fi
     exit "$status"
@@ -407,7 +511,7 @@ cmd_test() (
   trap 'exit 130' INT
   trap 'exit 143' HUP TERM
   local fixture_suite=0
-  case "$suite" in sshmux|input|reconnect) fixture_suite=1 ;; esac
+  case "$suite" in sshmux|input|reconnect|release-sshmux) fixture_suite=1 ;; esac
   if [ "$fixture_suite" = 1 ]; then
     [ -f "$SSHMUX_FIXTURE/device/fixture.properties" ] || die "the $suite suite needs the owned fixture: ci/android-sshmux-fixture.sh up <address>"
   fi
@@ -418,10 +522,18 @@ cmd_test() (
     fi
   fi
   local abi; abi=$(device_abi "$serial"); require_abi "$abi"
-  cmd_check "$abi"
-  gradle :app:assembleDebug :app:assembleDebugAndroidTest
-  cmd_install "$serial"
-  adb -s "$serial" install -r android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+  local variant=debug
+  case "$suite" in release-load|release-sshmux) variant=release ;; esac
+  cmd_check "$abi" "$variant"
+  if [ "$variant" = release ]; then
+    signing_certificate > /dev/null
+    gradle -Pwezterm.releaseTests=true :app:assembleRelease :app:assembleReleaseAndroidTest
+    cmd_inspect release
+  else
+    gradle :app:assembleDebug :app:assembleDebugAndroidTest
+  fi
+  cmd_install "$serial" "$variant"
+  adb -s "$serial" install -r "android/app/build/outputs/apk/androidTest/$variant/app-$variant-androidTest.apk"
   if [ "$fixture_suite" = 1 ]; then
     fixture_files=1
     adb -s "$serial" shell "rm -rf $SSHMUX_DEVICE_DIR $SSHMUX_PICKER_DIR && mkdir -p $SSHMUX_DEVICE_DIR $SSHMUX_PICKER_DIR"
@@ -430,10 +542,11 @@ cmd_test() (
   fi
   for class in $classes; do
     local receipt=$results/$class
-    local command=(adb -s "$serial" shell am instrument -w -r
-      -e class "org.wezterm.android.$class"
-      -e configOverrides "$(shell_quote "${WEZTERM_ANDROID_CONFIG_OVERRIDES:-}")"
-      org.wezterm.android.test/androidx.test.runner.AndroidJUnitRunner)
+    local command=(adb -s "$serial" shell am instrument -w -r -e class "org.wezterm.android.$class")
+    if [ "$variant" = debug ]; then
+      command+=(-e configOverrides "$(shell_quote "${WEZTERM_ANDROID_CONFIG_OVERRIDES:-}")")
+    fi
+    command+=(org.wezterm.android.test/androidx.test.runner.AndroidJUnitRunner)
     printf '%q ' "${command[@]}" > "$receipt.command"
     printf '\n' >> "$receipt.command"
     (exec adb -s "$serial" logcat -v time 'wezterm:V' 'WezTermSurface:V' 'WezTermSshMuxTest:V' 'WezTermInputTest:V' 'TestRunner:V' 'AndroidRuntime:E' '*:S') > "$receipt.logcat" 2>&1 &
@@ -452,6 +565,7 @@ case "${1:-}" in
   provision)        shift; cmd_provision "$@" ;;
   native)           shift; cmd_native "$@" ;;
   build)            shift; cmd_build "$@" ;;
+  release)          shift; cmd_release "$@" ;;
   check)            shift; cmd_check "$@" ;;
   inspect)          shift; cmd_inspect "$@" ;;
   inspect-selftest) shift; cmd_inspect_selftest "$@" ;;

@@ -2,6 +2,7 @@
 import os
 import sys
 import glob
+import pathlib
 from copy import deepcopy
 
 # The build from this target will be pushed to the gemfury APT repo
@@ -412,7 +413,7 @@ rustup default {toolchain}
                 ),
                 # Vendor dependencies
                 RunStep(
-                    name="Vendor dependencies",
+                    name="Vendor dependecies",
                     condition="steps.cache-cargo-vendor.outputs.cache-hit != 'true'",
                     run="cargo vendor --locked --versioned-dirs >> .cargo/config",
                 ),
@@ -1159,6 +1160,86 @@ on:
     )
 
 
+def android_actions():
+    policy = dict(line.split("=", 1) for line in pathlib.Path("android/gradle.properties").read_text().splitlines()
+                  if line and not line.startswith("#"))
+    checkout = CheckoutStep()
+    setup = [
+        checkout,
+        ActionStep("Set up uv", "astral-sh/setup-uv@v6"),
+        ActionStep("Set up Android SDK", "android-actions/setup-android@v3"),
+        RunStep("Provision pinned Android inputs", f"""sdkmanager 'platforms;android-{policy['wezterm.compileSdk']}' 'build-tools;{policy['wezterm.buildToolsVersion']}' 'ndk;{policy['wezterm.ndkVersion']}'
+make android-provision"""),
+    ]
+    signing = RunStep("Create throwaway CI signing identity", """umask 077
+keydir=$(mktemp -d "$RUNNER_TEMP/android-signing.XXXXXX")
+openssl rand -base64 48 > "$keydir/password"
+"$HOME/.local/share/wezterm-android-toolchain/jdk-17.0.20.1+1/bin/keytool" -genkeypair -storetype PKCS12 -keystore "$keydir/ci.p12" -alias ci -storepass:file "$keydir/password" -keypass:file "$keydir/password" -keyalg RSA -keysize 3072 -validity 30 -dname 'CN=Throwaway Android CI,OU=Not release authority'
+chmod 600 "$keydir/ci.p12"
+printf 'WEZTERM_ANDROID_KEYSTORE=%s\\nWEZTERM_ANDROID_KEY_ALIAS=ci\\nWEZTERM_ANDROID_STORE_PASSWORD_FILE=%s\\nWEZTERM_ANDROID_KEY_PASSWORD_FILE=%s\\n' "$keydir/ci.p12" "$keydir/password" "$keydir/password" >> "$GITHUB_ENV"
+"""
+    )
+    jobs = {
+        "checks": setup + [
+            RunStep("Host dependencies", "sudo apt-get update && sudo env CI=yes PATH=$PATH ./get-deps --testing"),
+            RunStep("Host tests and doctests", "cargo test --locked -p wezterm-android && cargo test --locked -p wezterm-android --doc"),
+            RunStep("Parser controls", "uv run --no-project python ci/test_android_instrument.py"),
+            RunStep("Shipping checks", "ci/android.sh check arm64-v8a release && ci/android.sh check x86_64 release"),
+        ],
+        "artifacts": setup + [signing, RunStep("Signed release artifacts", "make android-release"),
+            ActionStep("Retain release receipts and symbols", "actions/upload-artifact@v7", params={
+                "name": "android-local-signed-release", "path": "android/app/build/outputs/apk/release/*.apk\nandroid/app/build/outputs/mapping/release/\ntarget/android-release/symbols/\ntarget/android-release/inspect/\ntarget/android-release/receipts/", "if-no-files-found": "error"})],
+    }
+    for api, port in [(24, 5560), (35, 5558)]:
+        serial = f"emulator-{port}"
+        suites = "native-load" if api == 24 else "native-load surface lifecycle"
+        jobs[f"api{api}"] = setup + [signing,
+            RunStep("Enable KVM", "sudo chmod 666 /dev/kvm"),
+            RunStep("Assemble and test an explicit emulator", f"""set -euo pipefail
+sdkmanager 'emulator' 'system-images;android-{api};google_apis;x86_64'
+printf 'no\\n' | avdmanager create avd --name android-ci-{api} --package 'system-images;android-{api};google_apis;x86_64'
+(exec "$ANDROID_HOME/emulator/emulator" -avd android-ci-{api} -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader -port {port} -cores 2 -memory 2560) > "$RUNNER_TEMP/emulator.log" 2>&1 &
+pid=$!
+cleanup() {{ status=$?; kill "$pid" 2>/dev/null || true; wait "$pid" || true; exit "$status"; }}
+trap cleanup EXIT
+# API24 logs boot-completed dispatch, API35 its completion; retained logs close the subscription race.
+timeout 600 bash -c 'adb -s "$1" wait-for-device && exec adb -s "$1" logcat -b system -v brief -s ActivityManager:D UserController:D -e "Sending BOOT_COMPLETE user #0|Finished processing BOOT_COMPLETED for u0" -m 1' _ {serial}
+test "$(adb -s {serial} shell getprop sys.boot_completed | tr -d '\\r')" = 1
+adb -s {serial} shell pm path android
+for suite in {suites}; do make android-test SERIAL={serial} SUITE="$suite"; done
+adb -s {serial} uninstall org.wezterm.android.test
+adb -s {serial} uninstall org.wezterm.android
+make android-test SERIAL={serial} SUITE=release-load""", env={
+                "WEZTERM_ANDROID_CONFIG_OVERRIDES": "'webgpu_preferred_adapter={name=\"Android Emulator OpenGL ES Translator (Google SwiftShader)\",backend=\"Gl\",device_type=\"Cpu\"}'"}),
+            ActionStep("Retain literal emulator receipts", "actions/upload-artifact@v7", params={
+                "name": f"android-api{api}-receipts", "path": "android/app/build/outputs/androidTest-results/\n${{ runner.temp }}/emulator.log", "if-no-files-found": "error"}, condition="always()"),
+        ]
+    with open(".github/workflows/gen_android.yml", "w") as output:
+        output.write("""name: Android
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+""")
+        for name, steps in jobs.items():
+            output.write(f"  {name}:\n    runs-on: ubuntu-24.04\n    env:\n      CARGO_BUILD_JOBS: '2'\n      RUSTUP_TOOLCHAIN: '{policy['wezterm.rustToolchain']}'\n")
+            Job("ubuntu-24.04", steps=steps).render(output, 3)
+        output.write("""  android-success:
+    runs-on: ubuntu-24.04
+    if: always()
+    needs: [checks, artifacts, api24, api35]
+    steps:
+      - name: Require every Android job
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: echo "$RESULTS" | jq -e 'all(.[]; .result == "success")'
+""")
+
+
 def remove_gen_actions():
     for name in glob.glob(".github/workflows/gen_*.yml"):
         os.remove(name)
@@ -1168,3 +1249,4 @@ remove_gen_actions()
 generate_pr_actions()
 continuous_actions()
 tag_actions()
+android_actions()
