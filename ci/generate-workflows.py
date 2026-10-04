@@ -1181,14 +1181,14 @@ printf 'WEZTERM_ANDROID_KEYSTORE=%s\\nWEZTERM_ANDROID_KEY_ALIAS=ci\\nWEZTERM_AND
     )
     jobs = {
         "checks": setup + [
-            RunStep("Host dependencies", "sudo apt-get update && sudo env CI=yes PATH=$PATH ./get-deps --testing"),
+            RunStep("Host dependencies", "sudo apt-get update && CI=yes ./get-deps --testing"),
             RunStep("Host tests and doctests", "cargo test --locked -p wezterm-android && cargo test --locked -p wezterm-android --doc"),
             RunStep("Parser controls", "uv run --no-project python ci/test_android_instrument.py"),
             RunStep("Shipping checks", "ci/android.sh check arm64-v8a release && ci/android.sh check x86_64 release"),
         ],
         "artifacts": setup + [signing, RunStep("Signed release artifacts", "make android-release"),
             ActionStep("Retain release receipts and symbols", "actions/upload-artifact@v7", params={
-                "name": "android-local-signed-release", "path": "android/app/build/outputs/apk/release/*.apk\nandroid/app/build/outputs/mapping/release/\ntarget/android-release/symbols/\ntarget/android-release/inspect/\ntarget/android-release/receipts/", "if-no-files-found": "error"})],
+                "name": "android-local-signed-release", "path": "android/app/build/outputs/apk/release/*.apk\nandroid/app/build/outputs/mapping/release/\ntarget/android-release/jniLibs/\ntarget/android-release/symbols/\ntarget/android-release/inspect/\ntarget/android-release/receipts/\ntarget/android-notices/assets/notices/", "if-no-files-found": "error"}, condition="always()")],
     }
     for api, port in [(24, 5560), (35, 5558)]:
         serial = f"emulator-{port}"
@@ -1196,23 +1196,72 @@ printf 'WEZTERM_ANDROID_KEYSTORE=%s\\nWEZTERM_ANDROID_KEY_ALIAS=ci\\nWEZTERM_AND
         jobs[f"api{api}"] = setup + [signing,
             RunStep("Enable KVM", "sudo chmod 666 /dev/kvm"),
             RunStep("Assemble and test an explicit emulator", f"""set -euo pipefail
-sdkmanager 'emulator' 'system-images;android-{api};google_apis;x86_64'
-printf 'no\\n' | avdmanager create avd --name android-ci-{api} --package 'system-images;android-{api};google_apis;x86_64'
-(exec "$ANDROID_HOME/emulator/emulator" -avd android-ci-{api} -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader -port {port} -cores 2 -memory 2560) > "$RUNNER_TEMP/emulator.log" 2>&1 &
-pid=$!
-cleanup() {{ status=$?; kill "$pid" 2>/dev/null || true; wait "$pid" || true; exit "$status"; }}
+diag="$RUNNER_TEMP/wezterm-emu/diagnostics"
+export ANDROID_AVD_HOME="$RUNNER_TEMP/wezterm-emu/avd"
+export ANDROID_USER_HOME="$RUNNER_TEMP/wezterm-emu/user"
+mkdir -p "$diag" "$ANDROID_AVD_HOME" "$ANDROID_USER_HOME"
+pid= logcat_pid=
+cleanup() {{
+  status=$?
+  trap - EXIT
+  set +e
+  printf '%s\\n' "$status" > "$diag/step.exit"
+  if [ -n "$pid" ]; then
+    ps -p "$pid" -o pid,ppid,args > "$diag/emulator-process.txt" 2>&1
+    # Empirical 30s snapshot budget; not another boot wait or readiness check.
+    timeout 30 adb -s {serial} get-state > "$diag/transport-final.txt" 2>&1
+    printf '%s\\n' "$?" > "$diag/transport-final.exit"
+    timeout 30 adb -s {serial} shell getprop sys.boot_completed > "$diag/boot-status-final.txt" 2>&1
+    printf '%s\\n' "$?" > "$diag/boot-status-final.exit"
+    timeout 30 adb -s {serial} logcat -b all -d -v threadtime > "$diag/logcat-final.txt" 2>&1
+    printf '%s\\n' "$?" > "$diag/logcat-final.exit"
+  fi
+  if [ -n "$logcat_pid" ]; then
+    kill "$logcat_pid" 2>/dev/null
+    wait "$logcat_pid"
+    printf '%s\\n' "$?" > "$diag/logcat.exit"
+  fi
+  if [ -n "$pid" ]; then
+    kill "$pid" 2>/dev/null
+    wait "$pid"
+    printf '%s\\n' "$?" > "$diag/emulator.exit"
+  fi
+  exit "$status"
+}}
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' HUP TERM
+printf 'serial={serial}\\nANDROID_HOME=%s\\nANDROID_AVD_HOME=%s\\nANDROID_USER_HOME=%s\\n' "$ANDROID_HOME" "$ANDROID_AVD_HOME" "$ANDROID_USER_HOME" > "$diag/owner.txt"
+sdkmanager 'emulator' 'system-images;android-{api};google_apis;x86_64'
+"$ANDROID_HOME/emulator/emulator" -version > "$diag/emulator-version.txt" 2>&1
+cp "$ANDROID_HOME/emulator/source.properties" "$diag/emulator-source.properties"
+cp "$ANDROID_HOME/system-images/android-{api}/google_apis/x86_64/source.properties" "$diag/image-source.properties"
+printf 'no\\n' | avdmanager create avd --name android-ci-{api} --path "$ANDROID_AVD_HOME/android-ci-{api}.avd" --package 'system-images;android-{api};google_apis;x86_64' > "$diag/avd-create.txt" 2>&1
+# Both tools must use the same index; fail before launch if creation did not publish it.
+test -f "$ANDROID_AVD_HOME/android-ci-{api}.ini"
+cp "$ANDROID_AVD_HOME/android-ci-{api}.ini" "$diag/avd.ini"
+cp "$ANDROID_AVD_HOME/android-ci-{api}.avd/config.ini" "$diag/avd-config.ini"
+(exec "$ANDROID_HOME/emulator/emulator" -avd android-ci-{api} -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader -port {port} -cores 2 -memory 2560) > "$diag/emulator.log" 2>&1 &
+pid=$!
+printf '%s\\n' "$pid" > "$diag/emulator.pid"
+(exec adb -s {serial} logcat -b all -v threadtime) > "$diag/logcat.txt" 2>&1 &
+logcat_pid=$!
+printf '%s\\n' "$logcat_pid" > "$diag/logcat.pid"
 # API24 logs boot-completed dispatch, API35 its completion; retained logs close the subscription race.
-timeout 600 bash -c 'adb -s "$1" wait-for-device && exec adb -s "$1" logcat -b system -v brief -s ActivityManager:D UserController:D -e "Sending BOOT_COMPLETE user #0|Finished processing BOOT_COMPLETED for u0" -m 1' _ {serial}
-test "$(adb -s {serial} shell getprop sys.boot_completed | tr -d '\\r')" = 1
-adb -s {serial} shell pm path android
+boot_status=0
+timeout 600 bash -c 'adb -s "$1" wait-for-device && exec adb -s "$1" logcat -b system -v brief -s ActivityManager:D UserController:D -e "Sending BOOT_COMPLETE user #0|Finished processing BOOT_COMPLETED for u0" -m 1' _ {serial} > "$diag/boot-event.txt" 2>&1 || boot_status=$?
+printf '%s\\n' "$boot_status" > "$diag/boot-wait.exit"
+[ "$boot_status" = 0 ] || exit "$boot_status"
+adb -s {serial} shell getprop sys.boot_completed > "$diag/boot-status.txt"
+test "$(tr -d '\\r' < "$diag/boot-status.txt")" = 1
+adb -s {serial} shell pm path android > "$diag/package-manager.txt"
 for suite in {suites}; do make android-test SERIAL={serial} SUITE="$suite"; done
 adb -s {serial} uninstall org.wezterm.android.test
 adb -s {serial} uninstall org.wezterm.android
 make android-test SERIAL={serial} SUITE=release-load""", env={
                 "WEZTERM_ANDROID_CONFIG_OVERRIDES": "'webgpu_preferred_adapter={name=\"Android Emulator OpenGL ES Translator (Google SwiftShader)\",backend=\"Gl\",device_type=\"Cpu\"}'"}),
             ActionStep("Retain literal emulator receipts", "actions/upload-artifact@v7", params={
-                "name": f"android-api{api}-receipts", "path": "android/app/build/outputs/androidTest-results/\n${{ runner.temp }}/emulator.log", "if-no-files-found": "error"}, condition="always()"),
+                "name": f"android-api{api}-receipts", "path": "android/app/build/outputs/androidTest-results/\n${{ runner.temp }}/wezterm-emu/diagnostics/\nandroid/app/build/outputs/apk/release/*.apk\ntarget/android-release/jniLibs/\ntarget/android-release/inspect/", "if-no-files-found": "error"}, condition="always()"),
         ]
     with open(".github/workflows/gen_android.yml", "w") as output:
         output.write("""name: Android

@@ -193,7 +193,7 @@ cmd_release() {
   set_variant release
   signing_certificate > /dev/null
   gradle :app:assembleRelease :app:lintRelease :app:testReleaseUnitTest
-  cmd_inspect release
+  # Preserve inputs and artifacts even when the inspection gate rejects them.
   local receipts=target/android-release/receipts
   mkdir -p "$receipts"
   git rev-parse HEAD > "$receipts/parent.txt"
@@ -207,13 +207,19 @@ cmd_release() {
     cargo ndk --version
     "$JAVA_HOME/bin/java" -version 2>&1
     gradle --version
+    printf 'ANDROID_HOME=%s\nANDROID_NDK_HOME=%s\nNDK_BIN=%s\n' "$ANDROID_HOME" "$ANDROID_NDK_HOME" "$NDK_BIN"
     cat "$ANDROID_NDK_HOME/source.properties"
+    "$NDK_BIN/clang" --version
+    "$NDK_BIN/llvm-readelf" --version
+    "$NDK_BIN/llvm-objcopy" --version
+    sha256sum "$NDK_BIN/clang" "$NDK_BIN/llvm-readelf" "$NDK_BIN/llvm-objcopy"
     cat android/gradle.properties android/gradle/wrapper/gradle-wrapper.properties
     printf 'native profile: release; opt-level=3; debug=2; locked Cargo resolution\n'
   } > "$receipts/tools.txt"
   find "$GRADLE_USER_HOME/caches/modules-2/files-2.1" -type f -print0 | sort -z | xargs -0 sha256sum > "$receipts/gradle-inputs.sha256"
-  find "$APK_DIR" "$SYMBOLS_DIR" target/android-notices/assets -type f -print0 | sort -z | xargs -0 sha256sum > "$receipts/artifacts.sha256"
+  find "$APK_DIR" "$JNI_LIBS" "$SYMBOLS_DIR" target/android-notices/assets -type f -print0 | sort -z | xargs -0 sha256sum > "$receipts/artifacts.sha256"
   signing_certificate > "$receipts/certificate.sha256"
+  cmd_inspect release
 }
 
 cmd_check() {
@@ -280,7 +286,10 @@ inspect_so() {
   assert_eq "$abi DT_NEEDED outside {${PERMITTED_NEEDED[*]}} [$needed]" "${disallowed# }" ""
   local comment; comment=$("$NDK_BIN/llvm-readelf" -p .comment "$so" 2>/dev/null || true)
   assert_eq "$abi built by pinned rustc" "$(grep -o "rustc version $RUST_TOOLCHAIN " <<< "$comment" | head -1)" "rustc version $RUST_TOOLCHAIN "
-  local ident; ident=$("$NDK_BIN/llvm-readelf" -p .note.android.ident "$so" 2>/dev/null || true)
+  "$NDK_BIN/llvm-readelf" -p .note.android.ident "$so" > "$out_dir/$abi.android-ident.txt" 2> "$out_dir/$abi.android-ident.stderr" || true
+  "$NDK_BIN/llvm-readelf" -n -x .note.android.ident "$so" > "$out_dir/$abi.android-notes.txt" 2>&1 || true
+  "$NDK_BIN/llvm-objcopy" --dump-section .note.android.ident="$out_dir/$abi.android-ident.bin" "$so" /dev/null > "$out_dir/$abi.android-ident-objcopy.txt" 2>&1 || true
+  local ident; ident=$(< "$out_dir/$abi.android-ident.txt")
   assert_eq "$abi .note.android.ident names NDK r$ndk_major build $ndk_build" "$(grep -cE "^\[ *[0-9a-f]+\] (r$ndk_major|$ndk_build)$" <<< "$ident")" "2"
   "$NDK_BIN/llvm-nm" -D --defined-only "$so" 2>/dev/null | awk '$2=="T" && $3 ~ /^Java_/ {print $3}' | sort > "$out_dir/$abi.jni-exports"
   local export
@@ -362,6 +371,13 @@ inspect_tree() {
   mkdir -p "$out_dir"
   OUT=$out_dir/inspect.txt
   FAILURES=0
+  {
+    printf 'ANDROID_NDK_HOME=%s\nNDK_BIN=%s\nexpected NDK=%s\n' "$ANDROID_NDK_HOME" "$NDK_BIN" "$NDK_VERSION"
+    cat "$ANDROID_NDK_HOME/source.properties"
+    "$NDK_BIN/llvm-readelf" --version
+    "$NDK_BIN/llvm-objcopy" --version
+    sha256sum "$NDK_BIN/llvm-readelf" "$NDK_BIN/llvm-objcopy"
+  } > "$out_dir/ndk-tools.txt" 2>&1
   : > "$OUT" "$out_dir/cert-digests"
   echo "# wezterm-android inspection $(date -u +%Y-%m-%dT%H:%M:%SZ) head=$(git rev-parse HEAD)" >> "$OUT"
   echo "minSdk=$ANDROID_MIN_API ndk=$NDK_VERSION build-tools=$BUILD_TOOLS_VERSION rust=$RUST_TOOLCHAIN ($(rustc --version))" >> "$OUT"
