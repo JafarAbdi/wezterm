@@ -53,8 +53,8 @@ class TerminalActivity : Activity(), SurfaceHolder.Callback, PlatformRequests.Li
         super.onCreate(savedInstanceState)
         val engine = NativeApp.startTerminal(
             this,
-            intent.getStringExtra(EXTRA_CONFIG_OVERRIDES) ?: "",
-            intent.getBooleanExtra(EXTRA_DIAGNOSTIC_APPLET, false),
+            if (BuildConfig.DEBUG) intent.getStringExtra(EXTRA_CONFIG_OVERRIDES) ?: "" else "",
+            BuildConfig.DEBUG && intent.getBooleanExtra(EXTRA_DIAGNOSTIC_APPLET, false),
         )
         Log.i(TAG, "engine $engine")
         connection = ConnectionPanel(this) {

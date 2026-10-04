@@ -192,27 +192,26 @@ pub fn adapter_info_to_gpu_info(info: wgpu::AdapterInfo) -> GpuInfo {
     }
 }
 
-/// The instance backends to create: all of them, except on Android,
-/// where a `webgpu_preferred_adapter` narrows them to the one it names.
-///
-/// Each backend creates its own surface on the window.  On Android a
-/// Vulkan surface connects the native window as a producer, after which
-/// the GL backend cannot create its EGL surface on the same window, so a
-/// preference for the GL adapter must keep Vulkan away from the window.
-/// Other platforms keep every backend, so a preference that matches no
-/// adapter still falls back across backends.
+/// Android creates just one backend: GL by default, or an explicit Vulkan
+/// preference. API 24 does not guarantee Vulkan support. Creating both surfaces
+/// lets Vulkan connect the native window's producer before GL can create EGL.
+/// Other platforms keep every backend, including for an unmatched preference.
 fn instance_backends(config: &ConfigHandle) -> wgpu::Backends {
     if !cfg!(target_os = "android") {
         return wgpu::Backends::all();
     }
-    let backend = config
-        .webgpu_preferred_adapter
-        .as_ref()
-        .map(|preference| preference.backend.as_str());
+    android_instance_backends(
+        config
+            .webgpu_preferred_adapter
+            .as_ref()
+            .map(|preference| preference.backend.as_str()),
+    )
+}
+
+fn android_instance_backends(backend: Option<&str>) -> wgpu::Backends {
     match backend {
         Some("Vulkan") => wgpu::Backends::VULKAN,
-        Some("Gl") => wgpu::Backends::GL,
-        _ => wgpu::Backends::all(),
+        _ => wgpu::Backends::GL,
     }
 }
 
@@ -252,6 +251,8 @@ impl WebGpuState {
         config: &ConfigHandle,
     ) -> anyhow::Result<Self> {
         let backends = instance_backends(config);
+        #[cfg(target_os = "android")]
+        log::info!("Android wgpu instance backends: {backends:?}");
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends,
             ..Default::default()
@@ -341,6 +342,8 @@ impl WebGpuState {
         })?;
 
         let adapter_info = adapter.get_info();
+        #[cfg(target_os = "android")]
+        log::info!("Android wgpu adapter: {adapter_info:?}");
         log::trace!("Using adapter: {adapter_info:?}");
         let caps = surface.get_capabilities(&adapter);
         log::trace!("caps: {caps:?}");
@@ -596,5 +599,30 @@ impl WebGpuState {
             // <https://github.com/wezterm/wezterm/issues/2881>
             self.surface.configure(&self.device, &config);
         }
+    }
+}
+
+#[cfg(test)]
+mod backend_tests {
+    use super::*;
+
+    #[test]
+    fn android_uses_one_native_window_producer() {
+        for preference in [None, Some("Gl"), Some("Metal"), Some("")] {
+            assert_eq!(android_instance_backends(preference), wgpu::Backends::GL);
+        }
+        assert_eq!(
+            android_instance_backends(Some("Vulkan")),
+            wgpu::Backends::VULKAN
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn desktop_keeps_all_backends() {
+        assert_eq!(
+            instance_backends(&ConfigHandle::default_config()),
+            wgpu::Backends::all()
+        );
     }
 }

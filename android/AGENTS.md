@@ -95,7 +95,7 @@ answer while nothing waits on it.
 `nativeSurfaceStatus` exposes the counters (`revision`, `generation`,
 `frames_presented`, `stale_events`, `retire_acks`, `live_leases`,
 `windows`, `closed_windows`, `clipboard_requests`, `clipboard_responses`,
-`loop_wakeups`); `nativeAwaitSurfaceChange`, `nativeAwaitSurfaceFrames` and
+`loop_wakeups`); Debug-only `nativeAwaitSurfaceChange`, `nativeAwaitSurfaceFrames` and
 `nativeAwaitSurfaceState` are condition waits on them. A surface destroy
 publishes `absent` before it releases the lease; the shutdown releases the
 lease first and publishes `absent` after. The thread inside
@@ -459,11 +459,11 @@ Gradle and the script.
 
 - Toolchain table (ABI, Rust target, ELF machine) is in `ci/android.sh`.
   Shipping ABI is `arm64-v8a`; `x86_64` is for the emulator.
-- Gradle's `preBuild` depends on `cargoNative_<abi>` for every ABI in
-  `wezterm.abis`, which runs `ci/android.sh native <abi>` from the repo root.
-  `build` and `test` therefore always package the native library of the
-  current source for every ABI; `native` alone never runs Gradle, so the
-  path is not recursive. Do not narrow the ABI split per invocation: Gradle
+- Gradle's `preDebugBuild` and `preReleaseBuild` depend on their respective
+  `cargoNative_<variant>_<abi>` tasks for every ABI in `wezterm.abis`, running
+  `ci/android.sh native <abi> <variant>` from the repo root. Builds and tests
+  therefore package the current variant's native source for every ABI;
+  `native` alone never runs Gradle, so the path is not recursive. Do not narrow the ABI split per invocation: Gradle
   deletes the APKs of ABIs missing from the split, which breaks `inspect`.
 - `minSdk=24`. Rust std needs 21, bionic `openpty()` (linked through
   `portable-pty`) needs 23, `libvulkan.so` for wgpu ships from 24. The
@@ -494,11 +494,13 @@ Gradle and the script.
   `inspect-selftest` proves the gate rejects missing, foreign, truncated and
   stale artifacts, symbols without DWARF, DWARF left in jniLibs, and
   symbols whose `.text` or defined symbols differ from the shipped
-  library, using symlinked fixture trees under
-  `target/android-inspect/selftest/`.
+  library, using symlinked fixture trees under the variant's inspection
+  directory.
 - `test <serial> <suite>` requires an explicit serial and runs `check`
-  for its ABI first. Gradle only assembles `assembleDebug` and
-  `assembleDebugAndroidTest`; the runner installs both APKs and invokes
+  for its ABI and selected variant first. Default suites assemble
+  `assembleDebug` and `assembleDebugAndroidTest`; `release-load` and
+  `release-sshmux` assemble `assembleRelease` and `assembleReleaseAndroidTest`. The runner installs
+  the selected app/test pair and invokes
   `am instrument` through `adb -s <serial>`. No device enumeration or
   Gradle connected/provider task is used. `ci/android_instrument.py`
   owns the exact method inventory and process plan. Run its negative
@@ -606,14 +608,17 @@ Gradle and the script.
   `WEZTERM_ANDROID_CONFIG_OVERRIDES` (`key=value` lines, debug builds only)
   reaches `TerminalActivity` as an intent extra; the same extra
   (`org.wezterm.android.CONFIG_OVERRIDES`) works with `am start --es`.
-- The API 35 x86_64 emulator with `-gpu swiftshader` aborts the whole
-  emulator process when wgpu creates a Vulkan pipeline (its SwiftShader
-  rejects naga's `OpSource WGSL`). Pin the GL adapter there:
-  `webgpu_preferred_adapter={name="Android Emulator OpenGL ES Translator (Google SwiftShader)",backend="Gl",device_type="Cpu"}`.
-  On Android only, `WebGpuState` instantiates just the preferred backend (a
-  Vulkan surface would connect the native window and block EGL); desktop
-  keeps every backend. Device creation retries with the WebGL2 limit
-  profile for GLES 3.0 adapters.
+- Android `WebGpuState` instantiates one backend: GL by default, or Vulkan
+  for an explicit `webgpu_preferred_adapter.backend="Vulkan"`; `"Gl"` also
+  narrows to GL. API 24 does not guarantee Vulkan support. Creating both
+  backend surfaces lets Vulkan connect the native window's producer before
+  GL can create EGL. This production default needs no debug override or GPU
+  name match; desktop retains every backend regardless of preference.
+  Backend mask and selected adapter metadata log at info on Android only,
+  without terminal/input payload. Physical GL/Vulkan behavior is unverified.
+  Explicit Vulkan on the API35 SwiftShader emulator can abort at pipeline
+  creation (`OpSource WGSL`); there is no automatic backend retry. The existing
+  WebGL2 device-limit retry remains for GLES 3.0 adapters.
 - Debug APKs are signed with the Android debug keystore. `native` keeps
   the unstripped library in `target/android-symbols/<abi>/` and writes a
   `llvm-strip --strip-debug` copy to jniLibs: same `.text` and symbol
@@ -625,3 +630,75 @@ Gradle and the script.
   built after a commit embed that commit. `.tag` still wins when present.
 - Preserve the workspace's editions, nightly `rustfmt`, and licenses. Only
   `wezterm-android` opts into `[workspace.lints]`.
+
+## Release boundary
+
+Release uses Cargo's optimized release profile with `debug=2` for separate
+DWARF, without changing desktop profile defaults. Never narrow the configured
+ABI split to save space or replace a failed release with debug bytes.
+
+The diagnostic Activity and its manifest entry live in `src/debug`.
+R8 removes unused diagnostic JNI declarations and intent-extra handling
+from release DEX. Rust `cfg(debug_assertions)` removes fault, census,
+wait-only JNI exports, startup overrides, and the diagnostic GUI option
+from release. The production initialization entry stays available for the
+native-load prerequisite. `inspect release` checks actual packaged DEX,
+manifest, native exports, notices, symbols, alignment, and signing identity.
+UI visibility and `BuildConfig.DEBUG` assertions alone are not release gates.
+
+Signing configuration reads private file inputs only for explicit Release
+tasks. Task-graph validation rejects implicit release tasks without that
+configuration. Files must be outside the repository and mode `0600`.
+No signing credential is an artifact. The certificate receipt identifies a
+signature, not authority to publish or deploy.
+
+`ci/android_notices.py` derives the Rust dependency closure, preserves
+available upstream license files and metadata, copies native notices, and
+extracts copyright and license fields from the actual bundled font name
+tables. Dependencies without separate license text remain explicit in the
+index and build output. Missing embedded font metadata is reported separately;
+verified upstream font notices retain their provenance. This inventory is not
+a legal compliance verdict. Static libssh LGPL obligations, including the
+applicable source/relinking obligations, are not discharged by bundling COPYING.
+
+`wezterm.releaseTests=true` selects only `src/releaseTest` instrumentation,
+so diagnostic test references cannot retain release diagnostics through R8.
+The shared parser owns the release inventories. Default debug suites and
+their fixtures retain their existing source sets and method inventories.
+
+`release-sshmux` is separate releaseTest instrumentation against the existing
+owned self-Tailscale-address fixture (local route through `lo`). It uses the
+production key picker, fingerprint Trust dialog, public Android input and
+connection controls, kept JNI status/counters, and a disconnected-input JNI
+submission. State synchronization uses Android display events, not diagnostic
+wait exports or optimized Kotlin internals. Host pane census, literal shell
+receipt and screenshots must corroborate instrumentation; the suite alone
+cannot establish same-pane bytes or private/physical acceptance. No fixture or
+production mode is introduced. Release invocations omit debug config arguments.
+
+Android CI is generated by `ci/generate-workflows.py`. Its aggregate gate
+requires checks, artifacts, API24, and API35 jobs to succeed. Emulator jobs
+assemble with Gradle and run through explicit serials in the shared runner.
+Boot synchronization uses adb's transport wait and the framework's retained
+boot-completed log (API24 dispatch, API35 completion), then one property and
+PackageManager check. The earlier enable-screen event is not a boot-completed
+barrier. There is no boot polling subprocess loop.
+No AGP connected, provider, or discovery task is allowed. CI signing is a
+throwaway test identity, not the retained delivery identity. Those jobs are
+planned behavior until the forge runs them. They do not verify a phone,
+private flow, host trust, remote input, or operator usability.
+
+## Acceptance and preservation
+
+Release preparation does not close ANDROID-07. Physical ARM64, an authorized
+separate private endpoint and identity, route proof, full phone suites,
+hardware metrics, and human review are required external gates. Missing
+proof is BLOCKED, never a successful empty test inventory.
+
+Retain the parent source and all raw failed controls. Freeze source hashes
+and APK, test APK, ELF, certificate, notice, tool, and literal XML receipts.
+Stop owned writers before archiving symbols and sealing the manifest.
+Only owned regenerable caches can be reclaimed after proving no active
+builds. Keep raw symbols, protected desktop binaries, fixtures, prior
+archives, other devices, and operator data. Independent exact-head review
+and all Git topology remain root responsibilities.

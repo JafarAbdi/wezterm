@@ -33,8 +33,10 @@ pub struct StartRequest {
     /// Paths, density and logging, as for `initialize`.
     pub init: InitRequest,
     /// Debug builds only: open the diagnostic applet window.
+    #[cfg(debug_assertions)]
     pub diagnostic_applet: bool,
     /// Extra `key=value` config overrides (Lua expressions), debug only.
+    #[cfg(debug_assertions)]
     pub config_overrides: Vec<(String, String)>,
 }
 
@@ -313,7 +315,7 @@ fn run_gui(request: StartRequest) -> Result<(), EngineEnd> {
         return Err(failed(EngineStage::Init, format!("{stage:?}: {message}")));
     }
 
-    let mut overrides = vec![
+    let overrides = vec![
         ("check_for_updates".to_string(), "false".to_string()),
         // A laptop mux without panes, or a lost connection, is a state the
         // app shows; it never ends the engine.
@@ -322,13 +324,19 @@ fn run_gui(request: StartRequest) -> Result<(), EngineEnd> {
             "false".to_string(),
         ),
     ];
-    overrides.extend(request.config_overrides);
+    #[cfg(debug_assertions)]
+    let overrides = {
+        let mut overrides = overrides;
+        overrides.extend(request.config_overrides);
+        overrides
+    };
     config::set_config_overrides(&overrides)
         .map_err(|err| failed(EngineStage::ConfigOverrides, format!("{err:#}")))?;
     config::reload();
 
     let options = wezterm_gui::android::GuiOptions {
         dpi: request.init.dpi as usize,
+        #[cfg(debug_assertions)]
         diagnostic_applet: request.diagnostic_applet,
     };
     wezterm_gui::android::run(options, || {
@@ -533,7 +541,7 @@ impl DiagnosticCommand {
 
 /// Run `command` on the GUI thread.  False when no GUI thread accepts
 /// work; for `PanicWithClipboardRead`, also when the read did not fail.
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, not(doc)))]
 pub fn diagnostic(command: DiagnosticCommand) -> bool {
     use wezterm_gui::android::diagnostic;
     if !matches!(engine_state(), EngineState::Running { .. }) {

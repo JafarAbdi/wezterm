@@ -35,7 +35,7 @@ class InstrumentTest(unittest.TestCase):
         self.assertEqual({case.attrib["name"] for case in root}, set(self.methods))
 
     def test_all_plans_keep_process_boundaries(self) -> None:
-        self.assertEqual([len(instrument.entries(suite)) for suite in instrument.EXPECTED], [1, 1, 6, 14, 1, 13])
+        self.assertEqual([len(instrument.entries(suite)) for suite in instrument.EXPECTED], [1, 1, 1, 1, 6, 14, 1, 13])
         for suite in instrument.EXPECTED:
             for entry in instrument.entries(suite):
                 class_name, separator, method = entry.partition("#")
@@ -44,12 +44,34 @@ class InstrumentTest(unittest.TestCase):
                 self.assertEqual(len(root), len(methods))
 
     def test_inventory_matches_unchanged_test_sources(self) -> None:
-        directory = pathlib.Path(__file__).parents[1] / "android/app/src/androidTest/java/org/wezterm/android"
-        for classes in instrument.EXPECTED.values():
+        for suite, classes in instrument.EXPECTED.items():
+            source_set = "releaseTest" if suite in {"release-load", "release-sshmux"} else "androidTest"
+            directory = pathlib.Path(__file__).parents[1] / f"android/app/src/{source_set}/java/org/wezterm/android"
             for class_name, methods in classes.items():
                 source = (directory / f"{class_name}.kt").read_text()
                 actual = re.findall(r"@Test\s+fun (\w+)\(", source)
                 self.assertCountEqual(methods, actual, class_name)
+
+    def test_release_load_requires_both_production_methods(self) -> None:
+        methods = instrument.EXPECTED["release-load"]["NativeLoadReleaseTest"]
+        self.assertEqual(methods, ["closureLoadsAndInitializesOnce", "publicLaunchRefusesForeignAddressesAndOpensTheDocumentPicker"])
+        root = instrument.parse("release-load", "NativeLoadReleaseTest", receipt("NativeLoadReleaseTest", methods), 0)
+        self.assertEqual(root.attrib["tests"], "2")
+        with self.assertRaises(ValueError):
+            instrument.parse("release-load", "NativeLoadReleaseTest", receipt("NativeLoadReleaseTest", methods[:1]), 0)
+        with self.assertRaises(ValueError):
+            instrument.parse("release-load", "NativeLoadReleaseTest", receipt("NativeLoadReleaseTest", methods), 1)
+
+    def test_release_sshmux_requires_the_production_flow_method(self) -> None:
+        methods = instrument.EXPECTED["release-sshmux"]["ReleaseSshMuxTest"]
+        self.assertEqual(instrument.entries("release-sshmux"), ["ReleaseSshMuxTest"])
+        root = instrument.parse("release-sshmux", "ReleaseSshMuxTest", receipt("ReleaseSshMuxTest", methods), 0)
+        self.assertEqual(root.attrib["tests"], "1")
+        for text, adb_exit in [(receipt("ReleaseSshMuxTest", []), 0),
+                               (receipt("ReleaseSshMuxTest", methods), 1),
+                               (receipt("ReleaseSshMuxTest", methods).replace("STATUS_CODE: 0", "STATUS_CODE: -3"), 0)]:
+            with self.assertRaises(ValueError):
+                instrument.parse("release-sshmux", "ReleaseSshMuxTest", text, adb_exit)
 
     def test_failure(self) -> None:
         self.reject(self.text.replace("INSTRUMENTATION_STATUS_CODE: 0", "INSTRUMENTATION_STATUS_CODE: -2", 1))

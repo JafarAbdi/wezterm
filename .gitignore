@@ -73,3 +73,5 @@ dhat-heap.json
 /android/local.properties
 /ci/android.local.env
 /android/.kotlin/
+!/android/app/src/debug/
+!/android/app/src/debug/**

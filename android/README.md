@@ -4,11 +4,10 @@ Native Android client that attaches to a laptop's WezTerm multiplexer over
 SSH through your own Tailscale network. Everything you type runs on the
 laptop.
 
-Current state: the app attaches to the laptop's mux server, renders its
-existing windows and panes with WezTerm's own renderer, and types into
-them. It has been exercised only on emulators against test servers on the
-build machine, not over a real tailnet, on a phone or with a hardware
-keyboard.
+The app renders existing mux panes with WezTerm's native renderer.
+Emulator fixtures verify attachment and input. Physical ARM64, a separate
+private Tailscale endpoint, human input, and hardware performance remain
+unverified. A locally signed APK is release preparation, not phone acceptance.
 
 ## Connect
 
@@ -95,8 +94,8 @@ pane at different sizes keep resizing it back and forth.
 
 ## Build
 
-Requirements: Android SDK with platform 35, build-tools 35.0.0 and NDK
-28.0.13004108; `rustup`; `curl`.
+Install `rustup`, `curl`, `uv`, and the Android SDK components pinned in
+`gradle.properties`. Use a Linux x86_64 build host.
 
 ```sh
 export ANDROID_HOME=/path/to/android-sdk
@@ -111,12 +110,11 @@ APKs land in `android/app/build/outputs/apk/debug/app-<abi>-debug.apk`.
 ## Install and test
 
 ```sh
-adb devices
 make android-install SERIAL=<serial>
 make android-test SERIAL=<serial> SUITE=native-load   # checks and rebuilds for the device ABI, then runs the suite
 make android-test SERIAL=<serial> SUITE=surface       # renders, retires and resumes the terminal surface
 make android-test SERIAL=<serial> SUITE=lifecycle     # rotation, Back, window selector, clipboard, engine failure
-ci/android-sshmux-fixture.sh up "$(tailscale ip -4)"  # test sshd and mux servers on this machine, generated keys only
+ci/android-sshmux-fixture.sh up <owned-host-address> # generated fixture keys and sessions only
 make android-test SERIAL=<serial> SUITE=sshmux        # connection screen, host trust, key import, attach, failures
 make android-test SERIAL=<serial> SUITE=input         # typing, keys, paste, selection, resize; needs a fresh `up`
 make android-test SERIAL=<serial> SUITE=reconnect     # cancel, lost connection, reconnect, force-stop, last-pane exit, repeated rounds; needs a fresh `up`
@@ -128,9 +126,9 @@ machine's own Tailscale address, which the kernel delivers over loopback.
 They test the app and the protocol; they do not show that traffic crosses
 a tailnet.
 
-The launcher entry "WezTerm" opens the connection screen and logs
-`WezTermSurface` lines; `org.wezterm.android/.DiagnosticActivity` still shows
-the native initialization report (`WezTermDiag`). Debug builds show a
+The launcher entry "WezTerm" opens the connection screen.
+Only debug APKs contain `org.wezterm.android/.DiagnosticActivity`, which
+shows the native initialization report. Debug builds show a
 built-in diagnostic text grid instead of the connection screen when
 launched with
 `am start -n org.wezterm.android/.TerminalActivity --ez org.wezterm.android.DIAGNOSTIC_APPLET true`.
@@ -138,4 +136,63 @@ launched with
 On the API 35 x86_64 emulator started with `-gpu swiftshader`, run the app
 and the `surface` and `lifecycle` suites with
 `WEZTERM_ANDROID_CONFIG_OVERRIDES='webgpu_preferred_adapter={name="Android Emulator OpenGL ES Translator (Google SwiftShader)",backend="Gl",device_type="Cpu"}'`;
-its Vulkan implementation aborts the emulator otherwise (see `AGENTS.md`).
+its Vulkan implementation aborts the emulator otherwise.
+
+## Build a signed release
+
+Release signing has no unsigned or debug-key fallback. Put your keystore and
+password files outside the repository. Set file permissions to `0600` and
+keep the containing directory private. Passwords belong in files, never in
+command arguments or logs.
+
+```sh
+export WEZTERM_ANDROID_KEYSTORE=/private/delivery.p12
+export WEZTERM_ANDROID_KEY_ALIAS=delivery
+export WEZTERM_ANDROID_STORE_PASSWORD_FILE=/private/store-password
+export WEZTERM_ANDROID_KEY_PASSWORD_FILE=/private/key-password
+make android-release
+make android-release-inspect
+make android-inspect-selftest VARIANT=release
+```
+
+Install `android/app/build/outputs/apk/release/app-arm64-v8a-release.apk` on
+an explicitly selected ARM64 device with
+`make android-install SERIAL=<serial> VARIANT=release`.
+Android refuses an update signed by a different key. Replacing a debug
+installation requires removing it first, which erases its private app data.
+Do not do that to preserve an existing profile or trust store.
+
+Keep the keystore and password files in secure, recoverable custody for
+updates. Share the APK, certificate digest, notices, and symbol archive,
+not the key or passwords. A newly minted local test key does not confer
+operator release authority.
+
+The release receipt directory is `target/android-release/receipts`.
+It records source hashes, tool inputs, certificate identity, and artifact
+checksums. Unstripped crash symbols are in `target/android-release/symbols`.
+The APK contains dependency and font notices under `assets/notices`.
+Preserve the symbols and the R8 mapping in
+`android/app/build/outputs/mapping/release` with the matching APK.
+Recorded inputs do not establish byte-for-byte reproducibility across hosts.
+
+```sh
+make android-test SERIAL=<owned-emulator> SUITE=release-load
+```
+
+This suite loads the signed native library, launches the production profile
+screen, refuses a non-tailnet address, and opens the system document picker.
+It does not connect to a laptop or pass physical-phone acceptance.
+Never substitute it for the full phone terminal, trust, input, lifecycle,
+reconnect, private-route, and human usability checks.
+
+Default logging excludes input, composition, paste, decoded PDU bodies,
+and clipboard text. `debug_key_events` is an unsafe explicit opt-in that
+can log keys. It remains off in tests and release.
+
+## Release limits
+
+DNS cancellation waits for the system resolver. A fatal GUI failure can
+park its thread and strand a mux domain after transport workers stop.
+API35 graphics descriptors grew in lifecycle testing. Rare failed-font
+cases can overlap regional-indicator glyphs. Do not interpret emulator
+results as hardware-driver or private-network proof.
