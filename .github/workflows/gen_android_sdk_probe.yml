@@ -1,0 +1,36 @@
+name: Android SDK-only causal probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sdk-probe:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: "checkout probe source"
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: "Set up uv"
+        uses: astral-sh/setup-uv@v6
+      - name: "Set up SDK tools only"
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools"
+      - name: "Install diagnostic host dependencies"
+        shell: bash
+        run: "sudo apt-get update && sudo apt-get install -y --no-install-recommends libpulse0 tcpdump strace && sudo chmod 666 /dev/kvm"
+      - name: "Install candidate SDK inputs"
+        shell: bash
+        run: "sdkmanager 'platform-tools' 'emulator' 'system-images;android-35;google_apis;x86_64'"
+      - name: "Verify inputs and run exactly two SDK-only cases"
+        shell: bash
+        run: "uv run --no-project python ci/android_sdk_probe.py"
+      - name: "Retain public SDK-only probe evidence"
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: "android-sdk-probe"
+          path: "${{ runner.temp }}/android-sdk-probe-public/"
+          if-no-files-found: "error"

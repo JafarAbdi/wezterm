@@ -1227,8 +1227,6 @@ cleanup() {{
     wait "$pid"
     printf '%s\\n' "$?" > "$diag/emulator.exit"
   fi
-  cp "${{TMPDIR:-/tmp}}/adb.$(id -u).log" "$diag/adb-server.log" 2> "$diag/adb-server-copy.stderr"
-  printf '%s\\n' "$?" > "$diag/adb-server-copy.exit"
   exit "$status"
 }}
 trap cleanup EXIT
@@ -1244,8 +1242,9 @@ printf 'no\\n' | avdmanager create avd --name android-ci-{api} --path "$ANDROID_
 test -f "$ANDROID_AVD_HOME/android-ci-{api}.ini"
 cp "$ANDROID_AVD_HOME/android-ci-{api}.ini" "$diag/avd.ini"
 cp "$ANDROID_AVD_HOME/android-ci-{api}.avd/config.ini" "$diag/avd-config.ini"
-# Start the shared daemon before the emulator and concurrent clients can race its startup.
-ADB_TRACE=transport adb start-server > "$diag/adb-start-server.txt" 2>&1
+# Start synchronously and override inherited tracing: transport tracing includes payload previews.
+export ADB_TRACE=
+adb start-server > "$diag/adb-start-server.txt" 2>&1
 (exec "$ANDROID_HOME/emulator/emulator" -avd android-ci-{api} -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader -port {port} -cores 2 -memory 2560) > "$diag/emulator.log" 2>&1 &
 pid=$!
 printf '%s\\n' "$pid" > "$diag/emulator.pid"
@@ -1294,6 +1293,31 @@ jobs:
 """)
 
 
+def android_sdk_probe_actions():
+    steps = [
+        ActionStep("checkout probe source", "actions/checkout@v5", params={"persist-credentials": False}),
+        ActionStep("Set up uv", "astral-sh/setup-uv@v6"),
+        ActionStep("Set up SDK tools only", "android-actions/setup-android@v3", params={"packages": "platform-tools"}),
+        RunStep("Install diagnostic host dependencies", "sudo apt-get update && sudo apt-get install -y --no-install-recommends libpulse0 tcpdump strace && sudo chmod 666 /dev/kvm"),
+        RunStep("Install candidate SDK inputs", "sdkmanager 'platform-tools' 'emulator' 'system-images;android-35;google_apis;x86_64'"),
+        RunStep("Verify inputs and run exactly two SDK-only cases", "uv run --no-project python ci/android_sdk_probe.py"),
+        ActionStep("Retain public SDK-only probe evidence", "actions/upload-artifact@v7", params={
+            "name": "android-sdk-probe", "path": "${{ runner.temp }}/android-sdk-probe-public/",
+            "if-no-files-found": "error"}, condition="always()"),
+    ]
+    with open(".github/workflows/gen_android_sdk_probe.yml", "w") as output:
+        output.write("""name: Android SDK-only causal probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sdk-probe:
+    runs-on: ubuntu-24.04
+""")
+        Job("ubuntu-24.04", steps=steps).render(output, 3)
+
+
 def remove_gen_actions():
     for name in glob.glob(".github/workflows/gen_*.yml"):
         os.remove(name)
@@ -1304,3 +1328,4 @@ generate_pr_actions()
 continuous_actions()
 tag_actions()
 android_actions()
+android_sdk_probe_actions()
