@@ -1274,13 +1274,26 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'normal: product CI; sdk-transport: diagnostic only (android-success intentionally fails)'
+        type: choice
+        required: true
+        default: normal
+        options: [normal, sdk-transport]
 permissions:
   contents: read
 jobs:
 """)
         for name, steps in jobs.items():
-            output.write(f"  {name}:\n    runs-on: ubuntu-24.04\n    env:\n      CARGO_BUILD_JOBS: '2'\n      RUSTUP_TOOLCHAIN: '{policy['wezterm.rustToolchain']}'\n")
+            output.write(f"  {name}:\n    if: github.event_name != 'workflow_dispatch' || inputs.mode == '' || inputs.mode == 'normal'\n    runs-on: ubuntu-24.04\n    env:\n      CARGO_BUILD_JOBS: '2'\n      RUSTUP_TOOLCHAIN: '{policy['wezterm.rustToolchain']}'\n")
             Job("ubuntu-24.04", steps=steps).render(output, 3)
+        output.write("""  sdk-transport-diagnostic:
+    name: SDK transport diagnostic (not product acceptance)
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'sdk-transport'
+    runs-on: ubuntu-24.04
+""")
+        Job("ubuntu-24.04", steps=android_sdk_probe_steps()).render(output, 3)
         output.write("""  android-success:
     runs-on: ubuntu-24.04
     if: always()
@@ -1293,8 +1306,8 @@ jobs:
 """)
 
 
-def android_sdk_probe_actions():
-    steps = [
+def android_sdk_probe_steps():
+    return [
         ActionStep("checkout probe source", "actions/checkout@v5", params={"persist-credentials": False}),
         ActionStep("Set up uv", "astral-sh/setup-uv@v6"),
         ActionStep("Set up SDK tools only", "android-actions/setup-android@v3", params={"packages": "platform-tools"}),
@@ -1305,6 +1318,9 @@ def android_sdk_probe_actions():
             "name": "android-sdk-probe", "path": "${{ runner.temp }}/android-sdk-probe-public/",
             "if-no-files-found": "error"}, condition="always()"),
     ]
+
+
+def android_sdk_probe_actions():
     with open(".github/workflows/gen_android_sdk_probe.yml", "w") as output:
         output.write("""name: Android SDK-only causal probe
 on:
@@ -1315,7 +1331,7 @@ jobs:
   sdk-probe:
     runs-on: ubuntu-24.04
 """)
-        Job("ubuntu-24.04", steps=steps).render(output, 3)
+        Job("ubuntu-24.04", steps=android_sdk_probe_steps()).render(output, 3)
 
 
 def remove_gen_actions():

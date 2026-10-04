@@ -4,10 +4,18 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'normal: product CI; sdk-transport: diagnostic only (android-success intentionally fails)'
+        type: choice
+        required: true
+        default: normal
+        options: [normal, sdk-transport]
 permissions:
   contents: read
 jobs:
   checks:
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == '' || inputs.mode == 'normal'
     runs-on: ubuntu-24.04
     env:
       CARGO_BUILD_JOBS: '2'
@@ -43,6 +51,7 @@ jobs:
         shell: bash
         run: "ci/android.sh check arm64-v8a release && ci/android.sh check x86_64 release"
   artifacts:
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == '' || inputs.mode == 'normal'
     runs-on: ubuntu-24.04
     env:
       CARGO_BUILD_JOBS: '2'
@@ -92,6 +101,7 @@ jobs:
             target/android-notices/assets/notices/
           if-no-files-found: "error"
   api24:
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == '' || inputs.mode == 'normal'
     runs-on: ubuntu-24.04
     env:
       CARGO_BUILD_JOBS: '2'
@@ -211,6 +221,7 @@ jobs:
             target/android-release/inspect/
           if-no-files-found: "error"
   api35:
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == '' || inputs.mode == 'normal'
     runs-on: ubuntu-24.04
     env:
       CARGO_BUILD_JOBS: '2'
@@ -328,6 +339,38 @@ jobs:
             android/app/build/outputs/apk/release/*.apk
             target/android-release/jniLibs/
             target/android-release/inspect/
+          if-no-files-found: "error"
+  sdk-transport-diagnostic:
+    name: SDK transport diagnostic (not product acceptance)
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'sdk-transport'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: "checkout probe source"
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: "Set up uv"
+        uses: astral-sh/setup-uv@v6
+      - name: "Set up SDK tools only"
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools"
+      - name: "Install diagnostic host dependencies"
+        shell: bash
+        run: "sudo apt-get update && sudo apt-get install -y --no-install-recommends libpulse0 tcpdump strace && sudo chmod 666 /dev/kvm"
+      - name: "Install candidate SDK inputs"
+        shell: bash
+        run: "sdkmanager 'platform-tools' 'emulator' 'system-images;android-35;google_apis;x86_64'"
+      - name: "Verify inputs and run exactly two SDK-only cases"
+        shell: bash
+        run: "uv run --no-project python ci/android_sdk_probe.py"
+      - name: "Retain public SDK-only probe evidence"
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: "android-sdk-probe"
+          path: "${{ runner.temp }}/android-sdk-probe-public/"
           if-no-files-found: "error"
   android-success:
     runs-on: ubuntu-24.04
