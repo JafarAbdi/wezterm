@@ -1227,6 +1227,8 @@ cleanup() {{
     wait "$pid"
     printf '%s\\n' "$?" > "$diag/emulator.exit"
   fi
+  cp "${{TMPDIR:-/tmp}}/adb.$(id -u).log" "$diag/adb-server.log" 2> "$diag/adb-server-copy.stderr"
+  printf '%s\\n' "$?" > "$diag/adb-server-copy.exit"
   exit "$status"
 }}
 trap cleanup EXIT
@@ -1243,7 +1245,7 @@ test -f "$ANDROID_AVD_HOME/android-ci-{api}.ini"
 cp "$ANDROID_AVD_HOME/android-ci-{api}.ini" "$diag/avd.ini"
 cp "$ANDROID_AVD_HOME/android-ci-{api}.avd/config.ini" "$diag/avd-config.ini"
 # Start the shared daemon before the emulator and concurrent clients can race its startup.
-adb start-server > "$diag/adb-start-server.txt" 2>&1
+ADB_TRACE=transport adb start-server > "$diag/adb-start-server.txt" 2>&1
 (exec "$ANDROID_HOME/emulator/emulator" -avd android-ci-{api} -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader -port {port} -cores 2 -memory 2560) > "$diag/emulator.log" 2>&1 &
 pid=$!
 printf '%s\\n' "$pid" > "$diag/emulator.pid"
