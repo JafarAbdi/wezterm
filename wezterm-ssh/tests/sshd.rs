@@ -5,10 +5,10 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Result as IoResult;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::LazyLock;
-use std::time::Duration;
-use wezterm_ssh::{Config, Session, SessionEvent};
+use std::thread::JoinHandle;
+use wezterm_ssh::{Config, ConfigMap, Session, SessionEvent};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -67,7 +67,7 @@ fn probe_sshd() -> bool {
 /// We pass this to sshd and tell it to listen on that port.
 /// This is racy, as releasing the socket technically makes
 /// that port available to others using the same technique.
-fn allocate_port() -> u16 {
+pub fn allocate_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0 failed");
     listener.local_addr().unwrap().port()
 }
@@ -110,6 +110,7 @@ pub struct SshAgent {
 impl Drop for SshAgent {
     fn drop(&mut self) {
         self.child.kill().ok();
+        self.child.wait().ok();
     }
 }
 
@@ -130,6 +131,9 @@ pub struct SshdConfig(HashMap<String, Vec<String>>);
 impl Default for SshdConfig {
     fn default() -> Self {
         let mut config = Self::new();
+        config
+            .0
+            .insert("ListenAddress".to_string(), vec!["127.0.0.1".to_string()]);
 
         config.set_authentication_methods(vec!["publickey".to_string()]);
         config.set_use_privilege_separation(false);
@@ -295,10 +299,18 @@ pub struct Sshd {
 
     agent_sock: PathBuf,
     _agent: SshAgent,
+    log: LogCopy,
 }
 
 impl Sshd {
-    pub fn spawn(mut config: SshdConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn spawn(config: SshdConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_on(config, std::iter::repeat_with(allocate_port))
+    }
+
+    pub fn spawn_on(
+        mut config: SshdConfig,
+        ports: impl IntoIterator<Item = u16>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let _ = env_logger::Builder::new()
             .is_test(true)
             .filter_level(log::LevelFilter::Trace)
@@ -345,99 +357,167 @@ impl Sshd {
         sshd_config_file.write_str(&config_string)?;
         eprintln!("{config_string}");
 
-        let sshd_log_file = tmp.child("sshd.log");
+        let mut log = std::fs::OpenOptions::new();
+        log.append(true).create(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut log, 0o600);
+        let log = log.open(tmp.child("sshd.log").path())?;
 
-        let (child, port) = Self::try_spawn_next(sshd_config_file.path(), sshd_log_file.path())
-            .expect("No open port available for sshd");
-
-        Ok(Self {
-            child,
-            port,
-            tmp,
-            _agent: agent,
-            agent_sock,
-        })
-    }
-
-    fn try_spawn_next(
-        config_path: impl AsRef<Path>,
-        log_path: impl AsRef<Path>,
-    ) -> IoResult<(Child, u16)> {
-        let mut err = None;
-
-        for _ in 0..100 {
-            let port = allocate_port();
-
-            match Self::try_spawn(port, config_path.as_ref(), log_path.as_ref()) {
-                // If successful, return our spawned server child process
-                Ok(child) => return Ok((child, port)),
-
-                Err(x) => {
-                    err.replace(x);
+        // A port is free only until something binds it, and the tests run
+        // in parallel with other listeners: take the next port when sshd
+        // reports another listener holds this one.
+        for port in ports.into_iter().take(100) {
+            match Self::try_spawn(port, sshd_config_file.path(), &log)? {
+                Some((child, log)) => {
+                    return Ok(Self {
+                        child,
+                        port,
+                        tmp,
+                        _agent: agent,
+                        agent_sock,
+                        log,
+                    })
                 }
+                None => eprintln!("port {port} is held by another listener"),
             }
         }
-
-        Err(err.unwrap())
+        Err("every port tried is held by another listener".into())
     }
 
+    /// Start sshd on `port`. Ready is sshd's own report that it listens
+    /// there; `None` means another listener holds the port.
     fn try_spawn(
         port: u16,
-        config_path: impl AsRef<Path>,
-        log_path: impl AsRef<Path>,
-    ) -> IoResult<Child> {
+        config_path: &Path,
+        log: &std::fs::File,
+    ) -> IoResult<Option<(Child, LogCopy)>> {
+        let (stderr, sshd_stderr) = filedescriptor::socketpair().map_err(std::io::Error::other)?;
+        let (lines, mut copy) = LogCopy::start(stderr, log.try_clone()?)?;
         let mut child = Command::new(BIN_PATH_STR)
             .arg("-D")
+            .arg("-e")
             .arg("-p")
             .arg(port.to_string())
             .arg("-f")
-            .arg(config_path.as_ref())
-            .arg("-E")
-            .arg(log_path.as_ref())
+            .arg(config_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(sshd_stderr.into_stdio())
             .spawn()
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("spawning {} failed {:#}", BIN_PATH_STR, e),
-                )
-            })?;
+            .map_err(|e| std::io::Error::other(format!("spawning {BIN_PATH_STR} failed {e:#}")))?;
 
-        for _ in 0..10 {
-            // Wait until the port is up
-            std::thread::sleep(Duration::from_millis(100));
-
-            // If the server exited already, then we know something is wrong!
-            if let Some(exit_status) = child.try_wait()? {
-                let output = child.wait_with_output()?;
-                let code = exit_status.code();
-                let msg = format!(
-                    "{}\n{}",
-                    String::from_utf8(output.stdout).unwrap(),
-                    String::from_utf8(output.stderr).unwrap(),
-                );
-
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "{} failed [{}]: {}",
-                        BIN_PATH_STR,
-                        code.map(|x| x.to_string())
-                            .unwrap_or_else(|| String::from("???")),
-                        msg
-                    ),
-                ));
+        // OpenSSH logs this after listen(2) on the address.
+        let listening = format!(" port {port}.");
+        let mut seen = vec![];
+        for line in lines {
+            if line.starts_with("Server listening on ") && line.ends_with(&listening) {
+                return Ok(Some((child, copy)));
             }
-
-            // If the port is up, then we're good!
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return Ok(child);
-            }
+            seen.push(line);
         }
+        // Before sshd listens no connection child exists, so the end of
+        // its stderr is its exit, unless the copy itself failed.
+        let copied = copy.stop();
+        if copied.is_err() {
+            let _ = child.kill();
+        }
+        let status = child.wait()?;
+        copied?;
+        if seen
+            .iter()
+            .any(|line| line.ends_with("Address already in use."))
+        {
+            return Ok(None);
+        }
+        Err(std::io::Error::other(format!(
+            "{BIN_PATH_STR} {status} before listening on port {port}:\n{}",
+            seen.join("\n")
+        )))
+    }
+}
 
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "ran out of ports when spawning sshd",
+/// A thread copying sshd's stderr into the fixture's log. It ends when
+/// sshd and the connections it forked have all closed their stderr, or
+/// when stopped: a connection child outlives a killed sshd until its
+/// client disconnects.
+struct LogCopy {
+    stop: filedescriptor::FileDescriptor,
+    thread: Option<JoinHandle<IoResult<()>>>,
+}
+
+impl LogCopy {
+    /// Copy `stderr` into `log`, sending each line to the returned
+    /// receiver while it is held.
+    fn start(
+        mut stderr: filedescriptor::FileDescriptor,
+        mut log: std::fs::File,
+    ) -> IoResult<(std::sync::mpsc::Receiver<String>, Self)> {
+        use filedescriptor::{pollfd, AsRawSocketDescriptor, POLLIN};
+        use std::io::{Read, Write};
+
+        let (stop, stopped) = filedescriptor::socketpair().map_err(std::io::Error::other)?;
+        let (sender, lines) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || -> IoResult<()> {
+            let mut buf = [0u8; 4096];
+            let mut line = vec![];
+            loop {
+                let mut fds = [
+                    pollfd {
+                        fd: stderr.as_socket_descriptor(),
+                        events: POLLIN,
+                        revents: 0,
+                    },
+                    pollfd {
+                        fd: stopped.as_socket_descriptor(),
+                        events: POLLIN,
+                        revents: 0,
+                    },
+                ];
+                filedescriptor::poll(&mut fds, None).map_err(std::io::Error::other)?;
+                if fds[0].revents == 0 {
+                    return Ok(());
+                }
+                let len = stderr.read(&mut buf)?;
+                if len == 0 {
+                    return Ok(());
+                }
+                log.write_all(&buf[..len])?;
+                for &byte in &buf[..len] {
+                    if byte == b'\n' {
+                        let text = String::from_utf8_lossy(&line);
+                        // The receiver is dropped once sshd is ready.
+                        let _ = sender.send(text.trim_end_matches('\r').to_string());
+                        line.clear();
+                    } else {
+                        line.push(byte);
+                    }
+                }
+            }
+        });
+        Ok((
+            lines,
+            Self {
+                stop,
+                thread: Some(thread),
+            },
         ))
+    }
+
+    /// Stop the copy once it has taken what sshd already wrote, and wait
+    /// for its thread.
+    fn stop(&mut self) -> IoResult<()> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        // Refused once the copy ended on its own and closed its end.
+        let _ = std::io::Write::write_all(&mut self.stop, b"x");
+        thread.join().expect("the sshd log copy panicked")
+    }
+}
+
+impl Drop for LogCopy {
+    fn drop(&mut self) {
+        let _ = self.stop();
     }
 }
 
@@ -448,7 +528,35 @@ impl Drop for Sshd {
 
         // NOTE: Should wait to ensure that the process does not become a zombie
         let _ = self.child.wait();
+        let _ = self.log.stop();
+        if std::thread::panicking() {
+            if let Ok(log) = std::fs::read_to_string(self.tmp.child("sshd.log").path()) {
+                eprintln!("sshd log:\n{log}");
+            }
+        }
     }
+}
+
+/// A direct connection to `port` whose identity, known hosts and SSH
+/// directory are all in `dir`.
+pub fn private_config(port: u16, dir: &Path, backend: &str) -> ConfigMap {
+    let mut config = Config::new().for_host("localhost");
+    for (key, value) in [
+        ("port", port.to_string()),
+        ("addressfamily", "inet".to_string()),
+        ("wezterm_ssh_backend", backend.to_string()),
+        ("wezterm_ssh_config_dir", dir.display().to_string()),
+        ("user", USERNAME.to_string()),
+        ("identitiesonly", "yes".to_string()),
+        ("identityfile", dir.join("id_rsa").display().to_string()),
+        (
+            "userknownhostsfile",
+            dir.join("known_hosts").display().to_string(),
+        ),
+    ] {
+        config.insert(key.to_string(), value);
+    }
+    config
 }
 
 #[fixture]
@@ -490,7 +598,12 @@ pub async fn session(#[default(Config::new())] config: Config, sshd: Sshd) -> Se
     // generated identity file, and host file
     let mut config = config.for_host("localhost");
     config.insert("port".to_string(), port.to_string());
+    config.insert("addressfamily".to_string(), "inet".to_string());
     config.insert("wezterm_ssh_verbose".to_string(), "true".to_string());
+    config.insert(
+        "wezterm_ssh_config_dir".to_string(),
+        sshd.tmp.path().display().to_string(),
+    );
 
     // If libssh-rs is not loaded (but ssh2 is), then we use ssh2 as the backend
     #[cfg(not(feature = "libssh-rs"))]
@@ -568,6 +681,8 @@ pub async fn session(#[default(Config::new())] config: Config, sshd: Sshd) -> Se
             SessionEvent::HostVerificationFailed(failed) => {
                 panic!("{}", failed);
             }
+            SessionEvent::HostVerified => {}
+            SessionEvent::HostKeyTypeChanged => panic!("host key type changed"),
             SessionEvent::Error(err) => {
                 panic!("{}", err);
             }

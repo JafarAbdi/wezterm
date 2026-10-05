@@ -14,6 +14,10 @@ pub struct HostVerificationFailed {
 #[derive(Debug)]
 pub struct HostVerificationEvent {
     pub message: String,
+    /// The `host:port` whose key is not yet trusted.
+    pub remote_address: String,
+    /// The fingerprint `message` shows.
+    pub fingerprint: String,
     pub(crate) reply: Sender<bool>,
 }
 
@@ -51,6 +55,8 @@ impl crate::sessioninner::SessionInner {
                                     Trust and continue connecting?",
                             hostname, port, key
                         ),
+                        remote_address: format!("{hostname}:{port}"),
+                        fingerprint: key.clone(),
                         reply,
                     }))
                     .context("sending HostVerify request to user")?;
@@ -61,6 +67,7 @@ impl crate::sessioninner::SessionInner {
                 if !trusted {
                     anyhow::bail!("user declined to trust host");
                 }
+                self.refuse_if_cancelled()?;
 
                 Ok(sess.update_known_hosts_file()?)
             }
@@ -84,6 +91,9 @@ impl crate::sessioninner::SessionInner {
                 anyhow::bail!("Host key verification failed");
             }
             libssh_rs::KnownHosts::Other => {
+                self.tx_event
+                    .try_send(SessionEvent::HostKeyTypeChanged)
+                    .context("sending HostKeyTypeChanged event to user")?;
                 anyhow::bail!(
                     "The host key for this server was not found, but another\n\
             type of key exists. An attacker might change the default\n\
@@ -166,6 +176,8 @@ impl crate::sessioninner::SessionInner {
                                 Trust and continue connecting?",
                                 remote_address, key_type, fingerprint
                             ),
+                            remote_address: remote_address.to_string(),
+                            fingerprint: fingerprint.clone(),
                             reply,
                         }))
                         .context("sending HostVerify request to user")?;
@@ -176,6 +188,7 @@ impl crate::sessioninner::SessionInner {
                     if !trusted {
                         anyhow::bail!("user declined to trust host");
                     }
+                    self.refuse_if_cancelled()?;
 
                     let host_and_port = if port != 22 {
                         format!("[{}]:{}", remote_host_name, port)

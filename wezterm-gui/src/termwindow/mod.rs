@@ -10,6 +10,7 @@ use crate::overlay::{
     start_overlay, start_overlay_pane, CopyModeParams, CopyOverlay, LauncherArgs, LauncherFlags,
     QuickSelectOverlay,
 };
+use crate::renderfault::{self, RenderStage};
 use crate::resize_increment_calculator::ResizeIncrementCalculator;
 use crate::scripting::guiwin::GuiWin;
 use crate::scrollbar::*;
@@ -599,30 +600,77 @@ impl TermWindow {
     }
 
     fn created(&mut self, ctx: RenderContext) -> anyhow::Result<()> {
-        self.render_state = None;
-
-        let render_info = ctx.renderer_info();
-        self.opengl_info.replace(render_info.clone());
-
-        match RenderState::new(ctx, &self.fonts, &self.render_metrics, ATLAS_SIZE) {
-            Ok(render_state) => {
-                log::debug!(
-                    "OpenGL initialized! {} wezterm version: {}",
-                    render_info,
-                    config::wezterm_version(),
-                );
-                self.render_state.replace(render_state);
-            }
-            Err(err) => {
-                log::error!("failed to create RenderState: {}", err);
-            }
-        }
-
-        if self.render_state.is_none() {
+        if let Err(err) = self.build_render_state(ctx) {
+            log::error!("failed to create RenderState: {}", err);
             panic!("No OpenGL");
         }
-
         Ok(())
+    }
+
+    fn build_render_state(&mut self, ctx: RenderContext) -> anyhow::Result<()> {
+        self.render_state = None;
+        let render_info = ctx.renderer_info();
+        self.opengl_info.replace(render_info.clone());
+        let render_state = RenderState::new(ctx, &self.fonts, &self.render_metrics, ATLAS_SIZE)?;
+        log::debug!(
+            "OpenGL initialized! {} wezterm version: {}",
+            render_info,
+            config::wezterm_version(),
+        );
+        self.render_state.replace(render_state);
+        Ok(())
+    }
+
+    /// The backend attached a presentation surface after the window was
+    /// created.  GPU state is built now.  Failure leaves the window
+    /// surfaceless until the next surface; it never closes the window or
+    /// touches the mux.
+    fn surface_available(&mut self, dimensions: Dimensions, window: &Window) {
+        self.surface_lost();
+        #[cfg(debug_assertions)]
+        if let Some(err) = renderfault::injected(RenderStage::GpuCreation) {
+            renderfault::record(RenderStage::GpuCreation);
+            log::error!("surface available but GPU initialization failed: {err:#}");
+            return;
+        }
+        let created = promise::spawn::block_on(WebGpuState::new(window, dimensions, &self.config));
+        let webgpu = match created {
+            Ok(state) => Rc::new(state),
+            Err(err) => {
+                renderfault::record(RenderStage::GpuCreation);
+                log::error!("surface available but GPU initialization failed: {err:#}");
+                return;
+            }
+        };
+        if let Err(err) = self.build_render_state(RenderContext::WebGpu(Rc::clone(&webgpu))) {
+            renderfault::record(RenderStage::GpuCreation);
+            log::error!("surface available but RenderState creation failed: {err:#}");
+            return;
+        }
+        log::info!(
+            "surface available {}x{} dpi {}: {}",
+            dimensions.pixel_width,
+            dimensions.pixel_height,
+            dimensions.dpi,
+            self.opengl_info.as_deref().unwrap_or("")
+        );
+        self.webgpu.replace(webgpu);
+        window.invalidate();
+    }
+
+    fn surface_lost(&mut self) {
+        if self.webgpu.is_some() {
+            log::info!("surface lost; releasing GPU state");
+        }
+        self.render_state = None;
+        self.webgpu = None;
+        self.opengl_info = None;
+        self.quad_generation += 1;
+        self.shape_generation += 1;
+        self.shape_cache.borrow_mut().clear();
+        self.line_to_ele_shape_cache.borrow_mut().clear();
+        self.invalidate_fancy_tab_bar();
+        self.invalidate_modal();
     }
 }
 
@@ -898,6 +946,9 @@ impl TermWindow {
         {
             let mut myself = tw.borrow_mut();
             let webgpu = match config.front_end {
+                // Android surfaces arrive later, through
+                // WindowEvent::SurfaceAvailable.
+                FrontEndSelection::WebGpu if cfg!(target_os = "android") => None,
                 FrontEndSelection::WebGpu => Some(Rc::new(
                     WebGpuState::new(&window, dimensions, &config).await?,
                 )),
@@ -933,6 +984,11 @@ impl TermWindow {
             myself.subscribe_to_pane_updates();
             myself.emit_window_event("window-config-reloaded", None);
             myself.emit_status_event();
+            if cfg!(target_os = "android") {
+                // The window selector lists a window by title before any
+                // surface event reaches it.
+                myself.update_title();
+            }
         }
 
         crate::update::start_update_checker();
@@ -946,6 +1002,10 @@ impl TermWindow {
         event: WindowEvent,
         window: &Window,
     ) -> anyhow::Result<bool> {
+        // A debug APK's logcat must not record what the user types or pastes.
+        #[cfg(target_os = "android")]
+        log::debug!("{}", event.without_text());
+        #[cfg(not(target_os = "android"))]
         log::debug!("{event:?}");
         match event {
             WindowEvent::Destroyed => {
@@ -959,6 +1019,16 @@ impl TermWindow {
             }
             WindowEvent::CloseRequested => {
                 self.close_requested(window);
+                Ok(true)
+            }
+            WindowEvent::SurfaceAvailable { dimensions } => {
+                self.surface_available(dimensions, window);
+                Ok(true)
+            }
+            WindowEvent::SurfaceLost => {
+                #[cfg(debug_assertions)]
+                renderfault::injected_surface_lost_panic();
+                self.surface_lost();
                 Ok(true)
             }
             WindowEvent::AppearanceChanged(appearance) => {
@@ -1125,7 +1195,9 @@ impl TermWindow {
                 self.dimensions.pixel_height as u32,
             ),
         );
-        self.paint_impl(&mut RenderFrame::Glium(&mut frame));
+        if let Err(err) = self.paint_impl(&mut RenderFrame::Glium(&mut frame)) {
+            log::error!("paint: {err:#}");
+        }
         window.finish_frame(frame).is_ok()
     }
 
@@ -1141,13 +1213,14 @@ impl TermWindow {
                     }
                     _ => {}
                 }
+                renderfault::record(RenderStage::Draw);
                 Err(err)
             }
         }
     }
 
     fn do_paint_webgpu_impl(&mut self) -> anyhow::Result<bool> {
-        self.paint_impl(&mut RenderFrame::WebGpu);
+        self.paint_impl(&mut RenderFrame::WebGpu)?;
         Ok(true)
     }
 
@@ -1320,6 +1393,11 @@ impl TermWindow {
                             || size.pixel_width != self.terminal_size.pixel_width
                             || size.pixel_height != self.terminal_size.pixel_height
                         {
+                            // An Android window cannot take the tab's
+                            // size; while it shows, its tabs fit its surface.
+                            #[cfg(target_os = "android")]
+                            crate::android::fit_bound_window();
+                            #[cfg(not(target_os = "android"))]
                             self.set_window_size(size, window)?;
                         } else if tab_size.dpi == 0 {
                             log::debug!("fixup dpi in newly added tab");
@@ -1359,6 +1437,8 @@ impl TermWindow {
                 | MuxNotification::PaneRemoved(_)
                 | MuxNotification::WindowWorkspaceChanged(_)
                 | MuxNotification::ActiveWorkspaceChanged(_)
+                | MuxNotification::ActivePaneChanged(_)
+                | MuxNotification::ActiveTabChanged(_)
                 | MuxNotification::Empty
                 | MuxNotification::WindowCreated(_) => {}
             },
@@ -1564,6 +1644,8 @@ impl TermWindow {
             | MuxNotification::SaveToDownloads { .. }
             | MuxNotification::WindowCreated(_)
             | MuxNotification::ActiveWorkspaceChanged(_)
+            | MuxNotification::ActivePaneChanged(_)
+            | MuxNotification::ActiveTabChanged(_)
             | MuxNotification::WorkspaceRenamed { .. }
             | MuxNotification::Empty
             | MuxNotification::WindowWorkspaceChanged(_) => return true,
@@ -3228,6 +3310,8 @@ impl TermWindow {
                     None => true,
                 };
                 if default_click {
+                    // Android logs are readable off the device; a link can carry a secret.
+                    #[cfg(not(target_os = "android"))]
                     log::info!("clicking {}", link);
                     wezterm_open_url::open_url(&link);
                 }

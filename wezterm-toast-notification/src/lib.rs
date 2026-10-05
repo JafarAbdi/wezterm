@@ -1,3 +1,4 @@
+#[cfg(all(not(target_os = "macos"), not(windows), not(target_os = "android")))]
 mod dbus;
 mod macos;
 mod windows;
@@ -18,10 +19,12 @@ impl ToastNotification {
 
 #[cfg(windows)]
 use crate::windows as backend;
-#[cfg(all(not(target_os = "macos"), not(windows)))]
+#[cfg(all(not(target_os = "macos"), not(windows), not(target_os = "android")))]
 use dbus as backend;
 #[cfg(target_os = "macos")]
 use macos as backend;
+#[cfg(target_os = "android")]
+use nop as backend;
 
 mod nop {
     use super::*;

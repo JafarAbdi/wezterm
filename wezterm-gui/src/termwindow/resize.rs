@@ -88,7 +88,7 @@ impl super::TermWindow {
         }
     }
 
-    pub fn apply_scale_change(&mut self, dimensions: &Dimensions, font_scale: f64) {
+    pub fn apply_scale_change(&mut self, dimensions: &Dimensions, font_scale: f64) -> bool {
         let config = &self.config;
         let font_size = config.font_size * font_scale;
         let theoretical_height = font_size * dimensions.dpi as f64 / 72.0;
@@ -101,13 +101,14 @@ impl super::TermWindow {
                 font_scale,
                 theoretical_height
             );
-            return;
+            return false;
         }
 
         let (prior_font, prior_dpi) = self.fonts.change_scaling(font_scale, dimensions.dpi);
-        match RenderMetrics::new(&self.fonts) {
+        let scaled = match RenderMetrics::new(&self.fonts) {
             Ok(metrics) => {
                 self.render_metrics = metrics;
+                true
             }
             Err(err) => {
                 log::error!(
@@ -118,14 +119,50 @@ impl super::TermWindow {
                 );
                 // Restore prior scaling factors
                 self.fonts.change_scaling(prior_font, prior_dpi);
+                false
             }
-        }
+        };
 
-        if let Err(err) = self.recreate_texture_atlas(None) {
+        let atlas = self.recreate_texture_atlas(None);
+        if let Err(err) = &atlas {
             log::error!("recreate_texture_atlas: {:#}", err);
         }
         self.invalidate_fancy_tab_bar();
         self.invalidate_modal();
+        scaled && atlas.is_ok()
+    }
+
+    /// GUI-thread preflight through the real native font and metric constraints.
+    #[cfg(target_os = "android")]
+    pub fn check_native_font_sizes(&self, size: config::NativeFontSizes) -> bool {
+        crate::mobile_font::prepare(&self.config, self.dimensions.dpi, size).is_ok()
+    }
+
+    /// Apply absolute native point sizes, clearing any per-window zoom, and
+    /// refit the panes to the existing pixels rather than resizing the window.
+    #[cfg(target_os = "android")]
+    pub fn set_native_font_sizes(&mut self, size: config::NativeFontSizes) -> bool {
+        let Ok((config, fonts)) =
+            crate::mobile_font::prepare(&self.config, self.dimensions.dpi, size)
+        else {
+            return false;
+        };
+        let prior_config = std::mem::replace(&mut self.config, config);
+        let prior_fonts = std::mem::replace(&mut self.fonts, fonts);
+        let prior_metrics = self.render_metrics;
+        let dimensions = self.dimensions;
+        if !self.apply_scale_change(&dimensions, 1.0) {
+            self.config = prior_config;
+            self.fonts = prior_fonts;
+            self.render_metrics = prior_metrics;
+            return false;
+        }
+        self.pending_scale_changes.clear();
+        if let Some(window) = self.window {
+            self.apply_dimensions(&dimensions, None, &window);
+            window.invalidate();
+        }
+        true
     }
 
     pub fn apply_dimensions(
@@ -533,6 +570,11 @@ impl super::TermWindow {
     }
 
     pub fn reset_font_and_window_size(&mut self, window: &Window) -> anyhow::Result<()> {
+        if cfg!(target_os = "android") {
+            // The window's size is its surface's, so only the font resets.
+            self.reset_font_size();
+            return Ok(());
+        }
         let size = self.config.initial_size(
             self.dimensions.dpi as u32,
             Some(crate::cell_pixel_dims(

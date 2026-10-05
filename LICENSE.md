@@ -20,9 +20,12 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-WezTerm bundles `JetBrains Mono`, `Noto Color Emoji` and `Roboto` fonts.
+WezTerm bundles `JetBrains Mono` and `Noto Color Emoji` fonts.
 Those are distributed under the terms of the OFL 1.1, the text of which
 can be found in the assets/fonts directory.
+
+WezTerm bundles `Roboto` fonts, whose embedded metadata declares the
+Apache License 2.0; its text is assets/fonts/LICENSE_ROBOTO.txt.
 
 WezTerm bundles `Symbols Nerd Font Mono`, built from only those icon sets
 available from https://github.com/ryanoasis/nerd-fonts which are clearly

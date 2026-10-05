@@ -18,6 +18,7 @@ fn route_via_jumps(
 ) -> ResolvedSshRoute {
     let mut config = Config::new();
     config.set_option("wezterm_ssh_backend", backend);
+    config.set_option("addressfamily", "inet");
 
     let jump_list = (0..jumps.len())
         .map(|idx| format!("jump{idx}"))
@@ -31,10 +32,12 @@ Host target
     User {user}
     IdentityFile {target_identity}
     UserKnownHostsFile {target_known_hosts}
+    Wezterm_Ssh_Config_Dir {target_dir}
     IdentitiesOnly yes
     ProxyJump {jump_list}
 "#,
         user = whoami::username(),
+        target_dir = target_keys.tmp.path().display(),
         target_identity = target_keys.tmp.child("id_rsa").path().display(),
         target_known_hosts = target_keys.tmp.child("known_hosts").path().display(),
     ));
@@ -48,10 +51,12 @@ Host jump{idx}
     User {user}
     IdentityFile {jump_identity}
     UserKnownHostsFile {jump_known_hosts}
+    Wezterm_Ssh_Config_Dir {jump_dir}
     IdentitiesOnly yes
 "#,
             user = whoami::username(),
             jump_port = jump.port,
+            jump_dir = jump.tmp.path().display(),
             jump_identity = jump.tmp.child("id_rsa").path().display(),
             jump_known_hosts = jump.tmp.child("known_hosts").path().display(),
         ));
@@ -70,7 +75,8 @@ fn route_via_jump(jump: &Sshd, target: &Sshd, backend: &str) -> ResolvedSshRoute
 async fn trust_and_authenticate(events: &Receiver<SessionEvent>) -> Result<(), String> {
     while let Ok(event) = events.recv().await {
         match event {
-            SessionEvent::Banner(_) => {}
+            SessionEvent::Banner(_) | SessionEvent::HostVerified => {}
+            SessionEvent::HostKeyTypeChanged => panic!("host key type changed"),
             SessionEvent::HostVerify(verify) => verify.answer(true).await.unwrap(),
             SessionEvent::Authenticate(auth) => {
                 let len = auth.prompts.len();

@@ -2,11 +2,11 @@ use crate::colorease::ColorEaseUniform;
 use crate::termwindow::webgpu::ShaderUniform;
 use crate::termwindow::RenderFrame;
 use crate::uniforms::UniformBuilder;
-use ::window::glium;
 use ::window::glium::uniforms::{
     MagnifySamplerFilter, MinifySamplerFilter, Sampler, SamplerWrapFunction,
 };
 use ::window::glium::{BlendingFunction, LinearBlendingFactor, Surface};
+use ::window::{glium, WindowOps};
 use config::FreeTypeLoadTarget;
 
 impl crate::TermWindow {
@@ -23,6 +23,10 @@ impl crate::TermWindow {
         let webgpu = self.webgpu.as_mut().unwrap();
         let render_state = self.render_state.as_ref().unwrap();
 
+        #[cfg(debug_assertions)]
+        if let Some(err) = crate::renderfault::injected(crate::renderfault::RenderStage::Draw) {
+            return Err(err);
+        }
         let output = webgpu.surface.get_current_texture()?;
         let view = output
             .texture
@@ -145,6 +149,9 @@ impl crate::TermWindow {
         // submit will accept anything that implements IntoIter
         webgpu.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+        if let Some(window) = self.window.as_ref() {
+            window.frame_presented();
+        }
 
         Ok(())
     }

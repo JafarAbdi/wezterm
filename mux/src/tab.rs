@@ -516,6 +516,24 @@ impl Tab {
         }
     }
 
+    /// Runs one complete mutation of the tab and announces
+    /// `ActivePaneChanged` when `get_active_pane` returns another pane
+    /// after it than before.  Compared once around the whole mutation,
+    /// by pane rather than index: a swap that keeps focus moves the active
+    /// index away and back, and removing an earlier pane renumbers it.
+    fn mutate<R>(&self, mutation: impl FnOnce(&mut TabInner) -> R) -> R {
+        let active = |inner: &mut TabInner| inner.get_active_pane().map(|pane| pane.pane_id());
+        let mut inner = self.inner.lock();
+        let before = active(&mut inner);
+        let result = mutation(&mut inner);
+        let changed = active(&mut inner) != before;
+        drop(inner);
+        if changed {
+            Mux::try_get().map(|mux| mux.notify(MuxNotification::ActivePaneChanged(self.tab_id)));
+        }
+        result
+    }
+
     pub fn get_title(&self) -> String {
         self.inner.lock().title.clone()
     }
@@ -548,7 +566,7 @@ impl Tab {
     where
         F: FnMut(PaneEntry) -> Arc<dyn Pane>,
     {
-        self.inner.lock().sync_with_pane_tree(size, root, make_pane)
+        self.mutate(|inner| inner.sync_with_pane_tree(size, root, make_pane))
     }
 
     pub fn codec_pane_tree(&self) -> PaneNode {
@@ -562,11 +580,11 @@ impl Tab {
 
     /// Sets the zoom state, returns the prior state
     pub fn set_zoomed(&self, zoomed: bool) -> bool {
-        self.inner.lock().set_zoomed(zoomed)
+        self.mutate(|inner| inner.set_zoomed(zoomed))
     }
 
     pub fn toggle_zoom(&self) {
-        self.inner.lock().toggle_zoom()
+        self.mutate(|inner| inner.toggle_zoom())
     }
 
     pub fn contains_pane(&self, pane: PaneId) -> bool {
@@ -582,11 +600,11 @@ impl Tab {
     }
 
     pub fn rotate_counter_clockwise(&self) {
-        self.inner.lock().rotate_counter_clockwise()
+        self.mutate(|inner| inner.rotate_counter_clockwise())
     }
 
     pub fn rotate_clockwise(&self) {
-        self.inner.lock().rotate_clockwise()
+        self.mutate(|inner| inner.rotate_clockwise())
     }
 
     pub fn iter_splits(&self) -> Vec<PositionedSplit> {
@@ -651,7 +669,7 @@ impl Tab {
     /// intended direction, we take the pane that has the largest
     /// edge intersection.
     pub fn activate_pane_direction(&self, direction: PaneDirection) {
-        self.inner.lock().activate_pane_direction(direction)
+        self.mutate(|inner| inner.activate_pane_direction(direction))
     }
 
     /// Returns an adjacent pane in the specified direction.
@@ -663,22 +681,22 @@ impl Tab {
     }
 
     pub fn prune_dead_panes(&self) -> bool {
-        self.inner.lock().prune_dead_panes()
+        self.mutate(|inner| inner.prune_dead_panes())
     }
 
     pub fn kill_pane(&self, pane_id: PaneId) -> bool {
-        self.inner.lock().kill_pane(pane_id)
+        self.mutate(|inner| inner.kill_pane(pane_id))
     }
 
     pub fn kill_panes_in_domain(&self, domain: DomainId) -> bool {
-        self.inner.lock().kill_panes_in_domain(domain)
+        self.mutate(|inner| inner.kill_panes_in_domain(domain))
     }
 
     /// Remove pane from tab.
     /// The pane is still live in the mux; the intent is for the pane to
     /// be added to a different tab.
     pub fn remove_pane(&self, pane_id: PaneId) -> Option<Arc<dyn Pane>> {
-        self.inner.lock().remove_pane(pane_id)
+        self.mutate(|inner| inner.remove_pane(pane_id))
     }
 
     pub fn can_close_without_prompting(&self, reason: CloseReason) -> bool {
@@ -699,25 +717,23 @@ impl Tab {
     }
 
     pub fn set_active_pane(&self, pane: &Arc<dyn Pane>) {
-        self.inner.lock().set_active_pane(pane)
+        self.mutate(|inner| inner.set_active_pane(pane))
     }
 
     pub fn set_active_idx(&self, pane_index: usize) {
-        self.inner.lock().set_active_idx(pane_index)
+        self.mutate(|inner| inner.set_active_idx(pane_index))
     }
 
     /// Assigns the root pane.
     /// This is suitable when creating a new tab and then assigning
     /// the initial pane
     pub fn assign_pane(&self, pane: &Arc<dyn Pane>) {
-        self.inner.lock().assign_pane(pane)
+        self.mutate(|inner| inner.assign_pane(pane))
     }
 
     /// Swap the active pane with the specified pane_index
     pub fn swap_active_with_index(&self, pane_index: usize, keep_focus: bool) -> Option<()> {
-        self.inner
-            .lock()
-            .swap_active_with_index(pane_index, keep_focus)
+        self.mutate(|inner| inner.swap_active_with_index(pane_index, keep_focus))
     }
 
     /// Computes the size of the pane that would result if the specified
@@ -730,7 +746,7 @@ impl Tab {
         pane_index: usize,
         request: SplitRequest,
     ) -> Option<SplitDirectionAndSize> {
-        self.inner.lock().compute_split_size(pane_index, request)
+        self.mutate(|inner| inner.compute_split_size(pane_index, request))
     }
 
     /// Split the pane that has pane_index in the given direction and assign
@@ -743,9 +759,7 @@ impl Tab {
         request: SplitRequest,
         pane: Arc<dyn Pane>,
     ) -> anyhow::Result<usize> {
-        self.inner
-            .lock()
-            .split_and_insert(pane_index, request, pane)
+        self.mutate(|inner| inner.split_and_insert(pane_index, request, pane))
     }
 
     pub fn get_zoomed_pane(&self) -> Option<Arc<dyn Pane>> {
@@ -2533,6 +2547,179 @@ pub(crate) mod test {
         assert_eq!(24, panes[2].height);
         assert_eq!(400, panes[2].pixel_width);
         assert_eq!(600, panes[2].pixel_height);
+    }
+
+    const SIZE: TerminalSize = TerminalSize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 800,
+        pixel_height: 600,
+        dpi: 96,
+    };
+
+    /// A tab of panes 1 and 2 side by side with pane 2 active, and its
+    /// `ActivePaneChanged` and `TabResized` notifications from now on.
+    fn two_panes() -> (Tab, Vec<Arc<dyn Pane>>, Arc<Mutex<Vec<&'static str>>>) {
+        let tab = Tab::new(&SIZE);
+        let panes = vec![FakePane::new(1, SIZE), FakePane::new(2, SIZE)];
+        tab.assign_pane(&panes[0]);
+        tab.split_and_insert(0, SplitRequest::default(), Arc::clone(&panes[1]))
+            .unwrap();
+        let tab_id = tab.tab_id();
+        let notices = crate::record_notifications(move |notification| match *notification {
+            MuxNotification::ActivePaneChanged(id) if id == tab_id => Some("active pane"),
+            MuxNotification::TabResized(id) if id == tab_id => Some("resized"),
+            _ => None,
+        });
+        (tab, panes, notices)
+    }
+
+    fn active(tab: &Tab) -> PaneId {
+        tab.get_active_pane().unwrap().pane_id()
+    }
+
+    fn taken(notices: &Mutex<Vec<&'static str>>) -> Vec<&'static str> {
+        std::mem::take(&mut *notices.lock())
+    }
+
+    /// What a server reports for `tab` at `size` with `active_pane` active.
+    fn resync(tab: &Tab, panes: &[Arc<dyn Pane>], size: TerminalSize, active_pane: PaneId) {
+        let leaf = |pane_id| {
+            PaneNode::Leaf(PaneEntry {
+                window_id: 0,
+                tab_id: tab.tab_id(),
+                pane_id,
+                title: String::new(),
+                size,
+                working_dir: None,
+                is_active_pane: pane_id == active_pane,
+                is_zoomed_pane: false,
+                workspace: String::new(),
+                cursor_pos: StableCursorPosition::default(),
+                physical_top: 0,
+                top_row: 0,
+                left_col: 0,
+                tty_name: None,
+            })
+        };
+        let half = |cols| TerminalSize {
+            cols,
+            pixel_width: cols * size.pixel_width / size.cols,
+            ..size
+        };
+        let root = PaneNode::Split {
+            left: Box::new(leaf(1)),
+            right: Box::new(leaf(2)),
+            node: SplitDirectionAndSize {
+                direction: SplitDirection::Horizontal,
+                first: half(size.cols / 2),
+                second: half(size.cols - size.cols / 2 - 1),
+            },
+        };
+        tab.sync_with_pane_tree(size, root, |entry| Arc::clone(&panes[entry.pane_id - 1]));
+    }
+
+    #[test]
+    fn a_change_of_geometry_announces_no_change_of_active_pane() {
+        let (tab, panes, notices) = two_panes();
+        let smaller = TerminalSize {
+            rows: 12,
+            pixel_height: 300,
+            ..SIZE
+        };
+
+        tab.resize(smaller);
+        tab.resize_split_by(0, 2);
+        resync(&tab, &panes, SIZE, 2);
+        tab.toggle_zoom();
+        tab.toggle_zoom();
+
+        assert_eq!(active(&tab), 2);
+        let notices = taken(&notices);
+        assert!(notices.contains(&"resized"));
+        assert!(!notices.contains(&"active pane"), "{:?}", notices);
+    }
+
+    #[test]
+    fn each_change_of_active_pane_is_announced_also_away_and_back() {
+        let (tab, panes, notices) = two_panes();
+        let changes = || {
+            taken(&notices)
+                .into_iter()
+                .filter(|notice| *notice == "active pane")
+                .count()
+        };
+
+        tab.set_active_idx(1);
+        tab.set_active_pane(&panes[1]);
+        assert_eq!(changes(), 0, "pane 2 was already active");
+
+        tab.set_active_idx(0);
+        assert_eq!((active(&tab), changes()), (1, 1));
+
+        tab.set_active_pane(&panes[1]);
+        tab.set_active_pane(&panes[0]);
+        assert_eq!((active(&tab), changes()), (1, 2), "away and back");
+
+        resync(&tab, &panes, SIZE, 2);
+        assert_eq!((active(&tab), changes()), (2, 1));
+
+        tab.split_and_insert(1, SplitRequest::default(), FakePane::new(3, SIZE))
+            .unwrap();
+        assert_eq!((active(&tab), changes()), (3, 1));
+
+        let top_level = SplitRequest {
+            top_level: true,
+            ..Default::default()
+        };
+        tab.split_and_insert(0, top_level, FakePane::new(4, SIZE))
+            .unwrap();
+        assert_eq!((active(&tab), changes()), (4, 1));
+    }
+
+    #[test]
+    fn a_swap_announces_a_change_only_when_focus_stays_in_place() {
+        let (tab, _panes, notices) = two_panes();
+
+        tab.swap_active_with_index(0, true);
+        assert_eq!(tab.iter_panes()[0].pane.pane_id(), 2);
+        assert_eq!(active(&tab), 2);
+        assert!(!taken(&notices).contains(&"active pane"));
+
+        tab.swap_active_with_index(1, false);
+        assert_eq!(active(&tab), 1);
+        assert_eq!(taken(&notices), ["active pane"]);
+    }
+
+    #[test]
+    fn removing_a_pane_announces_a_change_only_when_it_was_the_active_one() {
+        let (tab, _panes, notices) = two_panes();
+        tab.split_and_insert(1, SplitRequest::default(), FakePane::new(3, SIZE))
+            .unwrap();
+        assert_eq!(active(&tab), 3);
+        taken(&notices);
+
+        tab.remove_pane(1);
+        assert_eq!((active(&tab), tab.get_active_idx()), (3, 1));
+        assert!(!taken(&notices).contains(&"active pane"));
+
+        tab.remove_pane(3);
+        assert_eq!(active(&tab), 2);
+        assert!(taken(&notices).contains(&"active pane"));
+    }
+
+    #[test]
+    fn unzooming_after_a_rotation_announces_the_pane_it_exposes() {
+        let (tab, _panes, notices) = two_panes();
+
+        tab.toggle_zoom();
+        tab.rotate_clockwise();
+        assert_eq!(active(&tab), 2, "the zoomed pane keeps the input");
+        assert!(!taken(&notices).contains(&"active pane"));
+
+        tab.toggle_zoom();
+        assert_eq!(active(&tab), 1);
+        assert!(taken(&notices).contains(&"active pane"));
     }
 
     fn is_send_and_sync<T: Send + Sync>() -> bool {

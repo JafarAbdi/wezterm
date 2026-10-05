@@ -1,3 +1,4 @@
+use crate::cancel::{Cancel, Cancelled, Registration, Worker};
 use crate::channelwrap::ChannelWrap;
 use crate::config::{ConfigMap, ResolvedSshRoute};
 use crate::dirwrap::DirWrap;
@@ -54,6 +55,11 @@ pub(crate) struct SessionInner {
     pub shown_accept_env_error: bool,
     pub last_keep_alive: Instant,
     pub keep_alive: Option<Duration>,
+    /// Sockets `cancel` shuts down; dropped before `_worker`.
+    pub registrations: Vec<Registration>,
+    pub cancel: Option<Cancel>,
+    /// Counts this thread until every descriptor above is closed.
+    pub _worker: Option<Worker>,
 }
 
 impl Drop for SessionInner {
@@ -63,6 +69,12 @@ impl Drop for SessionInner {
 }
 
 impl SessionInner {
+    /// Fails once the transport was shut down: a trust answer arriving
+    /// after that writes no `known_hosts`, and the request loop ends.
+    pub(crate) fn refuse_if_cancelled(&self) -> Result<(), Cancelled> {
+        self.cancel.as_ref().map_or(Ok(()), Cancel::check)
+    }
+
     pub fn run(&mut self) {
         if let Err(err) = self.run_impl() {
             self.tx_event
@@ -214,7 +226,22 @@ impl SessionInner {
         sess.set_option(libssh_rs::SshOption::Hostname(hostname.clone()))?;
         sess.set_option(libssh_rs::SshOption::User(Some(user)))?;
         sess.set_option(libssh_rs::SshOption::Port(port))?;
-        sess.options_parse_config(None)?; // FIXME: overridden config path?
+        // libssh reads the default OpenSSH configuration files at connect
+        // unless this is cleared.
+        #[cfg(target_os = "android")]
+        sess.set_option(libssh_rs::SshOption::ProcessConfig(false))?;
+        if let Some(dir) = config.get("wezterm_ssh_config_dir") {
+            // libssh resolves HOME through getpwuid, not the process environment.
+            sess.set_option(libssh_rs::SshOption::SshDir(Some(dir.clone())))?;
+            sess.set_option(libssh_rs::SshOption::GlobalKnownHosts(Some(format!(
+                "{dir}/known_hosts"
+            ))))?;
+            #[cfg(not(target_os = "android"))]
+            sess.set_option(libssh_rs::SshOption::ProcessConfig(false))?;
+        } else {
+            #[cfg(not(target_os = "android"))]
+            sess.options_parse_config(None)?;
+        }
         if let Some(agent) = config.get("identityagent") {
             sess.set_option(libssh_rs::SshOption::IdentityAgent(Some(agent.clone())))?;
         }
@@ -272,6 +299,9 @@ impl SessionInner {
             .context("notifying user of banner")?;
 
         self.host_verification_libssh(config, &sess, &hostname, port)?;
+        self.tx_event
+            .try_send(SessionEvent::HostVerified)
+            .context("notifying user that the host is verified")?;
         self.authenticate_libssh(config, &sess)?;
 
         if let Ok(banner) = sess.get_issue_banner() {
@@ -349,6 +379,9 @@ impl SessionInner {
 
         self.host_verification(config, &sess, &hostname, port, &remote_address)
             .context("host verification")?;
+        self.tx_event
+            .try_send(SessionEvent::HostVerified)
+            .context("notifying user that the host is verified")?;
 
         self.authenticate(config, &sess, &user, &hostname)
             .context("authentication")?;
@@ -375,7 +408,7 @@ impl SessionInner {
     /// too, as proxy commands are not supported by libssh2 and are not supported
     /// on Windows in libssh.
     fn connect_to_host(
-        &self,
+        &mut self,
         config: &ConfigMap,
         hostname: &str,
         port: u16,
@@ -447,8 +480,16 @@ impl SessionInner {
                 .with_context(|| format!("binding to {bind_addr:?}"))?;
         }
 
-        sock.connect(&addr.into())
-            .with_context(|| format!("Connecting to {hostname}:{port} ({addr:?})"))?;
+        match &self.cancel {
+            // Refused once shut down, so a cancel during the name lookup,
+            // which cannot be interrupted, dials nothing.
+            Some(cancel) => {
+                self.registrations.push(cancel.register(&sock)?);
+                cancel.connect(&sock, &addr.into())
+            }
+            None => sock.connect(&addr.into()).map_err(Into::into),
+        }
+        .with_context(|| format!("Connecting to {hostname}:{port} ({addr:?})"))?;
         Ok((sock, None))
     }
 
@@ -497,6 +538,8 @@ impl SessionInner {
         let mut sleep_delay = Duration::from_millis(100);
 
         loop {
+            // A shut socket wakes the poll below; its channels end with it.
+            self.refuse_if_cancelled()?;
             self.do_keepalive(sess)?;
             self.tick_io()?;
             self.drain_request_pipe();
@@ -522,6 +565,14 @@ impl SessionInner {
                     revents: 0,
                 },
             ];
+            if let Some(cancel) = &self.cancel {
+                poll_array.push(pollfd {
+                    fd: cancel.wake_descriptor().as_socket_descriptor(),
+                    events: POLLIN,
+                    revents: 0,
+                });
+            }
+            let fixed = poll_array.len();
             let mut mapping = vec![];
 
             for info in self.channels.values() {
@@ -550,10 +601,10 @@ impl SessionInner {
                 if poll.revents != 0 {
                     sleep_delay = Duration::from_millis(100);
                 }
-                if idx == 0 || idx == 1 {
+                if idx < fixed {
                     // Dealt with at the top of the loop
                 } else if poll.revents != 0 {
-                    let (channel_id, fd_num) = mapping[idx - 2];
+                    let (channel_id, fd_num) = mapping[idx - fixed];
                     let info = self.channels.get_mut(&channel_id).unwrap();
                     let state = &mut info.descriptors[fd_num];
                     let fd = state.fd.as_mut().unwrap();

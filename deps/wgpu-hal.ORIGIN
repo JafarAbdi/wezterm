@@ -1,0 +1,16 @@
+wgpu-hal 25.0.2
+Origin: https://static.crates.io/crates/wgpu-hal/wgpu-hal-25.0.2.crate
+Registry: registry+https://github.com/rust-lang/crates.io-index
+Archive SHA-256 (original Cargo.lock checksum):
+f968767fe4d3d33747bbd1473ccd55bf0f6451f55d733b5597e67b5deab4ad17
+Upstream VCS: https://github.com/gfx-rs/wgpu
+Commit: f35cf942af1a3bb6f48aa9185f4d2bcee809f814
+VCS subdirectory: wgpu-hal
+
+The directory wgpu-hal is the complete crate archive extracted with its
+single leading directory removed. Upstream MIT and Apache-2.0 licenses,
+Cargo.toml.orig and .cargo_vcs_info.json are retained unchanged.
+Only src/gles/egl.rs differs: Android prefers the advertised
+EGL_EXT_create_context_robustness attribute over the EGL 1.5 core attribute.
+Android without EXT and non-Android retain the upstream selection.
+No robustness disabling, context retry or backend change is added.

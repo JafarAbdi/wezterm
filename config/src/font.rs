@@ -692,6 +692,8 @@ impl Default for FontLocatorSelection {
             FontLocatorSelection::Gdi
         } else if cfg!(target_os = "macos") {
             FontLocatorSelection::CoreText
+        } else if cfg!(target_os = "android") {
+            FontLocatorSelection::ConfigDirsOnly
         } else {
             FontLocatorSelection::FontConfig
         }

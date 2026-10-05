@@ -144,6 +144,7 @@ mio = "0.8"
 mlua = "0.9"
 mux = { path = "mux" }
 mux-lua = { path = "lua-api-crates/mux" }
+ndk = { version = "0.9", default-features = false }
 names = { version = "0.12", default-features = false }
 nix = "0.29"
 notify = "5.0.0"
@@ -282,3 +283,5 @@ zvariant = "4.0"
 # We use our own vendored cairo, which has minimal deps and should just
 # build via cargo.
 cairo-sys-rs = {path="deps/cairo", version="0.18.0"}
+# Android EGL robustness attribute selection; origin in deps/wgpu-hal.ORIGIN.
+wgpu-hal = {path="deps/wgpu-hal", version="=25.0.2"}

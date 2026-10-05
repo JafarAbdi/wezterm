@@ -100,7 +100,7 @@ pub struct Config {
     /// search ahead of the standard font locations for fonts.
     /// Relative paths are taken to be relative to the directory
     /// from which the config was loaded.
-    #[dynamic(default)]
+    #[dynamic(default = "default_font_dirs")]
     pub font_dirs: Vec<PathBuf>,
 
     #[dynamic(default)]
@@ -346,7 +346,7 @@ pub struct Config {
     #[dynamic(default = "default_harfbuzz_features")]
     pub harfbuzz_features: Vec<String>,
 
-    #[dynamic(default)]
+    #[dynamic(default = "default_front_end")]
     pub front_end: FrontEndSelection,
 
     /// Whether to select the higher powered discrete GPU when
@@ -817,7 +817,7 @@ pub struct Config {
     #[dynamic(default)]
     pub sort_fallback_fonts_by_coverage: bool,
 
-    #[dynamic(default)]
+    #[dynamic(default = "default_search_font_dirs_for_fallback")]
     pub search_font_dirs_for_fallback: bool,
 
     #[dynamic(default)]
@@ -1082,8 +1082,11 @@ impl Config {
         // We didn't find (or were asked to skip) a wezterm.lua file, so
         // update the environment to make it simpler to understand this
         // state.
-        std::env::remove_var("WEZTERM_CONFIG_FILE");
-        std::env::remove_var("WEZTERM_CONFIG_DIR");
+        #[cfg(not(target_os = "android"))]
+        {
+            std::env::remove_var("WEZTERM_CONFIG_FILE");
+            std::env::remove_var("WEZTERM_CONFIG_DIR");
+        }
 
         match Self::try_default() {
             Err(err) => LoadedConfig {
@@ -1154,9 +1157,12 @@ impl Config {
                 // problems earlier than we use them.
                 let _ = cfg.key_bindings();
 
-                std::env::set_var("WEZTERM_CONFIG_FILE", p);
-                if let Some(dir) = p.parent() {
-                    std::env::set_var("WEZTERM_CONFIG_DIR", dir);
+                #[cfg(not(target_os = "android"))]
+                {
+                    std::env::set_var("WEZTERM_CONFIG_FILE", p);
+                    if let Some(dir) = p.parent() {
+                        std::env::set_var("WEZTERM_CONFIG_DIR", dir);
+                    }
                 }
                 Ok(cfg)
             });
@@ -1628,6 +1634,31 @@ impl Config {
     }
 }
 
+/// Android has no font service to ask; the platform's own fallback faces
+/// (the files `/system/etc/fonts.xml` names) live in `/system/fonts`, so
+/// that directory is the default font database and takes part in glyph
+/// fallback.
+fn default_font_dirs() -> Vec<PathBuf> {
+    if cfg!(target_os = "android") {
+        vec![PathBuf::from("/system/fonts")]
+    } else {
+        vec![]
+    }
+}
+
+fn default_search_font_dirs_for_fallback() -> bool {
+    cfg!(target_os = "android")
+}
+
+/// Android has no OpenGL window backend, so its only renderer is wgpu.
+fn default_front_end() -> FrontEndSelection {
+    if cfg!(target_os = "android") {
+        FrontEndSelection::WebGpu
+    } else {
+        FrontEndSelection::OpenGL
+    }
+}
+
 fn default_check_for_updates() -> bool {
     cfg!(not(feature = "distro-defaults"))
 }
@@ -1640,8 +1671,14 @@ fn default_pane_select_bg_color() -> RgbaColor {
     SrgbaTuple(0., 0., 0., 0.5).into()
 }
 
+// Existing desktop point sizes; applications may derive relative emphasis.
+pub const DEFAULT_FONT_SIZE: f64 = 12.0;
+pub const DEFAULT_COMMAND_PALETTE_FONT_SIZE: f64 = 14.0;
+pub const DEFAULT_CHAR_SELECT_FONT_SIZE: f64 = 18.0;
+pub const DEFAULT_PANE_SELECT_FONT_SIZE: f64 = 36.0;
+
 fn default_pane_select_font_size() -> f64 {
-    36.0
+    crate::native_font_defaults().map_or(DEFAULT_PANE_SELECT_FONT_SIZE, |sizes| sizes.pane_select)
 }
 
 fn default_integrated_title_buttons() -> Vec<IntegratedTitleButton> {
@@ -1650,7 +1687,7 @@ fn default_integrated_title_buttons() -> Vec<IntegratedTitleButton> {
 }
 
 fn default_char_select_font_size() -> f64 {
-    18.0
+    crate::native_font_defaults().map_or(DEFAULT_CHAR_SELECT_FONT_SIZE, |sizes| sizes.char_select)
 }
 
 fn default_char_select_fg_color() -> RgbaColor {
@@ -1662,7 +1699,9 @@ fn default_char_select_bg_color() -> RgbaColor {
 }
 
 fn default_command_palette_font_size() -> f64 {
-    14.0
+    crate::native_font_defaults().map_or(DEFAULT_COMMAND_PALETTE_FONT_SIZE, |sizes| {
+        sizes.command_palette
+    })
 }
 
 fn default_command_palette_fg_color() -> RgbaColor {
@@ -1758,9 +1797,25 @@ fn default_term() -> String {
 }
 
 fn default_font_size() -> f64 {
-    12.0
+    crate::native_font_defaults().map_or(DEFAULT_FONT_SIZE, |sizes| sizes.body)
 }
 
+#[cfg(target_os = "android")]
+pub(crate) fn compute_cache_dir() -> anyhow::Result<PathBuf> {
+    Ok(crate::android_paths().cache.clone())
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn compute_data_dir() -> anyhow::Result<PathBuf> {
+    Ok(crate::android_paths().data.clone())
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn compute_runtime_dir() -> anyhow::Result<PathBuf> {
+    Ok(crate::android_paths().runtime.clone())
+}
+
+#[cfg(not(target_os = "android"))]
 pub(crate) fn compute_cache_dir() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = dirs_next::cache_dir() {
         return Ok(runtime.join("wezterm"));
@@ -1769,6 +1824,7 @@ pub(crate) fn compute_cache_dir() -> anyhow::Result<PathBuf> {
     Ok(crate::HOME_DIR.join(".local/share/wezterm"))
 }
 
+#[cfg(not(target_os = "android"))]
 pub(crate) fn compute_data_dir() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = dirs_next::data_dir() {
         return Ok(runtime.join("wezterm"));
@@ -1781,6 +1837,7 @@ fn default_session_db() -> PathBuf {
     crate::DATA_DIR.join("sessions.db")
 }
 
+#[cfg(not(target_os = "android"))]
 pub(crate) fn compute_runtime_dir() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = dirs_next::runtime_dir() {
         return Ok(runtime.join("wezterm"));

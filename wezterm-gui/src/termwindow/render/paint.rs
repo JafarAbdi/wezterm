@@ -14,7 +14,10 @@ pub enum AllowImage {
 }
 
 impl crate::TermWindow {
-    pub fn paint_impl(&mut self, frame: &mut RenderFrame) {
+    /// Paint one frame.  A draw failure, including a lost or outdated wgpu
+    /// surface, is returned so the caller can react instead of silently
+    /// skipping the frame.
+    pub fn paint_impl(&mut self, frame: &mut RenderFrame) -> anyhow::Result<()> {
         self.num_frames += 1;
         // If nothing on screen needs animating, then we can avoid
         // invalidating as frequently
@@ -105,7 +108,7 @@ impl crate::TermWindow {
         }
         log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
 
-        self.call_draw(frame).ok();
+        self.call_draw(frame)?;
         self.last_frame_duration = start.elapsed();
         log::debug!(
             "paint_impl elapsed={:?}, fps={}",
@@ -144,6 +147,7 @@ impl crate::TermWindow {
                 }
             }
         }
+        Ok(())
     }
 
     pub fn paint_modal(&mut self) -> anyhow::Result<()> {

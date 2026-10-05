@@ -85,18 +85,37 @@ impl Window {
         mux.notify(MuxNotification::WindowInvalidated(self.id));
     }
 
+    /// Runs one complete mutation of the window and announces
+    /// `ActiveTabChanged` when `get_active_tab` returns another tab after
+    /// it than before.  Compared once around the whole mutation, by tab
+    /// rather than index: removing an earlier tab renumbers the active one
+    /// and leaves the index invalid until it is fixed up.
+    fn mutate<R>(&mut self, mutation: impl FnOnce(&mut Self) -> R) -> R {
+        let active = |window: &Self| window.get_active_tab().map(|tab| tab.tab_id());
+        let before = active(self);
+        let result = mutation(self);
+        if active(self) != before {
+            Mux::get().notify(MuxNotification::ActiveTabChanged(self.id));
+        }
+        result
+    }
+
     /// Insert `tab` in window, at given index.
     pub fn insert_tab_at_idx(&mut self, index: usize, tab: &Arc<Tab>) {
         self.assert_tab_isnt_already_in_window(tab);
-        self.tabs.insert(index, Arc::clone(tab));
-        self.invalidate();
+        self.mutate(|window| {
+            window.tabs.insert(index, Arc::clone(tab));
+            window.invalidate();
+        })
     }
 
     /// Insert `tab` in window, after other tabs.
     pub fn push_tab(&mut self, tab: &Arc<Tab>) {
         self.assert_tab_isnt_already_in_window(tab);
-        self.tabs.push(Arc::clone(tab));
-        self.invalidate();
+        self.mutate(|window| {
+            window.tabs.push(Arc::clone(tab));
+            window.invalidate();
+        })
     }
 
     /// Return true if this window contains no tabs.
@@ -140,14 +159,14 @@ impl Window {
         if let Some(active) = active {
             for (idx, tab) in self.tabs.iter().enumerate() {
                 if tab.tab_id() == active.tab_id() {
-                    self.set_active_tab_idx_without_saving(idx);
+                    self.activate_tab_idx(idx);
                     return;
                 }
             }
         }
 
         if len > 0 && self.active_tab_idx >= len {
-            self.set_active_tab_idx_without_saving(len - 1);
+            self.activate_tab_idx(len - 1);
         } else {
             self.invalidate();
         }
@@ -157,14 +176,14 @@ impl Window {
     pub fn remove_tab_idx(&mut self, idx: usize) -> Arc<Tab> {
         self.invalidate();
         let active = self.get_active_tab().map(Arc::clone);
-        self.do_remove_tab_idx(idx, active)
+        self.mutate(|window| window.do_remove_tab_idx(idx, active))
     }
 
     /// Remove tab with given id, if present.
     pub fn remove_tab_id(&mut self, id: TabId) {
         let active = self.get_active_tab().map(Arc::clone);
         if let Some(idx) = self.get_tab_idx_for_id(id) {
-            self.do_remove_tab_idx(idx, active);
+            self.mutate(|window| window.do_remove_tab_idx(idx, active));
         }
     }
 
@@ -176,7 +195,7 @@ impl Window {
             {
                 // If we are removing active tab, switch back to previously active tab
                 if let Some(last_active) = self.get_last_active_tab_idx() {
-                    self.set_active_tab_idx_without_saving(last_active);
+                    self.activate_tab_idx(last_active);
                 }
             }
         }
@@ -227,6 +246,10 @@ impl Window {
 
     /// Make given index the active tab without remembering current tab as the "last active" tab.
     pub fn set_active_tab_idx_without_saving(&mut self, idx: usize) {
+        self.mutate(|window| window.activate_tab_idx(idx))
+    }
+
+    fn activate_tab_idx(&mut self, idx: usize) {
         assert!(idx < self.tabs.len());
         if self.active_tab_idx != idx {
             if let Some(tab) = self.tabs.get(self.active_tab_idx) {
@@ -291,5 +314,86 @@ impl Window {
         if invalidated {
             self.invalidate();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wezterm_term::TerminalSize;
+
+    /// A window of `count` tabs with the first active, the tabs' ids, and
+    /// a count of its `ActiveTabChanged` notifications since the last call.
+    fn window(count: usize) -> (Window, Vec<TabId>, impl Fn() -> usize) {
+        let mut window = Window::new(Some("test".to_string()), None);
+        let window_id = window.window_id();
+        let notices = crate::record_notifications(move |notification| match *notification {
+            MuxNotification::ActiveTabChanged(id) if id == window_id => Some(()),
+            _ => None,
+        });
+        let changes = move || std::mem::take(&mut *notices.lock()).len();
+        let tabs: Vec<TabId> = (0..count)
+            .map(|_| {
+                let tab = Arc::new(Tab::new(&TerminalSize::default()));
+                window.push_tab(&tab);
+                tab.tab_id()
+            })
+            .collect();
+        assert_eq!(changes(), count.min(1), "only the first tab becomes active");
+        (window, tabs, changes)
+    }
+
+    fn active(window: &Window) -> Option<TabId> {
+        window.get_active_tab().map(|tab| tab.tab_id())
+    }
+
+    #[test]
+    fn each_change_of_active_tab_is_announced_also_away_and_back() {
+        let (mut window, tabs, changes) = window(2);
+
+        window.set_active_tab_idx_without_saving(0);
+        window.remember_and_set_active_tab_idx(0);
+        assert_eq!(changes(), 0, "the first tab was already active");
+
+        window.remember_and_set_active_tab_idx(1);
+        assert_eq!((active(&window), changes()), (Some(tabs[1]), 1));
+
+        window.set_active_tab_idx_without_saving(0);
+        window.set_active_tab_idx_without_saving(1);
+        assert_eq!((active(&window), changes()), (Some(tabs[1]), 2));
+    }
+
+    #[test]
+    fn removing_a_tab_announces_a_change_only_when_it_was_the_active_one() {
+        let (mut window, tabs, changes) = window(3);
+        window.set_active_tab_idx_without_saving(1);
+        assert_eq!(changes(), 1);
+
+        window.remove_tab_id(tabs[0]);
+        assert_eq!(
+            window.get_active_tab_idx(),
+            0,
+            "the active tab is renumbered"
+        );
+        assert_eq!((active(&window), changes()), (Some(tabs[1]), 0));
+
+        window.remove_tab_idx(0);
+        assert_eq!((active(&window), changes()), (Some(tabs[2]), 1));
+
+        window.remove_tab_idx(0);
+        assert_eq!((active(&window), changes()), (None, 1));
+    }
+
+    #[test]
+    fn inserting_a_tab_announces_a_change_only_when_it_takes_the_active_place() {
+        let (mut window, tabs, changes) = window(1);
+
+        let after = Arc::new(Tab::new(&TerminalSize::default()));
+        window.insert_tab_at_idx(1, &after);
+        assert_eq!((active(&window), changes()), (Some(tabs[0]), 0));
+
+        let before = Arc::new(Tab::new(&TerminalSize::default()));
+        window.insert_tab_at_idx(0, &before);
+        assert_eq!((active(&window), changes()), (Some(before.tab_id()), 1));
     }
 }

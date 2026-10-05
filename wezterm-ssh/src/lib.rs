@@ -2,6 +2,7 @@
 compile_error!("Either libssh-rs or ssh2 must be enabled!");
 
 mod auth;
+mod cancel;
 mod channelwrap;
 mod config;
 mod dirwrap;
@@ -15,6 +16,7 @@ mod sftp;
 mod sftpwrap;
 
 pub use auth::*;
+pub use cancel::{Cancel, Cancelled, Worker};
 pub use config::*;
 pub use host::*;
 pub use pty::*;

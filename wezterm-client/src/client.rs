@@ -77,6 +77,12 @@ pub struct IncompatibleVersionError {
     pub codec_vers: usize,
 }
 
+/// The server did not answer the version request: it is not running, is
+/// not wezterm, or its output is not the mux protocol.
+#[derive(Error, Debug)]
+#[error("{0}")]
+pub struct VersionCheckFailed(pub String);
+
 macro_rules! rpc {
     ($method_name:ident, $request_type:ident, $response_type:ident) => {
         pub async fn $method_name(&self, pdu: $request_type) -> anyhow::Result<$response_type> {
@@ -147,6 +153,13 @@ async fn process_unilateral_inner_async(
     let local_pane_id = match client_domain.remote_to_local_pane_id(pane_id) {
         Some(p) => p,
         None => {
+            // The PDU's name only: its payload can hold the pane's screen lines.
+            #[cfg(target_os = "android")]
+            log::debug!(
+                "got {} for remote pane {pane_id}, pane not found locally, resync",
+                decoded.pdu.pdu_name()
+            );
+            #[cfg(not(target_os = "android"))]
             log::debug!("got {decoded:?}, pane not found locally, resync");
             client_domain.resync().await?;
             client_domain
@@ -160,6 +173,9 @@ async fn process_unilateral_inner_async(
     let pane = match mux.get_pane(local_pane_id) {
         Some(p) => p,
         None => {
+            #[cfg(target_os = "android")]
+            log::debug!("got {} for remote pane {pane_id}, but local pane {local_pane_id} no longer exists; resync", decoded.pdu.pdu_name());
+            #[cfg(not(target_os = "android"))]
             log::debug!("got {decoded:?}, but local pane {local_pane_id} no longer exists; resync");
             client_domain.resync().await?;
 
@@ -698,7 +714,9 @@ impl Reconnectable {
         let exec = smol::block_on(sess.exec(&cmd, None))?;
 
         let mut stderr = exec.stderr;
+        let worker = ui.worker();
         std::thread::spawn(move || {
+            let _worker = worker;
             let mut buf = [0u8; 1024];
             while let Ok(len) = stderr.read(&mut buf) {
                 if len == 0 {
@@ -714,10 +732,14 @@ impl Reconnectable {
         // the proxy, and prevents us from hanging forever after the process
         // has died
         let mut child = exec.child;
-        std::thread::spawn(move || match child.wait() {
-            Err(err) => log::error!("waiting on {} failed: {:#}", cmd, err),
-            Ok(status) if !status.success() => log::error!("{}: {}", cmd, status),
-            _ => {}
+        let worker = ui.worker();
+        std::thread::spawn(move || {
+            let _worker = worker;
+            match child.wait() {
+                Err(err) => log::error!("waiting on {} failed: {:#}", cmd, err),
+                Ok(status) if !status.success() => log::error!("{}: {}", cmd, status),
+                _ => {}
+            }
         });
 
         let stream: Box<dyn AsyncReadAndWrite> = Box::new(Async::new(SshStream {
@@ -1038,7 +1060,12 @@ impl Reconnectable {
 }
 
 impl Client {
-    fn new(local_domain_id: Option<DomainId>, mut reconnectable: Reconnectable) -> Self {
+    /// `worker` counts the client thread for the attempt that connected.
+    fn new(
+        local_domain_id: Option<DomainId>,
+        mut reconnectable: Reconnectable,
+        worker: Option<wezterm_ssh::Worker>,
+    ) -> Self {
         let client_domain_config = reconnectable.config.clone();
         let is_reconnectable = reconnectable.reconnectable();
         let is_local = reconnectable.is_local();
@@ -1046,6 +1073,7 @@ impl Client {
         let client_id = ClientId::new();
 
         thread::spawn(move || {
+            let _worker = worker;
             const BASE_INTERVAL: Duration = Duration::from_secs(1);
             const MAX_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -1209,7 +1237,7 @@ impl Client {
                     )
                 };
                 ui.output_str(&msg);
-                bail!("{}", msg);
+                Err(VersionCheckFailed(msg).into())
             }
         }
     }
@@ -1275,7 +1303,7 @@ impl Client {
         let mut reconnectable =
             Reconnectable::new(ClientDomainConfig::Unix(unix_dom.clone()), None);
         reconnectable.connect(initial, ui, no_auto_start)?;
-        Ok(Self::new(local_domain_id, reconnectable))
+        Ok(Self::new(local_domain_id, reconnectable, ui.worker()))
     }
 
     pub fn new_tls(
@@ -1287,7 +1315,7 @@ impl Client {
             Reconnectable::new(ClientDomainConfig::Tls(tls_client.clone()), None);
         let no_auto_start = true;
         reconnectable.connect(true, ui, no_auto_start)?;
-        Ok(Self::new(Some(local_domain_id), reconnectable))
+        Ok(Self::new(Some(local_domain_id), reconnectable, ui.worker()))
     }
 
     pub fn new_ssh(
@@ -1298,7 +1326,7 @@ impl Client {
         let mut reconnectable = Reconnectable::new(ClientDomainConfig::Ssh(ssh_dom.clone()), None);
         let no_auto_start = true;
         reconnectable.connect(true, ui, no_auto_start)?;
-        Ok(Self::new(Some(local_domain_id), reconnectable))
+        Ok(Self::new(Some(local_domain_id), reconnectable, ui.worker()))
     }
 
     pub async fn send_pdu(&self, pdu: Pdu) -> anyhow::Result<Pdu> {

@@ -16,6 +16,44 @@ pub struct InputMap {
     leader: Option<(KeyCode, Modifiers, Duration)>,
 }
 
+/// Whether the native key table makes this key a paste. Platforms with an
+/// already-read clipboard can deliver it in input order rather than starting
+/// TermWindow's asynchronous clipboard request.
+#[cfg(any(target_os = "android", test))]
+pub fn is_paste_key(key: &window::KeyEvent) -> bool {
+    InputMap::new(&config::configuration())
+        .lookup_key(&key.key, key.modifiers, None)
+        .is_some_and(|entry| matches!(entry.action, KeyAssignment::PasteFrom(_)))
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+
+    #[test]
+    fn paste_adapter_uses_native_default_bindings() {
+        for (key, modifiers, paste) in [
+            (KeyCode::Char('V'), Modifiers::CTRL | Modifiers::SHIFT, true),
+            (KeyCode::Char('v'), Modifiers::SUPER, true),
+            (KeyCode::Insert, Modifiers::SHIFT, true),
+            (KeyCode::Paste, Modifiers::NONE, true),
+            (KeyCode::Char('v'), Modifiers::CTRL, false),
+            (KeyCode::Char('x'), Modifiers::NONE, false),
+        ] {
+            let event = window::KeyEvent {
+                key,
+                modifiers,
+                leds: window::KeyboardLedStatus::empty(),
+                repeat_count: 1,
+                key_is_down: true,
+                raw: None,
+            }
+            .normalize_shift();
+            assert_eq!(is_paste_key(&event), paste);
+        }
+    }
+}
+
 impl InputMap {
     pub fn default_input_map() -> Self {
         let config = ConfigHandle::default_config();

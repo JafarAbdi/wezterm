@@ -596,7 +596,7 @@ pub struct WindowFrameConfig {
 
     #[dynamic(default)]
     pub font: Option<TextStyle>,
-    #[dynamic(default)]
+    #[dynamic(default = "default_window_frame_font_size")]
     pub font_size: Option<f64>,
 
     #[dynamic(try_from = "crate::units::PixelUnit", default = "default_zero_pixel")]
@@ -618,6 +618,10 @@ const fn default_zero_pixel() -> Dimension {
     Dimension::Pixels(0.)
 }
 
+fn default_window_frame_font_size() -> Option<f64> {
+    crate::native_font_defaults().map(|sizes| sizes.title)
+}
+
 impl Default for WindowFrameConfig {
     fn default() -> Self {
         Self {
@@ -632,7 +636,7 @@ impl Default for WindowFrameConfig {
             button_hover_fg: default_button_hover_fg(),
             button_hover_bg: default_button_hover_bg(),
             font: None,
-            font_size: None,
+            font_size: default_window_frame_font_size(),
             border_left_width: default_zero_pixel(),
             border_right_width: default_zero_pixel(),
             border_top_height: default_zero_pixel(),
