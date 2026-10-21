@@ -147,6 +147,10 @@ impl PerPane {
             working_dir: working_dir.map(Into::into),
             input_serial: force_with_input_serial,
             seqno: self.seqno,
+            semantic_zones: pane.get_semantic_zones().unwrap_or_else(|err| {
+                log::error!("get_semantic_zones for pane {}: {err:#}", pane.pane_id());
+                vec![]
+            }),
         })
     }
 }

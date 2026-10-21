@@ -22,7 +22,7 @@ use termwiz::color::AnsiColor;
 use termwiz::image::{ImageCell, ImageData};
 use termwiz::surface::{SequenceNo, SEQ_ZERO};
 use url::Url;
-use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex};
+use wezterm_term::{KeyCode, KeyModifiers, Line, SemanticZone, StableRowIndex};
 
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const BASE_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -69,6 +69,7 @@ pub struct RenderableInner {
     pub title: String,
     pub working_dir: Option<Url>,
     pub seqno: SequenceNo,
+    pub semantic_zones: Vec<SemanticZone>,
 
     fetch_limiter: RateLimiter,
 
@@ -117,6 +118,7 @@ impl RenderableInner {
             last_input_rtt: 0,
             input_serial: InputSerial::empty(),
             seqno: SEQ_ZERO,
+            semantic_zones: vec![],
         }
     }
 
@@ -359,6 +361,7 @@ impl RenderableInner {
             self.local_pane_id
         );
         self.seqno = delta.seqno;
+        self.semantic_zones = delta.semantic_zones;
 
         let config = configuration();
         for (stable_row, line) in bonus_lines {

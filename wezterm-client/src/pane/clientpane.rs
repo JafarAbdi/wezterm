@@ -27,8 +27,8 @@ use url::Url;
 use wezterm_dynamic::Value;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
-    Alert, Clipboard, KeyCode, KeyModifiers, Line, MouseEvent, Progress, StableRowIndex,
-    TerminalConfiguration, TerminalSize,
+    Alert, Clipboard, KeyCode, KeyModifiers, Line, MouseEvent, Progress, SemanticZone,
+    StableRowIndex, TerminalConfiguration, TerminalSize,
 };
 
 pub struct ClientPane {
@@ -308,6 +308,10 @@ impl Pane for ClientPane {
 
     fn get_current_seqno(&self) -> SequenceNo {
         self.renderable.lock().get_current_seqno()
+    }
+
+    fn get_semantic_zones(&self) -> anyhow::Result<Vec<SemanticZone>> {
+        Ok(self.renderable.lock().inner.borrow().semantic_zones.clone())
     }
 
     fn get_changed_since(

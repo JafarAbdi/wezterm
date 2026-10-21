@@ -35,7 +35,7 @@ use termwiz::image::{ImageData, TextureCoordinate};
 use termwiz::surface::{Line, SequenceNo};
 use thiserror::Error;
 use wezterm_term::color::ColorPalette;
-use wezterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
+use wezterm_term::{Alert, ClipboardSelection, SemanticZone, StableRowIndex, TerminalSize};
 
 #[derive(Error, Debug)]
 #[error("Corrupt Response: {0}")]
@@ -442,7 +442,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 46;
+pub const CODEC_VERSION: usize = 47;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -927,6 +927,7 @@ pub struct GetPaneRenderChangesResponse {
 
     pub input_serial: Option<InputSerial>,
     pub seqno: SequenceNo,
+    pub semantic_zones: Vec<SemanticZone>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -1218,6 +1219,60 @@ mod test {
             err.downcast_ref::<std::io::Error>().unwrap().kind(),
             std::io::ErrorKind::UnexpectedEof
         );
+    }
+
+    #[test]
+    fn test_render_changes_semantic_zones() {
+        use wezterm_term::SemanticType;
+
+        let zones = vec![
+            SemanticZone {
+                start_y: 12,
+                start_x: 0,
+                end_y: 12,
+                end_x: 1,
+                semantic_type: SemanticType::Prompt,
+            },
+            SemanticZone {
+                start_y: 12,
+                start_x: 2,
+                end_y: 12,
+                end_x: 5,
+                semantic_type: SemanticType::Input,
+            },
+            SemanticZone {
+                start_y: 13,
+                start_x: 0,
+                end_y: 40,
+                end_x: 9,
+                semantic_type: SemanticType::Output,
+            },
+        ];
+        for semantic_zones in [zones, vec![]] {
+            let pdu = Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+                pane_id: 1,
+                mouse_grabbed: false,
+                alt_screen_active: false,
+                cursor_position: StableCursorPosition::default(),
+                dimensions: RenderableDimensions {
+                    physical_top: 30,
+                    ..RenderableDimensions::default()
+                },
+                dirty_lines: vec![],
+                title: String::new(),
+                working_dir: None,
+                bonus_lines: vec![].into(),
+                input_serial: None,
+                seqno: 42,
+                semantic_zones,
+            });
+            let mut encoded = vec![];
+            pdu.encode(&mut encoded, 7).unwrap();
+            assert_eq!(
+                Pdu::decode(encoded.as_slice()).unwrap(),
+                DecodedPdu { serial: 7, pdu }
+            );
+        }
     }
 
     #[test]
